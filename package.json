@@ -1,0 +1,20 @@
+{
+  "name": "chat-mirror",
+  "version": "1.0.0",
+  "description": "Mirrors Twitch + YouTube Live chat to Discord with rich embeds",
+  "main": "index.js",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js",
+    "dev":   "node --watch index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv":     "^16.4.5",
+    "express":    "^4.19.2",
+    "masterchat": "^3.4.0",
+    "node-fetch": "^3.3.2",
+    "tmi.js":     "^1.8.5",
+    "xml2js":     "^0.6.2"
+  }
+}
