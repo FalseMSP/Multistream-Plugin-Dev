@@ -29,9 +29,9 @@ async function _startMasterchat(videoId, queue) {
 
   let Masterchat, convertEmojiRuns;
   try {
-    ({ Masterchat, convertEmojiRuns } = await import('masterchat'));
+    ({ Masterchat, convertEmojiRuns } = await import('@stu43005/masterchat'));
   } catch {
-    log.error('[YouTube] masterchat not installed — run: npm install masterchat');
+    log.error('[YouTube] masterchat not installed — run: npm install @stu43005/masterchat');
     return;
   }
 
