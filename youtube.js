@@ -27,9 +27,9 @@ async function _startMasterchat(videoId, queue) {
     return;
   }
 
-  let Masterchat, convertEmojiRuns;
+  let Masterchat, stringify;
   try {
-    ({ Masterchat, convertEmojiRuns } = await import('@stu43005/masterchat'));
+    ({ Masterchat, stringify } = await import('@stu43005/masterchat'));
   } catch {
     log.error('[YouTube] masterchat not installed — run: npm install @stu43005/masterchat');
     return;
@@ -38,37 +38,27 @@ async function _startMasterchat(videoId, queue) {
   log.info(`[YouTube] Starting masterchat for video=${videoId}`);
   let mc;
   try {
-    mc = new Masterchat(videoId, '', { mode: 'live' });
+    mc = await Masterchat.init(videoId);
   } catch (err) {
     log.error('[YouTube] Masterchat init failed:', err.message);
     return;
   }
 
   _activeSessions.set(videoId, mc);
-
-  mc.on('chat', (action) => {
-    const username = action.authorName ?? 'unknown';
-    const message  = action.message
-      ? action.message.map(r => r.text ?? r.emoji?.shortcuts?.[0] ?? '').join('')
-      : '';
-    if (message) queue.pushMessage({ platform: 'youtube', username, message });
-  });
-
-  mc.on('end', () => {
-    log.info(`[YouTube] masterchat ended for ${videoId}`);
-    _activeSessions.delete(videoId);
-  });
-
-  mc.on('error', (err) => {
-    log.error(`[YouTube] masterchat error (${videoId}):`, err.message);
-    _activeSessions.delete(videoId);
-  });
+  log.info(`[YouTube] masterchat connected for video=${videoId}`);
 
   try {
-    await mc.listen();
+    for await (const action of mc.iter()) {
+      if (action.type !== 'addChatItemAction') continue;
+      const username = action.authorName ?? 'unknown';
+      const message  = stringify ? stringify(action.message) : (action.message ?? '');
+      if (message) queue.pushMessage({ platform: 'youtube', username, message });
+    }
   } catch (err) {
-    log.error(`[YouTube] masterchat listen failed (${videoId}):`, err.message);
+    log.error(`[YouTube] masterchat error (${videoId}):`, err.message);
+  } finally {
     _activeSessions.delete(videoId);
+    log.info(`[YouTube] masterchat session ended for ${videoId}`);
   }
 }
 
