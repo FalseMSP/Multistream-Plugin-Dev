@@ -1,10 +1,11 @@
 'use strict';
 
 /**
- * WebSub (PubSubHubbub) server
- * ─────────────────────────────
- * Receives push notifications from YouTube when a channel goes live.
- * Verifies HMAC-SHA1 signature, parses the Atom feed, and triggers masterchat.
+ * HTTP server
+ * ───────────
+ * Handles two push notification systems on the same express instance:
+ *  • GET/POST /websub       — YouTube WebSub (PubSubHubbub)
+ *  • POST     /eventsub     — Twitch EventSub (channel point redeems)
  */
 
 const express   = require('express');
@@ -12,29 +13,25 @@ const crypto    = require('crypto');
 const { parseStringPromise } = require('xml2js');
 const log       = require('./logger');
 
-const PUBLIC_URL     = (process.env.WEBSUB_PUBLIC_URL ?? '').replace(/\/$/, '');
-const SECRET         = process.env.WEBSUB_SECRET       ?? 'change-me-please';
-const PORT           = parseInt(process.env.WEBSUB_PORT ?? '8081', 10);
-const HUB            = 'https://pubsubhubbub.appspot.com/';
-const LEASE_SECONDS  = 86400;
-const YT_CHANNEL_ID  = process.env.YT_CHANNEL_ID ?? '';
+const PUBLIC_URL    = (process.env.WEBSUB_PUBLIC_URL ?? '').replace(/\/$/, '');
+const YT_SECRET     = process.env.WEBSUB_SECRET      ?? 'change-me-please';
+const TWITCH_SECRET = process.env.TWITCH_EVENTSUB_SECRET ?? 'change-me-twitch';
+const PORT          = parseInt(process.env.WEBSUB_PORT ?? '8081', 10);
+const HUB           = 'https://pubsubhubbub.appspot.com/';
+const LEASE_SECONDS = 86400;
+const YT_CHANNEL_ID = process.env.YT_CHANNEL_ID ?? '';
 
-let _queue = null;  // set on startWebSub()
+let _queue = null;
 
-// ── HMAC verification ─────────────────────────────────────────────────────
+// ── YouTube WebSub ────────────────────────────────────────────────────────
 
-function verifySignature(body, header) {
+function verifyYtSignature(body, header) {
   if (!header?.startsWith('sha1=')) return false;
-  const expected = crypto.createHmac('sha1', SECRET).update(body).digest('hex');
-  return crypto.timingSafeEqual(
-    Buffer.from(expected),
-    Buffer.from(header.slice(5))
-  );
+  const expected = crypto.createHmac('sha1', YT_SECRET).update(body).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header.slice(5)));
 }
 
-// ── Subscription ──────────────────────────────────────────────────────────
-
-async function subscribe(channelId) {
+async function ytSubscribe(channelId) {
   const { default: fetch } = await import('node-fetch');
   const topic    = `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`;
   const callback = `${PUBLIC_URL}/websub`;
@@ -44,66 +41,123 @@ async function subscribe(channelId) {
     'hub.topic':         topic,
     'hub.callback':      callback,
     'hub.lease_seconds': String(LEASE_SECONDS),
-    'hub.secret':        SECRET,
+    'hub.secret':        YT_SECRET,
   });
 
   const res = await fetch(HUB, { method: 'POST', body });
   if (res.status === 202 || res.status === 204) {
-    log.info('[WebSub] Subscription accepted for channel', channelId);
+    log.info('[WebSub] YouTube subscription accepted for channel', channelId);
   } else {
-    log.error('[WebSub] Subscription failed', res.status, await res.text());
+    log.error('[WebSub] YouTube subscription failed', res.status, await res.text());
   }
 }
 
-async function renewLoop(channelId) {
+async function ytRenewLoop(channelId) {
   while (true) {
     await new Promise(r => setTimeout(r, (LEASE_SECONDS - 3600) * 1000));
-    log.info('[WebSub] Renewing subscription…');
-    await subscribe(channelId).catch(e => log.error('[WebSub] Renew error:', e));
+    log.info('[WebSub] Renewing YouTube subscription…');
+    await ytSubscribe(channelId).catch(e => log.error('[WebSub] Renew error:', e));
   }
 }
 
-// ── Express routes ────────────────────────────────────────────────────────
+// ── Twitch EventSub ───────────────────────────────────────────────────────
+
+const TWITCH_MSG_ID          = 'twitch-eventsub-message-id';
+const TWITCH_MSG_TIMESTAMP   = 'twitch-eventsub-message-timestamp';
+const TWITCH_MSG_SIGNATURE   = 'twitch-eventsub-message-signature';
+const TWITCH_MSG_TYPE        = 'twitch-eventsub-message-type';
+
+function verifyTwitchSignature(body, headers) {
+  const msgId        = headers[TWITCH_MSG_ID]        ?? '';
+  const msgTimestamp = headers[TWITCH_MSG_TIMESTAMP] ?? '';
+  const msgSig       = headers[TWITCH_MSG_SIGNATURE] ?? '';
+
+  const hmacMessage = msgId + msgTimestamp + body;
+  const expected    = 'sha256=' + crypto.createHmac('sha256', TWITCH_SECRET).update(hmacMessage).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(msgSig));
+  } catch {
+    return false;
+  }
+}
+
+// ── Express app ───────────────────────────────────────────────────────────
 
 function buildApp() {
   const app = express();
 
-  // GET — hub verification challenge
+  // ── YouTube WebSub routes ──────────────────────────────────────────────
+
   app.get('/websub', (req, res) => {
     const { 'hub.challenge': challenge, 'hub.mode': mode } = req.query;
-    log.info('[WebSub] Hub verification:', mode);
+    log.info('[WebSub] YouTube hub verification:', mode);
     res.send(challenge ?? '');
   });
 
-  // POST — feed notification
   app.post('/websub', express.raw({ type: '*/*' }), async (req, res) => {
     const sig = req.headers['x-hub-signature'] ?? '';
-
-    if (SECRET && !verifySignature(req.body, sig)) {
-      log.warn('[WebSub] Signature mismatch — ignoring');
+    if (YT_SECRET && !verifyYtSignature(req.body, sig)) {
+      log.warn('[WebSub] YouTube signature mismatch — ignoring');
       return res.sendStatus(403);
     }
-
-    res.sendStatus(204); // respond fast before processing
+    res.sendStatus(204);
 
     try {
-      const xml = req.body.toString('utf8');
+      const xml    = req.body.toString('utf8');
       const parsed = await parseStringPromise(xml, { explicitArray: false });
       const entries = parsed?.feed?.entry;
-      const list = Array.isArray(entries) ? entries : entries ? [entries] : [];
-
+      const list    = Array.isArray(entries) ? entries : entries ? [entries] : [];
       for (const entry of list) {
         const videoId = entry?.['yt:videoId'];
         if (videoId) {
-          log.info('[WebSub] New video notification:', videoId);
-          // Dynamically require to avoid circular dep at module load
+          log.info('[WebSub] YouTube video notification:', videoId);
           const yt = require('./youtube');
           yt.triggerVideo(videoId, _queue);
         }
       }
     } catch (err) {
-      log.error('[WebSub] Parse error:', err.message);
+      log.error('[WebSub] YouTube parse error:', err.message);
     }
+  });
+
+  // ── Twitch EventSub route ──────────────────────────────────────────────
+
+  app.post('/eventsub', express.raw({ type: '*/*' }), (req, res) => {
+    if (!verifyTwitchSignature(req.body, req.headers)) {
+      log.warn('[EventSub] Twitch signature mismatch — ignoring');
+      return res.sendStatus(403);
+    }
+
+    const msgType = req.headers[TWITCH_MSG_TYPE];
+    const body    = JSON.parse(req.body.toString('utf8'));
+
+    // Twitch sends a webhook_callback_verification challenge on first subscribe
+    if (msgType === 'webhook_callback_verification') {
+      log.info('[EventSub] Twitch challenge verified ✓');
+      return res.status(200).send(body.challenge);
+    }
+
+    if (msgType === 'notification') {
+      const event = body.event;
+      if (event && _queue) {
+        log.info(`[EventSub] Redeem: ${event.user_name} → ${event.reward?.title}`);
+        _queue.pushRedeem({
+          username:  event.user_name,
+          title:     event.reward?.title    ?? 'Unknown Reward',
+          cost:      event.reward?.cost     ?? 0,
+          input:     event.user_input       || null,
+          timestamp: new Date(event.redeemed_at),
+        });
+      }
+      return res.sendStatus(204);
+    }
+
+    if (msgType === 'revocation') {
+      log.warn('[EventSub] Twitch subscription revoked:', body.subscription?.status);
+      return res.sendStatus(204);
+    }
+
+    res.sendStatus(204);
   });
 
   return app;
@@ -123,12 +177,21 @@ async function startWebSub(queue) {
   await new Promise((resolve, reject) =>
     app.listen(PORT, '0.0.0.0', (err) => err ? reject(err) : resolve())
   );
-  log.info(`[WebSub] Server listening on port ${PORT}`);
+  log.info(`[WebSub/EventSub] Server listening on port ${PORT}`);
 
-  await subscribe(YT_CHANNEL_ID);
-  renewLoop(YT_CHANNEL_ID); // not awaited
+  await ytSubscribe(YT_CHANNEL_ID);
+  ytRenewLoop(YT_CHANNEL_ID);
 
   return true;
 }
 
-module.exports = { startWebSub };
+// Called by twitch.js after connecting, to register the EventSub subscription
+function getEventSubCallbackUrl() {
+  return PUBLIC_URL ? `${PUBLIC_URL}/eventsub` : null;
+}
+
+function getTwitchSecret() {
+  return TWITCH_SECRET;
+}
+
+module.exports = { startWebSub, getEventSubCallbackUrl, getTwitchSecret };
