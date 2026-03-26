@@ -29,7 +29,7 @@ async function _startMasterchat(videoId, queue) {
 
   let Masterchat, stringify;
   try {
-    ({ Masterchat, stringify } = await import('@stu43005/masterchat'));
+    ({ Masterchat, stringify } = require('@stu43005/masterchat'));
   } catch {
     log.error('[YouTube] masterchat not installed — run: npm install @stu43005/masterchat');
     return;
@@ -47,28 +47,31 @@ async function _startMasterchat(videoId, queue) {
   _activeSessions.set(videoId, mc);
   log.info(`[YouTube] masterchat connected for video=${videoId}`);
 
-  try {
-    for await (const action of mc.iter()) {
-      if (action.type !== 'addChatItemAction') continue;
-      const username = action.authorName ?? 'unknown';
-      const message  = stringify ? stringify(action.message) : (action.message ?? '');
-      if (message) queue.pushMessage({ platform: 'youtube', username, message });
-    }
-  } catch (err) {
-    log.error(`[YouTube] masterchat error (${videoId}):`, err.message);
-  } finally {
+  mc.on('chat', (chat) => {
+    const username = chat.authorName ?? 'unknown';
+    const message  = stringify ? stringify(chat.message) : '';
+    if (message) queue.pushMessage({ platform: 'youtube', username, message });
+  });
+
+  mc.on('end', () => {
+    log.info(`[YouTube] masterchat ended for ${videoId}`);
     _activeSessions.delete(videoId);
-    log.info(`[YouTube] masterchat session ended for ${videoId}`);
-  }
+  });
+
+  mc.on('error', (err) => {
+    log.error(`[YouTube] masterchat error (${videoId}):`, err.message);
+    _activeSessions.delete(videoId);
+  });
+
+  // Non-blocking — listen() runs the polling loop in the background
+  mc.listen();
 }
 
 // ── Live video detection ──────────────────────────────────────────────────
 
 async function _findLiveVideoId() {
-  // Static override
   if (YT_VIDEO_ID) return YT_VIDEO_ID;
 
-  // API search
   if (YT_API_KEY && YT_CHANNEL_ID) {
     try {
       const { default: fetch } = await import('node-fetch');
@@ -81,7 +84,6 @@ async function _findLiveVideoId() {
     }
   }
 
-  // Scrape fallback (no quota cost)
   if (YT_CHANNEL_ID) {
     try {
       const { default: fetch } = await import('node-fetch');
@@ -110,7 +112,7 @@ async function _watchdog(queue) {
       const videoId = await _findLiveVideoId();
       if (videoId && !_activeSessions.has(videoId)) {
         log.info('[YouTube] Live video detected:', videoId);
-        _startMasterchat(videoId, queue); // don't await — runs in background
+        _startMasterchat(videoId, queue);
       }
     } catch (err) {
       log.error('[YouTube] Watchdog error:', err.message);
@@ -119,48 +121,14 @@ async function _watchdog(queue) {
   }
 }
 
-// ── Mod actions via YouTube Data API ────────────────────────────────────
-
-async function _ytApiRequest(method, endpoint, params, body) {
-  const { default: fetch } = await import('node-fetch');
-  const url = new URL(`https://www.googleapis.com/youtube/v3/${endpoint}`);
-  url.searchParams.set('key', YT_API_KEY);
-  for (const [k, v] of Object.entries(params ?? {})) url.searchParams.set(k, v);
-
-  const res = await fetch(url.toString(), {
-    method,
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`YouTube API ${res.status}: ${text}`);
-  }
-  return res.status === 204 ? null : res.json();
-}
-
-async function _getLiveChatId() {
-  const videoId = await _findLiveVideoId();
-  if (!videoId) throw new Error('No live video found');
-  const data = await _ytApiRequest('GET', 'videos', { part: 'liveStreamingDetails', id: videoId });
-  const chatId = data?.items?.[0]?.liveStreamingDetails?.activeLiveChatId;
-  if (!chatId) throw new Error('No active live chat');
-  return chatId;
-}
+// ── Mod actions ───────────────────────────────────────────────────────────
 
 async function ytBan(_, username) {
-  // YouTube "ban" = hide user from chat (requires OAuth, not API key)
-  // This requires the channel owner's OAuth token — documented limitation.
-  // For now we log a clear message; full OAuth flow is a separate setup step.
   log.warn(`[YouTube] Ban for "${username}" requires OAuth token — see README.`);
   throw new Error('YouTube ban requires OAuth setup (see README)');
 }
 
 async function ytVip(_, username) {
-  log.warn(`[YouTube] VIP for "${username}" — YouTube has no VIP concept; promoting to moderator instead.`);
-  // YouTube's equivalent is "moderator" role via liveChatModerators.insert
-  // Requires OAuth — same limitation as ban.
   throw new Error('YouTube mod promotion requires OAuth setup (see README)');
 }
 
@@ -177,15 +145,12 @@ async function startYouTube(queue, websubRunning) {
   }
 
   if (!websubRunning) {
-    // No WebSub — poll for live video
-    _watchdog(queue); // intentionally not awaited
+    _watchdog(queue);
   } else {
     log.info('[YouTube] WebSub active — watchdog polling disabled.');
-    // WebSub will call triggerVideo() when a new video goes live
   }
 }
 
-/** Called by WebSub when a new video is published */
 function triggerVideo(videoId, queue) {
   _startMasterchat(videoId, queue);
 }
