@@ -49,16 +49,30 @@ async function main() {
     if (platform === 'youtube') return ytModule.modHandlers.unvip('youtube', username);
   });
 
-  // 4. Twitch
-  await twitchModule.startTwitch(queue);
-
-  // 5. YouTube WebSub server (returns false if not configured → polling fallback)
+  // 4. YouTube WebSub + EventSub HTTP server
   const websubRunning = await startWebSub(queue);
 
-  // 6. YouTube chat + watchdog
+  // 5. Purge any stale Twitch EventSub subs from previous runs, then
+  //    register a fresh one — both must happen AFTER the server is listening
+  //    so Twitch can reach /eventsub for the challenge handshake.
+  const { getEventSubCallbackUrl, getTwitchSecret, purgeStaleTwitchSubs } = require('./src/websub');
+  if (getEventSubCallbackUrl()) {
+    try {
+      const appToken = await twitchModule.getAppToken();
+      await purgeStaleTwitchSubs(appToken);
+    } catch (err) {
+      log.warn('Could not purge stale Twitch subs:', err.message);
+    }
+    await twitchModule.setupEventSub(getEventSubCallbackUrl(), getTwitchSecret());
+  }
+
+  // 6. Twitch IRC (chat mirroring)
+  await twitchModule.startTwitch(queue);
+
+  // 7. YouTube chat + watchdog
   await ytModule.startYouTube(queue, websubRunning);
 
-  // 7. Register Discord slash commands (idempotent guild deploy)
+  // 8. Register Discord slash commands (idempotent guild deploy)
   await discord.registerCommands();
 
   log.info('chat-mirror running. Ctrl+C to stop.');

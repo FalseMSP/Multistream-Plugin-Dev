@@ -14,8 +14,9 @@ const { parseStringPromise } = require('xml2js');
 const log       = require('./logger');
 
 const PUBLIC_URL    = (process.env.WEBSUB_PUBLIC_URL ?? '').replace(/\/$/, '');
-const YT_SECRET     = process.env.WEBSUB_SECRET      ?? 'change-me-please';
-const TWITCH_SECRET = process.env.TWITCH_EVENTSUB_SECRET ?? 'change-me-twitch';
+const YT_SECRET     = process.env.WEBSUB_SECRET           ?? 'change-me-please';
+const TWITCH_SECRET = process.env.TWITCH_EVENTSUB_SECRET  ?? 'change-me-twitch';
+const CLIENT_ID     = process.env.TWITCH_CLIENT_ID        ?? '';
 const PORT          = parseInt(process.env.WEBSUB_PORT ?? '8081', 10);
 const HUB           = 'https://pubsubhubbub.appspot.com/';
 const LEASE_SECONDS = 86400;
@@ -62,22 +63,76 @@ async function ytRenewLoop(channelId) {
 
 // ── Twitch EventSub ───────────────────────────────────────────────────────
 
-const TWITCH_MSG_ID          = 'twitch-eventsub-message-id';
-const TWITCH_MSG_TIMESTAMP   = 'twitch-eventsub-message-timestamp';
-const TWITCH_MSG_SIGNATURE   = 'twitch-eventsub-message-signature';
-const TWITCH_MSG_TYPE        = 'twitch-eventsub-message-type';
+const TWITCH_MSG_ID        = 'twitch-eventsub-message-id';
+const TWITCH_MSG_TIMESTAMP = 'twitch-eventsub-message-timestamp';
+const TWITCH_MSG_SIGNATURE = 'twitch-eventsub-message-signature';
+const TWITCH_MSG_TYPE      = 'twitch-eventsub-message-type';
 
 function verifyTwitchSignature(body, headers) {
   const msgId        = headers[TWITCH_MSG_ID]        ?? '';
   const msgTimestamp = headers[TWITCH_MSG_TIMESTAMP] ?? '';
   const msgSig       = headers[TWITCH_MSG_SIGNATURE] ?? '';
 
-  const hmacMessage = msgId + msgTimestamp + body;
-  const expected    = 'sha256=' + crypto.createHmac('sha256', TWITCH_SECRET).update(hmacMessage).digest('hex');
+  // body is a Buffer from express.raw — feed parts to .update() separately
+  // so the bytes are hashed as-is rather than coerced to "[object Buffer]"
+  const hmac = crypto.createHmac('sha256', TWITCH_SECRET);
+  hmac.update(msgId);
+  hmac.update(msgTimestamp);
+  hmac.update(body);
+  const expected = 'sha256=' + hmac.digest('hex');
+
+  // DEBUG — remove once redeems are confirmed working
+  log.info('[EventSub] sig verify | bodyIsBuffer:', Buffer.isBuffer(body));
+  log.info('[EventSub] sig verify | bodyLen:', body.length);
+  log.info('[EventSub] sig verify | msgId:', msgId);
+  log.info('[EventSub] sig verify | timestamp:', msgTimestamp);
+  log.info('[EventSub] sig verify | expected:', expected);
+  log.info('[EventSub] sig verify | received:', msgSig);
+  log.info('[EventSub] sig verify | match:', expected === msgSig);
+
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(msgSig));
-  } catch {
+  } catch (e) {
+    log.error('[EventSub] sig verify timingSafeEqual threw:', e.message, '| expected.len:', expected.length, '| received.len:', msgSig.length);
     return false;
+  }
+}
+
+/**
+ * Purge any EventSub subscriptions for channel point redeems that are not
+ * in 'enabled' state (e.g. webhook_callback_verification_failed from a
+ * previous run where the server wasn't ready in time).
+ */
+async function purgeStaleTwitchSubs(appToken) {
+  if (!appToken || !CLIENT_ID) return;
+  try {
+    const { default: fetch } = await import('node-fetch');
+    const res  = await fetch(
+      'https://api.twitch.tv/helix/eventsub/subscriptions?type=channel.channel_points_custom_reward_redemption.add',
+      { headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${appToken}` } }
+    );
+    if (!res.ok) {
+      log.warn('[EventSub] Could not list subs for purge:', res.status);
+      return;
+    }
+    const data  = await res.json();
+    const stale = (data?.data ?? []).filter(s => s.status !== 'enabled');
+    for (const sub of stale) {
+      const del = await fetch(
+        `https://api.twitch.tv/helix/eventsub/subscriptions?id=${sub.id}`,
+        {
+          method:  'DELETE',
+          headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${appToken}` },
+        }
+      );
+      if (del.status === 204) {
+        log.info(`[EventSub] Purged stale sub ${sub.id} (${sub.status})`);
+      } else {
+        log.warn(`[EventSub] Failed to delete sub ${sub.id}:`, del.status);
+      }
+    }
+  } catch (err) {
+    log.warn('[EventSub] Purge error:', err.message);
   }
 }
 
@@ -103,8 +158,8 @@ function buildApp() {
     res.sendStatus(204);
 
     try {
-      const xml    = req.body.toString('utf8');
-      const parsed = await parseStringPromise(xml, { explicitArray: false });
+      const xml     = req.body.toString('utf8');
+      const parsed  = await parseStringPromise(xml, { explicitArray: false });
       const entries = parsed?.feed?.entry;
       const list    = Array.isArray(entries) ? entries : entries ? [entries] : [];
       for (const entry of list) {
@@ -123,6 +178,10 @@ function buildApp() {
   // ── Twitch EventSub route ──────────────────────────────────────────────
 
   app.post('/eventsub', express.raw({ type: '*/*' }), (req, res) => {
+    // TEMP: log every incoming request
+    log.info('[EventSub] Incoming request headers:', JSON.stringify(req.headers, null, 2));
+    log.info('[EventSub] Incoming request body:', req.body?.toString('utf8'));
+
     if (!verifyTwitchSignature(req.body, req.headers)) {
       log.warn('[EventSub] Twitch signature mismatch — ignoring');
       return res.sendStatus(403);
@@ -143,9 +202,9 @@ function buildApp() {
         log.info(`[EventSub] Redeem: ${event.user_name} → ${event.reward?.title}`);
         _queue.pushRedeem({
           username:  event.user_name,
-          title:     event.reward?.title    ?? 'Unknown Reward',
-          cost:      event.reward?.cost     ?? 0,
-          input:     event.user_input       || null,
+          title:     event.reward?.title ?? 'Unknown Reward',
+          cost:      event.reward?.cost  ?? 0,
+          input:     event.user_input    || null,
           timestamp: new Date(event.redeemed_at),
         });
       }
@@ -166,8 +225,11 @@ function buildApp() {
 // ── Entry point ───────────────────────────────────────────────────────────
 
 async function startWebSub(queue) {
-  if (!PUBLIC_URL || !YT_CHANNEL_ID) {
-    log.info('[WebSub] Not configured — YouTube will use polling fallback.');
+  // The EventSub server must start even if YouTube is not configured,
+  // because Twitch needs the /eventsub endpoint to be up before it
+  // creates the subscription (otherwise the challenge fails).
+  if (!PUBLIC_URL) {
+    log.info('[WebSub] WEBSUB_PUBLIC_URL not set — WebSub/EventSub server disabled.');
     return false;
   }
 
@@ -179,8 +241,22 @@ async function startWebSub(queue) {
   );
   log.info(`[WebSub/EventSub] Server listening on port ${PORT}`);
 
-  await ytSubscribe(YT_CHANNEL_ID);
-  ytRenewLoop(YT_CHANNEL_ID);
+  // Purge any stale EventSub subs from previous runs before Twitch reconnects.
+  // We need the app token — borrow it from twitch.js if available.
+  try {
+    const twitch   = require('./twitch');
+    const appToken = await twitch.getAppToken?.();
+    if (appToken) await purgeStaleTwitchSubs(appToken);
+  } catch {
+    // twitch module may not expose getAppToken — silently skip
+  }
+
+  if (YT_CHANNEL_ID) {
+    await ytSubscribe(YT_CHANNEL_ID);
+    ytRenewLoop(YT_CHANNEL_ID);
+  } else {
+    log.info('[WebSub] YT_CHANNEL_ID not set — YouTube WebSub skipped.');
+  }
 
   return true;
 }
@@ -194,4 +270,4 @@ function getTwitchSecret() {
   return TWITCH_SECRET;
 }
 
-module.exports = { startWebSub, getEventSubCallbackUrl, getTwitchSecret };
+module.exports = { startWebSub, getEventSubCallbackUrl, getTwitchSecret, purgeStaleTwitchSubs };
