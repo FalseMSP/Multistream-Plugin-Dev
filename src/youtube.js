@@ -357,19 +357,138 @@ async function _watchdog(queue) {
   }
 }
 
+// ── YouTube OAuth client ──────────────────────────────────────────────────
+
+const fs   = require('fs');
+const path = require('path');
+const YT_TOKEN_FILE = path.resolve('.youtube-tokens.json');
+
+function _getOAuthClient() {
+  const { google } = require('googleapis');
+  const creds = JSON.parse(fs.readFileSync('client_secret.json'));
+  const { client_id, client_secret } = creds.installed ?? creds.web;
+  const oauth2 = new google.auth.OAuth2(client_id, client_secret, 'http://localhost');
+
+  if (!fs.existsSync(YT_TOKEN_FILE)) {
+    throw new Error('YouTube OAuth not set up — run: node youtube_auth.js');
+  }
+  const tokens = JSON.parse(fs.readFileSync(YT_TOKEN_FILE));
+  oauth2.setCredentials(tokens);
+
+  // Persist refreshed tokens automatically
+  oauth2.on('tokens', (fresh) => {
+    const merged = { ...tokens, ...fresh };
+    fs.writeFileSync(YT_TOKEN_FILE, JSON.stringify(merged, null, 2));
+    log.info('[YouTube] OAuth tokens refreshed and saved.');
+  });
+
+  return oauth2;
+}
+
+// Resolve a display name to an active live chat participant's channel ID.
+// YouTube has no username→ID lookup; we have to search the live chat itself.
+async function _findChatParticipant(youtube, liveChatId, displayName) {
+  let pageToken;
+  do {
+    const res = await youtube.liveChatMessages.list({
+      liveChatId,
+      part: ['authorDetails'],
+      maxResults: 200,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const item of res.data.items ?? []) {
+      if (item.authorDetails?.displayName?.toLowerCase() === displayName.toLowerCase()) {
+        return item.authorDetails.channelId;
+      }
+    }
+    pageToken = res.data.nextPageToken;
+  } while (pageToken);
+  return null;
+}
+
+async function _getActiveLiveChatId() {
+  const videoId = await _findLiveVideoId();
+  if (!videoId) throw new Error('No active YouTube live stream found');
+  const chatId = await _getLiveChatId(videoId);
+  if (!chatId) throw new Error(`No active live chat for video ${videoId}`);
+  return chatId;
+}
+
 // ── Mod actions ───────────────────────────────────────────────────────────
 
 async function ytBan(_, username) {
-  log.warn(`[YouTube] Ban for "${username}" requires OAuth token — see README.`);
-  throw new Error('YouTube ban requires OAuth setup (see README)');
+  const { google } = require('googleapis');
+  const auth    = _getOAuthClient();
+  const youtube = google.youtube({ version: 'v3', auth });
+
+  const liveChatId = await _getActiveLiveChatId();
+  const channelId  = await _findChatParticipant(youtube, liveChatId, username);
+  if (!channelId) throw new Error(`YouTube user "${username}" not found in live chat`);
+
+  await youtube.liveChatBans.insert({
+    part: ['snippet'],
+    requestBody: {
+      snippet: {
+        liveChatId,
+        type: 'permanent',
+        bannedUserDetails: { channelId },
+      },
+    },
+  });
+  log.info(`[YouTube] Banned ${username}`);
 }
 
 async function ytVip(_, username) {
-  throw new Error('YouTube mod promotion requires OAuth setup (see README)');
+  const { google } = require('googleapis');
+  const auth    = _getOAuthClient();
+  const youtube = google.youtube({ version: 'v3', auth });
+
+  const liveChatId = await _getActiveLiveChatId();
+  const channelId  = await _findChatParticipant(youtube, liveChatId, username);
+  if (!channelId) throw new Error(`YouTube user "${username}" not found in live chat`);
+
+  await youtube.liveChatModerators.insert({
+    part: ['snippet'],
+    requestBody: {
+      snippet: {
+        liveChatId,
+        moderatorDetails: { channelId },
+      },
+    },
+  });
+  log.info(`[YouTube] Promoted ${username} to moderator`);
 }
 
 async function ytUnvip(_, username) {
-  throw new Error('YouTube mod removal requires OAuth setup (see README)');
+  const { google } = require('googleapis');
+  const auth    = _getOAuthClient();
+  const youtube = google.youtube({ version: 'v3', auth });
+
+  const liveChatId = await _getActiveLiveChatId();
+
+  // Find the moderator entry by listing all mods and matching display name
+  let pageToken;
+  let moderatorId = null;
+  do {
+    const res = await youtube.liveChatModerators.list({
+      liveChatId,
+      part: ['snippet'],
+      maxResults: 50,
+      ...(pageToken ? { pageToken } : {}),
+    });
+    for (const item of res.data.items ?? []) {
+      if (item.snippet?.moderatorDetails?.displayName?.toLowerCase() === username.toLowerCase()) {
+        moderatorId = item.id;
+        break;
+      }
+    }
+    pageToken = res.data.nextPageToken;
+  } while (pageToken && !moderatorId);
+
+  if (!moderatorId) throw new Error(`YouTube user "${username}" is not a moderator`);
+
+  await youtube.liveChatModerators.delete({ id: moderatorId });
+  log.info(`[YouTube] Removed moderator ${username}`);
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────
@@ -408,6 +527,7 @@ function triggerVideo(videoId, queue) {
 }
 
 module.exports = {
+  say,
   startYouTube,
   triggerVideo,
   modHandlers: {
@@ -416,3 +536,45 @@ module.exports = {
     unvip: ytUnvip,
   },
 };
+// ── Chat reply ─────────────────────────────────────────────────────────────
+
+/**
+ * Send a message to the active YouTube live chat.
+ * Requires OAuth (client_secret.json + .youtube-tokens.json).
+ * Silently warns if no stream is active or OAuth is not set up.
+ */
+async function say(text) {
+  let auth, youtube;
+  try {
+    const { google } = require('googleapis');
+    auth    = _getOAuthClient();
+    youtube = google.youtube({ version: 'v3', auth });
+  } catch (err) {
+    log.warn('[YouTube] say() — OAuth not configured:', err.message);
+    return;
+  }
+
+  let liveChatId;
+  try {
+    liveChatId = await _getActiveLiveChatId();
+  } catch (err) {
+    log.warn('[YouTube] say() — no active live chat:', err.message);
+    return;
+  }
+
+  try {
+    await youtube.liveChatMessages.insert({
+      part: ['snippet'],
+      requestBody: {
+        snippet: {
+          liveChatId,
+          type: 'textMessageEvent',
+          textMessageDetails: { messageText: text },
+        },
+      },
+    });
+    log.debug('[YouTube] say():', text);
+  } catch (err) {
+    log.error('[YouTube] say() error:', err.message);
+  }
+}

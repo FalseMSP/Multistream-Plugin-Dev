@@ -255,32 +255,76 @@ function handleEventSubNotification(type, event, queue) {
   }
 }
 // ── Mod actions ───────────────────────────────────────────────────────────
-async function twitchBan(_, username, reason) {
-  const broadcasterId = await getBroadcasterId();
-  const userRes = await helixRequest('GET', `/users?login=${username}`);
-  const userId  = userRes?.data?.[0]?.id;
-  if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-  await helixRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
-    data: { user_id: userId, reason },
-  });
-  log.info(`[Twitch] Banned ${username}`);
-}
 async function twitchVip(_, username) {
   const broadcasterId = await getBroadcasterId();
   const userRes = await helixRequest('GET', `/users?login=${username}`);
   const userId  = userRes?.data?.[0]?.id;
   if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-  await helixRequest('POST', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
+  
+  // Must use user token — app token returns 401 for this endpoint
+  const { default: fetch } = await import('node-fetch');
+  const userToken = await getUserToken();
+  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
+  const res = await fetch(
+    `https://api.twitch.tv/helix/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`,
+    { method: 'POST', headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}` } }
+  );
+  if (!res.ok) throw new Error(`Twitch VIP API ${res.status}: ${await res.text()}`);
   log.info(`[Twitch] VIP granted to ${username}`);
 }
+
 async function twitchUnvip(_, username) {
   const broadcasterId = await getBroadcasterId();
   const userRes = await helixRequest('GET', `/users?login=${username}`);
   const userId  = userRes?.data?.[0]?.id;
   if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-  await helixRequest('DELETE', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
+
+  const { default: fetch } = await import('node-fetch');
+  const userToken = await getUserToken();
+  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
+  const res = await fetch(
+    `https://api.twitch.tv/helix/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`,
+    { method: 'DELETE', headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}` } }
+  );
+  if (!res.ok) throw new Error(`Twitch unVIP API ${res.status}: ${await res.text()}`);
   log.info(`[Twitch] VIP removed from ${username}`);
 }
+
+async function twitchBan(_, username, reason) {
+  const broadcasterId = await getBroadcasterId();
+  const userRes = await helixRequest('GET', `/users?login=${username}`);
+  const userId  = userRes?.data?.[0]?.id;
+  if (!userId) throw new Error(`User "${username}" not found on Twitch`);
+
+  const { default: fetch } = await import('node-fetch');
+  const userToken = await getUserToken();
+  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
+  const res = await fetch(
+    // moderator_id must be the account that owns the user token (the broadcaster in this case)
+    `https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`,
+    {
+      method: 'POST',
+      headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: { user_id: userId, reason } }),
+    }
+  );
+  if (!res.ok) throw new Error(`Twitch ban API ${res.status}: ${await res.text()}`);
+  log.info(`[Twitch] Banned ${username}`);
+}
+
+let _tmiClient = null;
+
+/**
+ * Send a message to all monitored Twitch channels.
+ */
+async function say(text) {
+  if (!_tmiClient) { log.warn("[Twitch] say() called before client ready"); return; }
+  for (const ch of CHANNELS) {
+    try { await _tmiClient.say(ch, text); }
+    catch (err) { log.error("[Twitch] say() error on " + ch + ":", err.message); }
+  }
+}
+
 // ── tmi.js client ─────────────────────────────────────────────────────────
 async function startTwitch(queue) {
   if (!TOKEN || !BOT_NICK || !CHANNELS.length) {
@@ -468,9 +512,11 @@ async function startTwitch(queue) {
   });
   await client.connect();
   log.info('[Twitch] tmi.js client ready');
+  _tmiClient = client;
   return client;
 }
 module.exports = {
+  say,
   startTwitch,
   setupEventSub,
   getAppToken,

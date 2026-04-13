@@ -9,6 +9,7 @@
  *  • Twitch redeems → #redeem-feed AND #chat-feed  (gold embed)
  *  • Discord slash commands: /ban /vip  (works on Twitch + YouTube)
  *  • YouTube: WebSub primary, masterchat polling fallback
+ *  • Plugin pipeline (src/plugins/) for extensible message processing
  */
 
 'use strict';
@@ -21,6 +22,7 @@ const ytModule            = require('./src/youtube');
 const { startWebSub }     = require('./src/websub');
 const queue               = require('./src/queue');
 const log                 = require('./src/logger');
+const plugins             = require('./src/plugins/index');
 
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
 process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err));
@@ -28,7 +30,7 @@ process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err)
 async function main() {
   log.info('chat-mirror starting…');
 
-  // 1. Discord bot
+  // 1. Discord bot (also loads + inits plugins)
   const discord = await startDiscordBot();
 
   // 2. Wire queue → Discord embeds
@@ -72,7 +74,14 @@ async function main() {
   // 7. YouTube chat + watchdog
   await ytModule.startYouTube(queue, websubRunning);
 
-  // 8. Register Discord slash commands (idempotent guild deploy)
+  // 8. Now that both platform clients are up, give plugins access to chat reply.
+  //    Plugins that need to send messages back to Twitch/YouTube chat use these.
+  plugins.setChatReply({
+    twitch:  (text) => twitchModule.say(text),
+    youtube: (text) => ytModule.say(text),
+  });
+
+  // 9. Register Discord slash commands (idempotent guild deploy)
   await discord.registerCommands();
 
   log.info('chat-mirror running. Ctrl+C to stop.');

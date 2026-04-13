@@ -5,13 +5,14 @@
  * ──────────────
  * • Sends chat messages as rich embeds via DISCORD_CHAT_WEBHOOK
  * • Sends redeems as gold embeds via DISCORD_REDEEM_WEBHOOK (+ also to chat)
- * • Registers and handles /ban and /vip slash commands
+ * • Registers and handles /ban, /vip, /unvip slash commands
+ * • Loads plugin slash commands and routes interactions to the plugin pipeline
  */
 
 const {
   Client, GatewayIntentBits, EmbedBuilder,
   REST, Routes, SlashCommandBuilder,
-  PermissionFlagsBits,
+  PermissionFlagsBits, WebhookClient,
 } = require('discord.js');
 
 const log = require('./logger');
@@ -23,23 +24,16 @@ const REDEEM_WEBHOOK_URL = process.env.DISCORD_REDEEM_WEBHOOK_URL ?? '';
 const BOT_TOKEN          = process.env.DISCORD_BOT_TOKEN          ?? '';
 const CLIENT_ID          = process.env.DISCORD_CLIENT_ID          ?? '';
 const GUILD_ID           = process.env.DISCORD_GUILD_ID           ?? '';
-const RATE_LIMIT         = parseFloat(process.env.DISCORD_RATE_LIMIT ?? '2'); // msgs/sec
+const RATE_LIMIT         = parseFloat(process.env.DISCORD_RATE_LIMIT ?? '2');
 
 // Platform colours
 const COLOURS = {
-  twitch:  0x9146FF,  // Twitch purple
-  youtube: 0xFF0000,  // YouTube red
-  redeem:  0xFFD700,  // Gold
-};
-
-const ICONS = {
-  twitch:  'https://cdn.jsdelivr.net/npm/simple-icons@v9/icons/twitch.svg',
-  youtube: 'https://cdn.jsdelivr.net/npm/simple-icons@v9/icons/youtube.svg',
+  twitch:  0x9146FF,
+  youtube: 0xFF0000,
+  redeem:  0xFFD700,
 };
 
 // ── Webhook sender ────────────────────────────────────────────────────────
-
-const { WebhookClient } = require('discord.js');
 
 let chatWebhook   = null;
 let redeemWebhook = null;
@@ -52,9 +46,9 @@ function getWebhooks() {
 // Token-bucket rate limiter
 class RateLimiter {
   constructor(ratePerSec) {
-    this._interval  = 1000 / ratePerSec;
-    this._queue     = [];
-    this._running   = false;
+    this._interval = 1000 / ratePerSec;
+    this._queue    = [];
+    this._running  = false;
   }
   schedule(fn) {
     return new Promise((resolve, reject) => {
@@ -75,7 +69,7 @@ class RateLimiter {
 
 const limiter = new RateLimiter(RATE_LIMIT);
 
-async function sendEmbed(webhookClient, embed, fallbackWebhook) {
+async function sendEmbed(webhookClient, embed) {
   const send = () => webhookClient.send({ embeds: [embed] });
   try {
     await limiter.schedule(send);
@@ -129,16 +123,12 @@ async function sendChat({ platform, username, message }) {
 async function sendRedeem({ username, title, cost, input, timestamp }) {
   getWebhooks();
   const embed = buildRedeemEmbed(username, title, cost, input, timestamp);
-
-  // Send to redeem feed
   if (redeemWebhook) await sendEmbed(redeemWebhook, embed);
   else log.warn('No redeem webhook configured');
-
-  // Also send to main chat feed
   if (chatWebhook)   await sendEmbed(chatWebhook, embed);
 }
 
-// ── Slash commands ────────────────────────────────────────────────────────
+// ── Core slash commands ───────────────────────────────────────────────────
 
 const PLATFORM_CHOICE = [
   { name: 'Both',    value: 'both'    },
@@ -146,7 +136,7 @@ const PLATFORM_CHOICE = [
   { name: 'YouTube', value: 'youtube' },
 ];
 
-const commands = [
+const coreCommands = [
   new SlashCommandBuilder()
     .setName('ban')
     .setDescription('Ban a user from Twitch and/or YouTube')
@@ -178,21 +168,30 @@ async function registerCommands() {
     log.warn('Discord bot credentials incomplete — slash commands disabled.');
     return;
   }
+
+  // Merge core commands with any plugin commands
+  const { getPluginCommands } = require('./plugins/index');
+  const allCommands = [...coreCommands, ...getPluginCommands()];
+
   const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-  log.info('Slash commands registered.');
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: allCommands });
+  log.info(`Slash commands registered (${allCommands.map(c => `/${c.name}`).join(', ')}).`);
 }
 
 // ── Bot client ────────────────────────────────────────────────────────────
 
 let _modHandlers = { ban: null, vip: null, unvip: null };
 
-/** Register external handlers so Twitch/YouTube modules can receive mod actions */
 function onModAction(action, fn) {
   _modHandlers[action] = fn;
 }
 
 async function startDiscordBot() {
+  // Load all plugins so their commands are available before registerCommands()
+  const plugins = require('./plugins/index');
+  plugins.loadPlugins();
+  plugins.initPlugins({ sendChat, sendRedeem, onModAction });
+
   if (!BOT_TOKEN) {
     log.warn('DISCORD_BOT_TOKEN not set — slash commands disabled. Webhooks still active.');
     return { sendChat, sendRedeem, registerCommands, onModAction };
@@ -205,6 +204,11 @@ async function startDiscordBot() {
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
 
+    // ── Try plugin commands first ──────────────────────────────────────
+    const handled = await plugins.handlePluginInteraction(interaction);
+    if (handled) return;
+
+    // ── Core mod commands ──────────────────────────────────────────────
     const { commandName } = interaction;
     const user     = interaction.options.getString('user');
     const platform = interaction.options.getString('platform') ?? 'both';
@@ -228,15 +232,12 @@ async function startDiscordBot() {
 
     const platforms = platform === 'both' ? ['twitch', 'youtube'] : [platform];
 
-    if (commandName === 'ban') {
-      for (const p of platforms) await run(p, 'ban');
-    } else if (commandName === 'vip') {
-      for (const p of platforms) await run(p, 'vip');
-    } else if (commandName === 'unvip') {
-      for (const p of platforms) await run(p, 'unvip');
-    }
+    if      (commandName === 'ban')   for (const p of platforms) await run(p, 'ban');
+    else if (commandName === 'vip')   for (const p of platforms) await run(p, 'vip');
+    else if (commandName === 'unvip') for (const p of platforms) await run(p, 'unvip');
+    else results.push(`⚠️ Unknown command: /${commandName}`);
 
-    await interaction.editReply(results.join('\n'));
+    await interaction.editReply(results.join('\n') || '⚠️ No actions were taken.');
   });
 
   await client.login(BOT_TOKEN);
