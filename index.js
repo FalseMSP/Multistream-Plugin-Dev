@@ -22,6 +22,10 @@ const queue               = require('./src/queue');
 const log                 = require('./src/logger');
 const plugins             = require('./src/plugins/index');
 
+// ▶ ADD THIS LINE — must come after plugins require() so registerSection()
+//   calls inside plugin modules (which fire at require-time) are already wired.
+const { startOverlayServer } = require('./src/overlay-server');
+
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
 process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err));
 
@@ -30,6 +34,11 @@ async function main() {
 
   // 1. Discord bot (also loads + inits plugins)
   const discord = await startDiscordBot();
+
+  // 1b. ▶ ADD THIS LINE — start the overlay HTTP server.
+  //     Port is optional; defaults to 2999.
+  //     OBS Browser Source URL: http://127.0.0.1:2999/overlay
+  startOverlayServer(2999);
 
   // 2. Wire queue → Discord embeds.
   //    Use late-binding lambdas so any plugin wrappers applied during

@@ -27,6 +27,9 @@
 
 const path = require('path');
 const log  = require('../logger');
+// Import overlay-server before any plugin loads so registerSection() is ready
+// when plugin modules execute their top-level require-time registration calls.
+require('../overlay-server');
 
 const _plugins = [];
 

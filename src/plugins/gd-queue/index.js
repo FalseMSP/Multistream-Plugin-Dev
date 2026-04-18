@@ -27,20 +27,62 @@
 
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
+const { registerSection, updateSection } = require('../../overlay-server');
 
 // ── State ─────────────────────────────────────────────────────────────────
-// Queue entries: Array<{ username, platform, levelId, notes, addedAt }>
-// Ordered by insertion time. One entry per username (case-insensitive).
 
 const _queue = [];
 let _enabled = true;
 
-const CMD_ADD      = /^!(?:q|queue)\s+(\d+)(?:\s+(.+))?\s*$/i;
-const CMD_LIST     = /^!q\s*$/i;
-const CMD_LENGTH   = /^!ql\s*$/i;
+const CMD_ADD    = /^!(?:q|queue)\s+(\d+)(?:\s+(.+))?\s*$/i;
+const CMD_LIST   = /^!q\s*$/i;
+const CMD_LENGTH = /^!ql\s*$/i;
 
-// Injected by onChatReady()
 let _chatReply = { twitch: null, youtube: null };
+
+function _notify() {
+  updateSection('gd-queue', { queue: _queue, enabled: _enabled });
+}
+
+// ── Overlay section registration ──────────────────────────────────────────
+
+registerSection('gd-queue', {
+  title: 'Level Queue',
+  order: 10,
+  icon: `<svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="5" width="18" height="2.5" rx="1.25" fill="#e53935"/>
+    <rect x="2" y="9.75" width="18" height="2.5" rx="1.25" fill="#e53935" opacity="0.6"/>
+    <rect x="2" y="14.5" width="12" height="2.5" rx="1.25" fill="#e53935" opacity="0.35"/>
+  </svg>`,
+  render: (function render(data, el, esc, { card, badge }) {
+    if (!data) { el.innerHTML = ''; return; }
+    const { queue, enabled } = data;
+
+    card.dataset.state = enabled ? '' : 'closed';
+    badge.textContent  = queue.length === 0 ? 'empty' : queue.length + (queue.length === 1 ? ' level' : ' levels');
+
+    if (queue.length === 0) {
+      el.innerHTML = '<div class="msg ' + (enabled ? 'msg-empty' : 'msg-closed') + '">'
+        + (enabled ? 'No levels in queue' : 'Queue closed') + '</div>';
+      return;
+    }
+
+    el.innerHTML = queue.map((e, i) => {
+      const hasNotes = e.notes && e.notes.trim();
+      return '<div class="entry">'
+        + '<span class="entry-pos">#' + (i + 1) + '</span>'
+        + '<div class="entry-main">'
+        +   '<span class="entry-id">'  + esc(e.levelId)  + '</span>'
+        +   '<span class="entry-user">'
+        +     '<span class="platform-dot ' + esc(e.platform) + '"></span>'
+        +     esc(e.username)
+        +   '</span>'
+        + '</div>'
+        + (hasNotes ? '<span class="entry-notes">' + esc(e.notes) + '</span>' : '')
+        + '</div>';
+    }).join('');
+  }).toString(),
+});
 
 // ── Queue helpers ─────────────────────────────────────────────────────────
 
@@ -57,7 +99,7 @@ function _add(username, platform, levelId, notes) {
   }
   _queue.push({ username, platform, levelId, notes: notes || null, addedAt: new Date() });
   log.info(`[gd-queue] Added: ${username} → ${levelId}${notes ? ` (notes: ${notes})` : ''} (queue length: ${_queue.length})`);
-  return existing !== -1; // true = was a replacement
+  return existing !== -1;
 }
 
 function _next() {
@@ -69,7 +111,6 @@ function _next() {
 async function processMessage(msg) {
   const text = msg.message.trim();
 
-  // !q (no args) — show the current queue
   if (CMD_LIST.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
@@ -89,23 +130,22 @@ async function processMessage(msg) {
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
-
     return { message: null };
   }
 
-  // !q <levelId> [notes] / !queue <levelId> [notes]
   if (CMD_ADD.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
       if (send) send(`@${msg.username} the level queue is currently closed.`)
         .catch(e => log.error('[gd-queue] chat reply error:', e.message));
-      return { message: null }; // still suppress from #stream-chat
+      return { message: null };
     }
 
     const addMatch  = text.match(CMD_ADD);
     const levelId   = addMatch[1];
     const notes     = addMatch[2] ? addMatch[2].trim() : null;
     const replaced  = _add(msg.username, msg.platform, levelId, notes);
+    _notify();
     const notesHint = notes ? ` (notes: ${notes})` : '';
     const reply     = replaced
       ? `@${msg.username} updated your request to level ${levelId}${notesHint}! Queue position: #${_queue.length}`
@@ -113,11 +153,9 @@ async function processMessage(msg) {
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
-
     return { message: null };
   }
 
-  // !ql
   if (CMD_LENGTH.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
@@ -133,7 +171,6 @@ async function processMessage(msg) {
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
-
     return { message: null };
   }
 
@@ -142,11 +179,11 @@ async function processMessage(msg) {
 
 // ── Slash commands ────────────────────────────────────────────────────────
 
-const GD_BLUE = 0x00a8ff;
+const GD_RED = 0xe53935;
 
 function _buildQueueEmbed() {
   const embed = new EmbedBuilder()
-    .setColor(GD_BLUE)
+    .setColor(GD_RED)
     .setTitle('🎮 GD Level Queue')
     .setTimestamp();
 
@@ -191,26 +228,26 @@ async function handleInteraction(interaction) {
   await interaction.deferReply({ ephemeral: false });
   const cmd = interaction.commandName;
 
-  // /next
   if (cmd === 'next') {
     if (!_enabled) {
       return interaction.editReply({ embeds: [
-        new EmbedBuilder().setColor(GD_BLUE).setDescription('⚠️ The queue is currently disabled.'),
+        new EmbedBuilder().setColor(GD_RED).setDescription('⚠️ The queue is currently disabled.'),
       ]});
     }
 
     const entry = _next();
+    _notify();
     if (!entry) {
       return interaction.editReply({ embeds: [
-        new EmbedBuilder().setColor(GD_BLUE).setDescription('📭 The queue is empty — no more levels!'),
+        new EmbedBuilder().setColor(GD_RED).setDescription('📭 The queue is empty — no more levels!'),
       ]});
     }
     const platform = entry.platform === 'twitch' ? '🟣 Twitch' : '🔴 YouTube';
     const embed = new EmbedBuilder()
-      .setColor(GD_BLUE)
+      .setColor(GD_RED)
       .setTitle('Next Level')
       .addFields(
-        { name: 'Level ID',     value: `\`${entry.levelId}\``,          inline: true },
+        { name: 'Level ID',     value: `\`${entry.levelId}\``,            inline: true },
         { name: 'Requested by', value: `(${platform}) ${entry.username}`, inline: true },
       )
       .setFooter({ text: `${_queue.length} level${_queue.length === 1 ? '' : 's'} remaining` })
@@ -221,16 +258,16 @@ async function handleInteraction(interaction) {
     return interaction.editReply({ embeds: [embed] });
   }
 
-  // /queue subcommands
   if (cmd === 'queue') {
     const sub = interaction.options.getSubcommand();
 
     if (sub === 'toggle') {
       _enabled = !_enabled;
+      _notify();
       log.info(`[gd-queue] Queue ${_enabled ? 'enabled' : 'disabled'} by Discord command`);
       return interaction.editReply({ embeds: [
         new EmbedBuilder()
-          .setColor(GD_BLUE)
+          .setColor(GD_RED)
           .setDescription(_enabled
             ? '✅ Level queue is now **open** — viewers can submit levels.'
             : '🔒 Level queue is now **closed** — submissions are paused.'),
@@ -244,6 +281,7 @@ async function handleInteraction(interaction) {
     if (sub === 'clear') {
       const count = _queue.length;
       _queue.length = 0;
+      _notify();
       log.info('[gd-queue] Queue cleared by Discord command');
       return interaction.editReply(`Queue cleared — removed ${count} level${count === 1 ? '' : 's'}.`);
     }
@@ -255,6 +293,7 @@ async function handleInteraction(interaction) {
         return interaction.editReply(`⚠️ No entry found for **${user}** in the queue.`);
       }
       const removed = _queue.splice(idx, 1)[0];
+      _notify();
       log.info(`[gd-queue] Removed ${removed.username}'s entry (${removed.levelId}) via Discord`);
       return interaction.editReply(`Removed **${removed.username}**'s level \`${removed.levelId}\` from the queue.`);
     }
