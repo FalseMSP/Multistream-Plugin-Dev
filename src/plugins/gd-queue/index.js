@@ -6,16 +6,20 @@
  * Geometry Dash level request queue.
  *
  * Chat commands (Twitch + YouTube):
- *   !q <levelId>   — add a level to the queue (numbers only)
- *                    if the user already has a level in the queue,
- *                    their previous entry is replaced with the new one
- *   !ql            — bot replies with the current queue length in that chat
+ *   !q <levelId> [notes]  — add a level to the queue (numbers only)
+ *                           optional notes appended after the ID
+ *                           if the user already has a level in the queue,
+ *                           their previous entry is replaced with the new one
+ *   !queue <levelId> [notes] — alias for !q
+ *   !q                    — show the current queue (alias for /queue list)
+ *   !ql                   — bot replies with the current queue length in that chat
  *
  * Discord slash commands:
  *   /next          — dequeue and display the next level ID
- *   /queue         — show all levels currently in the queue
- *   /queue_clear   — empty the entire queue
- *   /queue_remove <user> — remove a specific user's entry
+ *   /queue list    — show all levels currently in the queue
+ *   /queue clear   — empty the entire queue
+ *   /queue remove <user> — remove a specific user's entry
+ *   /queue toggle  — enable or disable the queue plugin
  *
  * All chat commands are suppressed from #stream-chat (they're bot triggers,
  * not conversation).
@@ -25,13 +29,15 @@ const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('disc
 const log = require('../../logger');
 
 // ── State ─────────────────────────────────────────────────────────────────
-// Queue entries: Array<{ username, platform, levelId, addedAt }>
+// Queue entries: Array<{ username, platform, levelId, notes, addedAt }>
 // Ordered by insertion time. One entry per username (case-insensitive).
 
 const _queue = [];
+let _enabled = true;
 
-const CMD_ADD    = /^!q\s+(\d+)\s*$/i;
-const CMD_LENGTH = /^!ql\s*$/i;
+const CMD_ADD      = /^!(?:q|queue)\s+(\d+)(?:\s+(.+))?\s*$/i;
+const CMD_LIST     = /^!q\s*$/i;
+const CMD_LENGTH   = /^!ql\s*$/i;
 
 // Injected by onChatReady()
 let _chatReply = { twitch: null, youtube: null };
@@ -42,15 +48,15 @@ function _findByUser(username) {
   return _queue.findIndex(e => e.username.toLowerCase() === username.toLowerCase());
 }
 
-function _add(username, platform, levelId) {
+function _add(username, platform, levelId, notes) {
   const existing = _findByUser(username);
   if (existing !== -1) {
     const old = _queue[existing].levelId;
     _queue.splice(existing, 1);
     log.info(`[gd-queue] Replaced ${username}'s entry ${old} → ${levelId}`);
   }
-  _queue.push({ username, platform, levelId, addedAt: new Date() });
-  log.info(`[gd-queue] Added: ${username} → ${levelId} (queue length: ${_queue.length})`);
+  _queue.push({ username, platform, levelId, notes: notes || null, addedAt: new Date() });
+  log.info(`[gd-queue] Added: ${username} → ${levelId}${notes ? ` (notes: ${notes})` : ''} (queue length: ${_queue.length})`);
   return existing !== -1; // true = was a replacement
 }
 
@@ -63,23 +69,63 @@ function _next() {
 async function processMessage(msg) {
   const text = msg.message.trim();
 
-  // !q <levelId>
-  const addMatch = text.match(CMD_ADD);
-  if (addMatch) {
-    const levelId    = addMatch[1];
-    const replaced   = _add(msg.username, msg.platform, levelId);
-    const reply      = replaced
-      ? `@${msg.username} updated your request to level ${levelId}! Queue position: #${_queue.length}`
-      : `@${msg.username} added level ${levelId} to the queue! Position: #${_queue.length}`;
+  // !q (no args) — show the current queue
+  if (CMD_LIST.test(text)) {
+    if (!_enabled) {
+      const send = _chatReply[msg.platform];
+      if (send) send('The level queue is currently closed.')
+        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+      return { message: null };
+    }
+
+    const len = _queue.length;
+    let reply;
+    if (len === 0) {
+      reply = 'The level queue is currently empty!';
+    } else {
+      const entries = _queue.map((e, i) => `#${i + 1}: ${e.levelId} (${e.username}${e.notes ? ` — ${e.notes}` : ''})`).join(' | ');
+      reply = `Queue (${len}): ${entries}`;
+    }
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
 
-    return { message: null }; // suppress from #stream-chat
+    return { message: null };
+  }
+
+  // !q <levelId> [notes] / !queue <levelId> [notes]
+  if (CMD_ADD.test(text)) {
+    if (!_enabled) {
+      const send = _chatReply[msg.platform];
+      if (send) send(`@${msg.username} the level queue is currently closed.`)
+        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+      return { message: null }; // still suppress from #stream-chat
+    }
+
+    const addMatch  = text.match(CMD_ADD);
+    const levelId   = addMatch[1];
+    const notes     = addMatch[2] ? addMatch[2].trim() : null;
+    const replaced  = _add(msg.username, msg.platform, levelId, notes);
+    const notesHint = notes ? ` (notes: ${notes})` : '';
+    const reply     = replaced
+      ? `@${msg.username} updated your request to level ${levelId}${notesHint}! Queue position: #${_queue.length}`
+      : `@${msg.username} added level ${levelId}${notesHint} to the queue! Position: #${_queue.length}`;
+
+    const send = _chatReply[msg.platform];
+    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+
+    return { message: null };
   }
 
   // !ql
   if (CMD_LENGTH.test(text)) {
+    if (!_enabled) {
+      const send = _chatReply[msg.platform];
+      if (send) send('The level queue is currently closed.')
+        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+      return { message: null };
+    }
+
     const len   = _queue.length;
     const reply = len === 0
       ? 'The level queue is currently empty!'
@@ -88,7 +134,7 @@ async function processMessage(msg) {
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
 
-    return { message: null }; // suppress from #stream-chat
+    return { message: null };
   }
 
   return { message: msg };
@@ -111,18 +157,14 @@ function _buildQueueEmbed() {
 
   const lines = _queue.map((e, i) => {
     const platform = e.platform === 'twitch' ? '🟣' : '🔴';
-    return `**${i + 1}.** \`${e.levelId}\` — ${platform} ${e.username}`;
+    const notesStr = e.notes ? ` — *${e.notes}*` : '';
+    return `**${i + 1}.** \`${e.levelId}\` — ${platform} ${e.username}${notesStr}`;
   });
 
   embed.setDescription(lines.join('\n'));
   embed.setFooter({ text: `${_queue.length} level${_queue.length === 1 ? '' : 's'} in queue` });
   return embed;
 }
-
-// We register multiple top-level commands (discord.js doesn't allow
-// subcommands and top-level commands to coexist on the same name easily,
-// and /next should be a clean single command).
-// The plugin exports an array for `command` — the pipeline engine handles both.
 
 const commandNext = new SlashCommandBuilder()
   .setName('next')
@@ -141,7 +183,9 @@ const commandQueue = new SlashCommandBuilder()
     sub.setName('remove')
       .setDescription("Remove a specific user's entry from the queue")
       .addStringOption(o =>
-        o.setName('user').setDescription('The username to remove').setRequired(true)));
+        o.setName('user').setDescription('The username to remove').setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('toggle').setDescription('Enable or disable the level queue'));
 
 async function handleInteraction(interaction) {
   await interaction.deferReply({ ephemeral: false });
@@ -149,6 +193,12 @@ async function handleInteraction(interaction) {
 
   // /next
   if (cmd === 'next') {
+    if (!_enabled) {
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder().setColor(GD_BLUE).setDescription('⚠️ The queue is currently disabled.'),
+      ]});
+    }
+
     const entry = _next();
     if (!entry) {
       return interaction.editReply({ embeds: [
@@ -160,17 +210,32 @@ async function handleInteraction(interaction) {
       .setColor(GD_BLUE)
       .setTitle('Next Level')
       .addFields(
-        { name: 'Level ID',    value: `\`${entry.levelId}\``,  inline: true },
+        { name: 'Level ID',     value: `\`${entry.levelId}\``,          inline: true },
         { name: 'Requested by', value: `(${platform}) ${entry.username}`, inline: true },
       )
       .setFooter({ text: `${_queue.length} level${_queue.length === 1 ? '' : 's'} remaining` })
       .setTimestamp();
+    if (entry.notes) {
+      embed.addFields({ name: 'Notes', value: entry.notes, inline: false });
+    }
     return interaction.editReply({ embeds: [embed] });
   }
 
   // /queue subcommands
   if (cmd === 'queue') {
     const sub = interaction.options.getSubcommand();
+
+    if (sub === 'toggle') {
+      _enabled = !_enabled;
+      log.info(`[gd-queue] Queue ${_enabled ? 'enabled' : 'disabled'} by Discord command`);
+      return interaction.editReply({ embeds: [
+        new EmbedBuilder()
+          .setColor(GD_BLUE)
+          .setDescription(_enabled
+            ? '✅ Level queue is now **open** — viewers can submit levels.'
+            : '🔒 Level queue is now **closed** — submissions are paused.'),
+      ]});
+    }
 
     if (sub === 'list') {
       return interaction.editReply({ embeds: [_buildQueueEmbed()] });
@@ -209,7 +274,7 @@ function onChatReady(chatReply) {
 
 module.exports = {
   id: 'gd-queue',
-  commands: [commandNext, commandQueue], // array — see note in pipeline engine
+  commands: [commandNext, commandQueue],
   handleInteraction,
   processMessage,
   onChatReady,

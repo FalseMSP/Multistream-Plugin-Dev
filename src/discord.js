@@ -187,14 +187,18 @@ function onModAction(action, fn) {
 }
 
 async function startDiscordBot() {
-  // Load all plugins so their commands are available before registerCommands()
   const plugins = require('./plugins/index');
   plugins.loadPlugins();
-  plugins.initPlugins({ sendChat, sendRedeem, onModAction });
+
+  // Single shared object — plugins can wrap api.sendRedeem and the queue
+  // will always call the current (possibly wrapped) version at call-time.
+  const api = { sendChat, sendRedeem, registerCommands, onModAction };
+
+  plugins.initPlugins(api);
 
   if (!BOT_TOKEN) {
     log.warn('DISCORD_BOT_TOKEN not set — slash commands disabled. Webhooks still active.');
-    return { sendChat, sendRedeem, registerCommands, onModAction };
+    return api;
   }
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -242,7 +246,7 @@ async function startDiscordBot() {
 
   await client.login(BOT_TOKEN);
 
-  return { sendChat, sendRedeem, registerCommands, onModAction };
+  return api;
 }
 
 module.exports = { startDiscordBot };

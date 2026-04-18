@@ -11,10 +11,13 @@
  * it is ONLY forwarded to #plugin-chat.
  *
  * Forwarded format (plain text, easy to parse):
- *   {Username}: <original message>
+ *   [PLATFORM] Username: <original message>
  *
  * Example trigger: viewer types "tnt" → #plugin-chat receives:
- *   {Steve}: tnt
+ *   [TWITCH] Steve: tnt
+ *
+ * All Twitch channel point redeems are ALWAYS forwarded to #plugin-chat as:
+ *   [TWITCH] username: REDEEM: <redeem name>
  *
  * Slash command: /minecraft_link
  *   status                — show enabled state, pattern, webhook
@@ -29,16 +32,14 @@
  *   MINECRAFT_LINK_ENABLED            — 'false' to start disabled (default: true)
  */
 
-const { SlashCommandBuilder, EmbedBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
+const { SlashCommandBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
 const WEBHOOK_URL = process.env.DISCORD_MINECRAFT_WEBHOOK_URL ?? '';
 
-// Default: match the word "tnt" anywhere in the message.
-// Override via MINECRAFT_LINK_DEFAULT_REGEX or /minecraft_link set_pattern.
-const DEFAULT_PATTERN = process.env.MINECRAFT_LINK_DEFAULT_REGEX ?? String.raw`\btnt\b`;
+const DEFAULT_PATTERN = process.env.MINECRAFT_LINK_DEFAULT_REGEX ?? String.raw`\b(tnt|william)\b`;
 
 // ── State ─────────────────────────────────────────────────────────────────
 
@@ -57,12 +58,51 @@ function getWebhook() {
   return _webhook;
 }
 
+// ── init — hook into sendRedeem ───────────────────────────────────────────
+
+/**
+ * context is the shared api object: { sendChat, sendRedeem, registerCommands, onModAction }
+ * We replace context.sendRedeem with a wrapper that mirrors every redeem to
+ * #plugin-chat before calling the original.
+ */
+function init(context) {
+  log.info('[minecraft-link] init called, context keys:', Object.keys(context ?? {}));
+
+  if (typeof context?.sendRedeem !== 'function') {
+    log.warn('[minecraft-link] No sendRedeem found in context — redeem forwarding disabled.');
+    return;
+  }
+
+  const _originalSendRedeem = context.sendRedeem;
+
+  context.sendRedeem = async function (redeem) {
+    const wh = getWebhook();
+    if (wh && WEBHOOK_URL) {
+      const redeemName = redeem?.title
+        ?? redeem?.redeemName
+        ?? redeem?.reward?.title
+        ?? 'UNKNOWN';
+      const username = redeem?.username
+        ?? redeem?.user?.login
+        ?? redeem?.user?.display_name
+        ?? 'UNKNOWN';
+      const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
+      try {
+        await wh.send({ content: formatted });
+        log.debug(`[minecraft-link] Redeem forwarded → "${formatted}"`);
+      } catch (err) {
+        log.error('[minecraft-link] Webhook send error (redeem):', err.message);
+      }
+    }
+    return _originalSendRedeem(redeem);
+  };
+
+  log.info('[minecraft-link] Redeem forwarding hooked ✅');
+}
+
 // ── processMessage ────────────────────────────────────────────────────────
 
 async function processMessage(msg) {
-  // Always pass the message through to the main feed unchanged.
-  // We only ever add a side effect — never suppress.
-
   if (!_enabled || !_regex || !WEBHOOK_URL) {
     return { message: msg };
   }
@@ -71,8 +111,8 @@ async function processMessage(msg) {
     return { message: msg };
   }
 
-  // Matched — forward to #plugin-chat as a structured plain-text message.
-  const formatted = `{${msg.username}}: ${msg.message}`;
+  const platform = (msg.platform ?? 'UNKNOWN').toUpperCase();
+  const formatted = `[${platform}] ${msg.username}: ${msg.message}`;
   const wh = getWebhook();
 
   return {
@@ -127,12 +167,14 @@ async function handleInteraction(interaction) {
   if (sub === 'status') {
     const lines = [
       `**Status:**   ${_enabled ? '✅ Enabled' : '❌ Disabled'}`,
-      `**Webhook:**  ${WEBHOOK_URL ? '✅ Configured' : '⚠️ Missing `DISCORD_MINECRAFT_WEBHOOK_URL`'}`,
+      `**Webhook:**  ${WEBHOOK_URL ? '✅ Configured' : '⚠️ Missing \`DISCORD_MINECRAFT_WEBHOOK_URL\`'}`,
       `**Pattern:**  \`${_pattern}\``,
       `**Regex OK:** ${_regex ? '✅' : '❌ Invalid — update with /minecraft_link set_pattern'}`,
       '',
       `Matched messages are **removed** from #stream-chat and forwarded to #plugin-chat as:`,
-      `\`\`\`{Username}: <message>\`\`\``,
+      `\`\`\`[PLATFORM] Username: <message>\`\`\``,
+      `All Twitch redeems are **always** forwarded to #plugin-chat as:`,
+      `\`\`\`[TWITCH] username: REDEEM: <redeem name>\`\`\``,
       `Main stream chat is **never** affected.`,
     ];
     return interaction.editReply(lines.join('\n'));
@@ -159,7 +201,7 @@ async function handleInteraction(interaction) {
     return interaction.editReply([
       `✅ Pattern updated to:`,
       `\`\`\`${raw}\`\`\``,
-      `Messages matching this regex will be forwarded as \`{Username}: <message>\`.`,
+      `Messages matching this regex will be forwarded as \`[PLATFORM] Username: <message>\`.`,
     ].join('\n'));
   }
 
@@ -172,7 +214,7 @@ async function handleInteraction(interaction) {
     const lines = [
       `**Message:** \`${text}\``,
       `**Pattern:** \`${_pattern}\``,
-      `**Result:**  ${matches ? `✅ MATCH — would forward as \`{SomeUser}: ${text}\`` : '❌ No match — would not forward'}`,
+      `**Result:**  ${matches ? `✅ MATCH — would forward as \`[PLATFORM] SomeUser: ${text}\`` : '❌ No match — would not forward'}`,
     ];
     return interaction.editReply(lines.join('\n'));
   }
@@ -187,4 +229,5 @@ module.exports = {
   command,
   handleInteraction,
   processMessage,
+  init,
 };

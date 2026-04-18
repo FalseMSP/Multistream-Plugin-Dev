@@ -13,9 +13,7 @@
  */
 
 'use strict';
-
 require('dotenv').config();
-
 const { startDiscordBot } = require('./src/discord');
 const twitchModule        = require('./src/twitch');
 const ytModule            = require('./src/youtube');
@@ -33,9 +31,11 @@ async function main() {
   // 1. Discord bot (also loads + inits plugins)
   const discord = await startDiscordBot();
 
-  // 2. Wire queue → Discord embeds
-  queue.onMessage(discord.sendChat.bind(discord));
-  queue.onRedeem(discord.sendRedeem.bind(discord));
+  // 2. Wire queue → Discord embeds.
+  //    Use late-binding lambdas so any plugin wrappers applied during
+  //    initPlugins() are always called — not the original bare functions.
+  queue.onMessage((msg)    => discord.sendChat(msg));
+  queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
 
   // 3. Wire mod action handlers: Discord /ban /vip → Twitch & YouTube
   discord.onModAction('ban', async (platform, username, reason) => {
@@ -75,7 +75,6 @@ async function main() {
   await ytModule.startYouTube(queue, websubRunning);
 
   // 8. Now that both platform clients are up, give plugins access to chat reply.
-  //    Plugins that need to send messages back to Twitch/YouTube chat use these.
   plugins.setChatReply({
     twitch:  (text) => twitchModule.say(text),
     youtube: (text) => ytModule.say(text),
