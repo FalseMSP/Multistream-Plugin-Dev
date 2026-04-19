@@ -13,6 +13,11 @@ Mirrors Twitch + YouTube Live chat to Discord with rich embeds, channel point re
 | `/vip <user> [platform]` | Grants VIP (Twitch) / Moderator (YouTube) |
 | `/unvip <user> [platform]` | Removes VIP/Mod |
 | YouTube ingest | WebSub primary, masterchat polling fallback |
+| Plugin Support | Look at src/plugins for how to make stuff |
+
+Current inbuilt plugins:
+- Minecraft Link -> hides a regex and moves it to #plugin-chat
+- GD Level Requests -> exactly what it sounds like
 
 ---
 
