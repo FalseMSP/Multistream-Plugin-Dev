@@ -70,34 +70,67 @@ function init(context) {
 
   if (typeof context?.sendRedeem !== 'function') {
     log.warn('[minecraft-link] No sendRedeem found in context — redeem forwarding disabled.');
-    return;
+  } else {
+    const _originalSendRedeem = context.sendRedeem;
+
+    context.sendRedeem = async function (redeem) {
+      const wh = getWebhook();
+      if (wh && WEBHOOK_URL) {
+        const redeemName = redeem?.title
+          ?? redeem?.redeemName
+          ?? redeem?.reward?.title
+          ?? 'UNKNOWN';
+        const username = redeem?.username
+          ?? redeem?.user?.login
+          ?? redeem?.user?.display_name
+          ?? 'UNKNOWN';
+        const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
+        try {
+          await wh.send({ content: formatted });
+          log.debug(`[minecraft-link] Redeem forwarded → "${formatted}"`);
+        } catch (err) {
+          log.error('[minecraft-link] Webhook send error (redeem):', err.message);
+        }
+      }
+      return _originalSendRedeem(redeem);
+    };
+
+    log.info('[minecraft-link] Redeem forwarding hooked ✅');
   }
 
-  const _originalSendRedeem = context.sendRedeem;
+  if (typeof context?.sendDonation !== 'function') {
+    log.warn('[minecraft-link] No sendDonation found in context — donation forwarding disabled.');
+  } else {
+    const _originalSendDonation = context.sendDonation;
 
-  context.sendRedeem = async function (redeem) {
-    const wh = getWebhook();
-    if (wh && WEBHOOK_URL) {
-      const redeemName = redeem?.title
-        ?? redeem?.redeemName
-        ?? redeem?.reward?.title
-        ?? 'UNKNOWN';
-      const username = redeem?.username
-        ?? redeem?.user?.login
-        ?? redeem?.user?.display_name
-        ?? 'UNKNOWN';
-      const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
-      try {
-        await wh.send({ content: formatted });
-        log.debug(`[minecraft-link] Redeem forwarded → "${formatted}"`);
-      } catch (err) {
-        log.error('[minecraft-link] Webhook send error (redeem):', err.message);
+    context.sendDonation = async function (donation) {
+      const wh = getWebhook();
+      if (wh && WEBHOOK_URL) {
+        const username = donation?.username ?? 'UNKNOWN';
+        const type     = (donation?.type ?? 'donation').toUpperCase();
+        let detail;
+        switch (donation?.type) {
+          case 'bits':    detail = `CHEER: ${donation.amount} bits`; break;
+          case 'sub':     detail = `SUB (Tier ${donation.tier ?? '1000'})`; break;
+          case 'resub':   detail = `RESUB (${donation.months} months, Tier ${donation.tier ?? '1000'})`; break;
+          case 'subgift': detail = donation.recipient
+            ? `SUBGIFT → ${donation.recipient}`
+            : `SUBGIFT x${donation.quantity ?? 1}`; break;
+          default:        detail = type;
+        }
+        const formatted = `[TWITCH] ${username}: ${detail}`;
+        try {
+          await wh.send({ content: formatted });
+          log.debug(`[minecraft-link] Donation forwarded → "${formatted}"`);
+        } catch (err) {
+          log.error('[minecraft-link] Webhook send error (donation):', err.message);
+        }
       }
-    }
-    return _originalSendRedeem(redeem);
-  };
+      return _originalSendDonation(donation);
+    };
 
-  log.info('[minecraft-link] Redeem forwarding hooked ✅');
+    log.info('[minecraft-link] Donation forwarding hooked ✅');
+  }
 }
 
 // ── processMessage ────────────────────────────────────────────────────────

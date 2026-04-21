@@ -13,6 +13,7 @@
  *   !queue <levelId> [notes] — alias for !q
  *   !q                    — show the current queue (alias for /queue list)
  *   !ql                   — bot replies with the current queue length in that chat
+ *   !p                    — show your own position in the queue
  *
  * Discord slash commands:
  *   /next          — dequeue and display the next level ID
@@ -30,58 +31,66 @@ const log = require('../../logger');
 const { registerSection, updateSection } = require('../../overlay-server');
 
 // ── State ─────────────────────────────────────────────────────────────────
+// Queue entries: Array<{ username, platform, levelId, notes, addedAt }>
+// Ordered by insertion time. One entry per username (case-insensitive).
 
 const _queue = [];
 let _enabled = true;
 
-const CMD_ADD    = /^!(?:q|queue)\s+(\d+)(?:\s+(.+))?\s*$/i;
-const CMD_LIST   = /^!q\s*$/i;
-const CMD_LENGTH = /^!ql\s*$/i;
+const CMD_ADD      = /^!(?:q|queue|r|request)\s+(\d+)(?:\s+(.+))?\s*$/i;
+const CMD_LIST     = /^!q\s*$/i;
+const CMD_LENGTH   = /^!ql\s*$/i;
+const CMD_POS      = /^!p\s*$/i;
 
+// Injected by onChatReady()
 let _chatReply = { twitch: null, youtube: null };
 
+// Push current state to the overlay
 function _notify() {
   updateSection('gd-queue', { queue: _queue, enabled: _enabled });
 }
 
 // ── Overlay section registration ──────────────────────────────────────────
+// The render function is serialised to a string so overlay-server.js can
+// inject it into the browser page. It must be self-contained (no closures).
 
 registerSection('gd-queue', {
   title: 'Level Queue',
   order: 10,
   icon: `<svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect x="2" y="5" width="18" height="2.5" rx="1.25" fill="#e53935"/>
-    <rect x="2" y="9.75" width="18" height="2.5" rx="1.25" fill="#e53935" opacity="0.6"/>
-    <rect x="2" y="14.5" width="12" height="2.5" rx="1.25" fill="#e53935" opacity="0.35"/>
+    <polygon points="11,2 13.5,8.5 20.5,8.5 14.9,12.7 17,19.5 11,15.3 5,19.5 7.1,12.7 1.5,8.5 8.5,8.5"
+             fill="none" stroke="#00e5ff" stroke-width="1.4" stroke-linejoin="round"/>
   </svg>`,
-  render: (function render(data, el, esc, { card, badge }) {
-    if (!data) { el.innerHTML = ''; return; }
-    const { queue, enabled } = data;
+  render: /* the fn below is serialised — no outer-scope references allowed */
+    (function render(data, el, esc, { card, badge }) {
+      if (!data) { el.innerHTML = ''; return; }
+      const { queue, enabled } = data;
 
-    card.dataset.state = enabled ? '' : 'closed';
-    badge.textContent  = queue.length === 0 ? 'empty' : queue.length + (queue.length === 1 ? ' level' : ' levels');
+      card.dataset.state = enabled ? '' : 'closed';
 
-    if (queue.length === 0) {
-      el.innerHTML = '<div class="msg ' + (enabled ? 'msg-empty' : 'msg-closed') + '">'
-        + (enabled ? 'No levels in queue' : 'Queue closed') + '</div>';
-      return;
-    }
+      badge.textContent = queue.length === 1 ? '1 level' : queue.length + ' levels';
 
-    el.innerHTML = queue.map((e, i) => {
-      const hasNotes = e.notes && e.notes.trim();
-      return '<div class="entry">'
-        + '<span class="entry-pos">#' + (i + 1) + '</span>'
-        + '<div class="entry-main">'
-        +   '<span class="entry-id">'  + esc(e.levelId)  + '</span>'
-        +   '<span class="entry-user">'
-        +     '<span class="platform-dot ' + esc(e.platform) + '"></span>'
-        +     esc(e.username)
-        +   '</span>'
-        + '</div>'
-        + (hasNotes ? '<span class="entry-notes">' + esc(e.notes) + '</span>' : '')
-        + '</div>';
-    }).join('');
-  }).toString(),
+      if (queue.length === 0) {
+        el.innerHTML = '<div class="msg ' + (enabled ? 'msg-empty' : 'msg-closed') + '">'
+          + (enabled ? 'NO LEVELS IN QUEUE' : 'QUEUE CLOSED') + '</div>';
+        return;
+      }
+
+      el.innerHTML = queue.map((e, i) => {
+        const hasNotes = e.notes && e.notes.trim();
+        return '<div class="entry">'
+          + '<span class="entry-pos">#' + (i + 1) + '</span>'
+          + '<div class="entry-main">'
+          +   '<span class="entry-id">'   + esc(e.levelId)  + '</span>'
+          +   '<span class="entry-user">'
+          +     '<span class="platform-dot ' + esc(e.platform) + '"></span>'
+          +     esc(e.username)
+          +   '</span>'
+          + '</div>'
+          + (hasNotes ? '<span class="entry-notes">' + esc(e.notes) + '</span>' : '')
+          + '</div>';
+      }).join('');
+    }).toString(),
 });
 
 // ── Queue helpers ─────────────────────────────────────────────────────────
@@ -99,7 +108,7 @@ function _add(username, platform, levelId, notes) {
   }
   _queue.push({ username, platform, levelId, notes: notes || null, addedAt: new Date() });
   log.info(`[gd-queue] Added: ${username} → ${levelId}${notes ? ` (notes: ${notes})` : ''} (queue length: ${_queue.length})`);
-  return existing !== -1;
+  return existing !== -1; // true = was a replacement
 }
 
 function _next() {
@@ -111,6 +120,7 @@ function _next() {
 async function processMessage(msg) {
   const text = msg.message.trim();
 
+  // !q (no args) — show the current queue
   if (CMD_LIST.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
@@ -130,15 +140,17 @@ async function processMessage(msg) {
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+
     return { message: null };
   }
 
+  // !q <levelId> [notes] / !queue <levelId> [notes]
   if (CMD_ADD.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
-      if (send) send(`@${msg.username} the level queue is currently closed.`)
+      if (send) send(`${msg.username} the level queue is currently closed.`)
         .catch(e => log.error('[gd-queue] chat reply error:', e.message));
-      return { message: null };
+      return { message: null }; // still suppress from #stream-chat
     }
 
     const addMatch  = text.match(CMD_ADD);
@@ -148,14 +160,16 @@ async function processMessage(msg) {
     _notify();
     const notesHint = notes ? ` (notes: ${notes})` : '';
     const reply     = replaced
-      ? `@${msg.username} updated your request to level ${levelId}${notesHint}! Queue position: #${_queue.length}`
-      : `@${msg.username} added level ${levelId}${notesHint} to the queue! Position: #${_queue.length}`;
+      ? `${msg.username} updated your request to level ${levelId}${notesHint}! Queue position: #${_queue.length}`
+      : `${msg.username} added level ${levelId}${notesHint} to the queue! Position: #${_queue.length}`;
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+
     return { message: null };
   }
 
+  // !ql
   if (CMD_LENGTH.test(text)) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
@@ -171,6 +185,24 @@ async function processMessage(msg) {
 
     const send = _chatReply[msg.platform];
     if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+
+    return { message: null };
+  }
+
+  // !p — show the calling user's position in the queue
+  if (CMD_POS.test(text)) {
+    const send = _chatReply[msg.platform];
+    const idx  = _findByUser(msg.username);
+    let reply;
+    if (!_enabled && idx === -1) {
+      reply = 'The level queue is currently closed.';
+    } else if (idx === -1) {
+      reply = `${msg.username} you are not in the queue.`;
+    } else {
+      const entry = _queue[idx];
+      reply = `${msg.username} you are #${idx + 1} in the queue (level ${entry.levelId}${entry.notes ? ` — ${entry.notes}` : ''}).`;
+    }
+    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
     return { message: null };
   }
 
@@ -179,11 +211,11 @@ async function processMessage(msg) {
 
 // ── Slash commands ────────────────────────────────────────────────────────
 
-const GD_RED = 0xe53935;
+const GD_BLUE = 0x00a8ff;
 
 function _buildQueueEmbed() {
   const embed = new EmbedBuilder()
-    .setColor(GD_RED)
+    .setColor(GD_BLUE)
     .setTitle('🎮 GD Level Queue')
     .setTimestamp();
 
@@ -228,26 +260,21 @@ async function handleInteraction(interaction) {
   await interaction.deferReply({ ephemeral: false });
   const cmd = interaction.commandName;
 
+  // /next — works regardless of whether the queue is open or closed
   if (cmd === 'next') {
-    if (!_enabled) {
-      return interaction.editReply({ embeds: [
-        new EmbedBuilder().setColor(GD_RED).setDescription('⚠️ The queue is currently disabled.'),
-      ]});
-    }
-
     const entry = _next();
     _notify();
     if (!entry) {
       return interaction.editReply({ embeds: [
-        new EmbedBuilder().setColor(GD_RED).setDescription('📭 The queue is empty — no more levels!'),
+        new EmbedBuilder().setColor(GD_BLUE).setDescription('📭 The queue is empty — no more levels!'),
       ]});
     }
     const platform = entry.platform === 'twitch' ? '🟣 Twitch' : '🔴 YouTube';
     const embed = new EmbedBuilder()
-      .setColor(GD_RED)
+      .setColor(GD_BLUE)
       .setTitle('Next Level')
       .addFields(
-        { name: 'Level ID',     value: `\`${entry.levelId}\``,            inline: true },
+        { name: 'Level ID',     value: `\`${entry.levelId}\``,          inline: true },
         { name: 'Requested by', value: `(${platform}) ${entry.username}`, inline: true },
       )
       .setFooter({ text: `${_queue.length} level${_queue.length === 1 ? '' : 's'} remaining` })
@@ -258,6 +285,7 @@ async function handleInteraction(interaction) {
     return interaction.editReply({ embeds: [embed] });
   }
 
+  // /queue subcommands
   if (cmd === 'queue') {
     const sub = interaction.options.getSubcommand();
 
@@ -267,7 +295,7 @@ async function handleInteraction(interaction) {
       log.info(`[gd-queue] Queue ${_enabled ? 'enabled' : 'disabled'} by Discord command`);
       return interaction.editReply({ embeds: [
         new EmbedBuilder()
-          .setColor(GD_RED)
+          .setColor(GD_BLUE)
           .setDescription(_enabled
             ? '✅ Level queue is now **open** — viewers can submit levels.'
             : '🔒 Level queue is now **closed** — submissions are paused.'),

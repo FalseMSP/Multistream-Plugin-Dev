@@ -554,11 +554,24 @@ async function say(text) {
     return;
   }
 
+  // Prefer the video ID already being polled — _getActiveLiveChatId() uses
+  // _findLiveVideoId() which re-scrapes and can return null even when a session
+  // is active (race at stream start, or YT_CHANNEL_ID scrape lag).
   let liveChatId;
   try {
-    liveChatId = await _getActiveLiveChatId();
+    const activeVideoId = _activeSessions.size > 0 ? [..._activeSessions.keys()][0] : null;
+    if (activeVideoId) {
+      liveChatId = await _getLiveChatId(activeVideoId);
+    }
+    if (!liveChatId) {
+      liveChatId = await _getActiveLiveChatId();
+    }
   } catch (err) {
     log.warn('[YouTube] say() — no active live chat:', err.message);
+    return;
+  }
+  if (!liveChatId) {
+    log.warn('[YouTube] say() — no live chat ID found');
     return;
   }
 

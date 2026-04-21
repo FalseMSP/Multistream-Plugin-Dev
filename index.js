@@ -45,7 +45,8 @@ async function main() {
   //    initPlugins() are always called — not the original bare functions.
   queue.onMessage((msg)    => discord.sendChat(msg));
   queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
-
+  queue.onDonation((donation)  => discord.sendDonation(donation));
+  
   // 3. Wire mod action handlers: Discord /ban /vip → Twitch & YouTube
   discord.onModAction('ban', async (platform, username, reason) => {
     if (platform === 'twitch')  return twitchModule.modHandlers.ban('twitch', username, reason);

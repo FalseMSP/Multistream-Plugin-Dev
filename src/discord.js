@@ -111,6 +111,52 @@ function buildRedeemEmbed(username, title, cost, input, timestamp) {
   return embed;
 }
 
+function buildDonationEmbed(donation) {
+  const { platform, type, username, amount, message, tier, months, streak, quantity, recipient } = donation;
+
+  let title, description;
+
+  switch (type) {
+    case 'bits':
+      title       = `💎 ${username} cheered ${amount} bits!`;
+      description = message || null;
+      break;
+    case 'sub':
+      title = `⭐ ${username} subscribed! (Tier ${_tierLabel(tier)})`;
+      break;
+    case 'resub':
+      title       = `🔄 ${username} resubscribed! (${months} months, Tier ${_tierLabel(tier)})`;
+      description = message || (streak ? `${streak} month streak` : null);
+      break;
+    case 'subgift':
+      if (recipient) {
+        title = `🎁 ${username} gifted a Tier ${_tierLabel(tier)} sub to ${recipient}!`;
+      } else {
+        title = `🎁 ${username} gifted ${quantity ?? 1}x Tier ${_tierLabel(tier)} sub${(quantity ?? 1) !== 1 ? 's' : ''}!`;
+      }
+      break;
+    default:
+      title = `💰 ${username} (${type})`;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(COLOURS[platform] ?? COLOURS.twitch)
+    .setAuthor({ name: platform === 'twitch' ? '🟣 Twitch' : '🔴 YouTube' })
+    .setTitle(title)
+    .setTimestamp();
+
+  if (description) embed.setDescription(description);
+  return embed;
+}
+
+function _tierLabel(tier) {
+  if (!tier) return '1';
+  if (tier === 'prime') return 'Prime';
+  // Twitch tiers: '1000' → '1', '2000' → '2', '3000' → '3'
+  if (String(tier).length === 4) return String(Number(tier) / 1000);
+  return String(tier);
+}
+
 // ── Public API ────────────────────────────────────────────────────────────
 
 async function sendChat({ platform, username, message }) {
@@ -128,7 +174,14 @@ async function sendRedeem({ username, title, cost, input, timestamp }) {
   if (chatWebhook)   await sendEmbed(chatWebhook, embed);
 }
 
-// ── Core slash commands ───────────────────────────────────────────────────
+async function sendDonation(donation) {
+  getWebhooks();
+  const embed = buildDonationEmbed(donation);
+  if (chatWebhook) await sendEmbed(chatWebhook, embed);
+  else log.warn('No chat webhook configured — donation not sent');
+}
+
+
 
 const PLATFORM_CHOICE = [
   { name: 'Both',    value: 'both'    },
@@ -192,7 +245,7 @@ async function startDiscordBot() {
 
   // Single shared object — plugins can wrap api.sendRedeem and the queue
   // will always call the current (possibly wrapped) version at call-time.
-  const api = { sendChat, sendRedeem, registerCommands, onModAction };
+  const api = { sendChat, sendRedeem, sendDonation, registerCommands, onModAction };
 
   plugins.initPlugins(api);
 
