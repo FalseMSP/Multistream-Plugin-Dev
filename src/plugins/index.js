@@ -172,8 +172,6 @@ async function runPipeline(msg) {
   return { finalMsg: current, sideEffects };
 }
 
-module.exports = { loadPlugins, initPlugins, getPluginCommands, handlePluginInteraction, runPipeline, setChatReply, getChatReply };
-
 // chatReply is set after platforms start; plugins access it via their init() context
 let _chatReply = { twitch: null, youtube: null };
 
@@ -189,6 +187,7 @@ function setChatReply(chatReply) {
       catch (err) { log.error(`[Plugins] onChatReady error in ${plugin.id}:`, err.message); }
     }
   }
+module.exports = { loadPlugins, initPlugins, getPluginCommands, handlePluginInteraction, runPipeline, setChatReply, getChatReply };
 }
 
 function getChatReply() { return _chatReply; }
