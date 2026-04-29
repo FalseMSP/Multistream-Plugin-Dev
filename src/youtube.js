@@ -205,13 +205,13 @@ async function _getLiveChatId(videoId) {
 // On active streams YT typically returns timeoutMs = 0, giving ~RTT latency.
 
 const MIN_FETCH_MS     = 500;    // never hammer faster than this
-const MAX_FETCH_MS     = 8_000;  // cap during quiet periods
-const PHASE_OFFSET_MS  = 1_000;  // lane B starts 1 s after lane A
+const MAX_FETCH_MS     = 4_000;  // ignore YouTube's 10-15 s suggestion; cap at 4 s
+const PHASE_OFFSET_MS  = 2_000;  // lane B starts 2 s after lane A (half of MAX_FETCH_MS)
 
 async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
-  // fetchChatPage returns { actions, continuation } where continuation has
-  // { timeoutMs, token }. We thread the token explicitly so both lanes
-  // advance independently through YT's pagination.
+  // fetch() returns { actions, continuation } where continuation has
+  // { token, timeoutMs }. We thread token explicitly so both lanes advance
+  // independently. timeoutMs is honoured but capped at MAX_FETCH_MS.
   let continuation = undefined;  // undefined = let masterchat use its default
 
   // Stagger lane B so it's out of phase with lane A
@@ -228,7 +228,7 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
     const fetchStart = Date.now();
 
     try {
-      result = await mc.fetchChatPage(continuation);
+      result = await mc.fetch(continuation?.token);
     } catch (err) {
       if (stopSignal.stopped) return;
       log.warn(`[YouTube] Lane ${laneId} fetch error: ${err.message} — backing off 5 s`);
@@ -241,6 +241,8 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
     // Extract continuation for the NEXT call before doing anything else,
     // then schedule the wait — dispatch runs concurrently with the timer.
     const nextContinuation = result?.continuation;
+    // Honour YouTube's timeoutMs so we don't poll too fast and get rate-limited,
+    // but cap it at MAX_FETCH_MS — YouTube can return 10-15 s even on active streams.
     const timeoutMs = Math.max(
       MIN_FETCH_MS,
       Math.min(nextContinuation?.timeoutMs ?? MAX_FETCH_MS, MAX_FETCH_MS),
@@ -251,14 +253,14 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
 
     if (!skipDispatch) {
       for (const action of result?.actions ?? []) {
-        // masterchat wraps chat events in action objects
-        const chat = action.addChatItemAction?.item?.liveChatTextMessageRenderer;
-        if (!chat) continue;
+        // masterchat 1.5.0 returns pre-parsed typed action objects:
+        // { type: 'addChatItemAction', id, authorName, authorChannelId, message: YTRun[] }
+        if (action.type !== 'addChatItemAction') continue;
 
-        const id          = chat.id;
-        const displayName = chat.authorName?.simpleText ?? 'unknown';
-        const channelId   = chat.authorExternalChannelId ?? null;
-        const message     = _stringifyRuns(chat.message?.runs);
+        const id          = action.id;
+        const displayName = action.authorName ?? 'unknown';
+        const channelId   = action.authorChannelId ?? null;
+        const message     = _stringifyRuns(action.message);
 
         _cacheParticipant(displayName, channelId);
 
@@ -268,12 +270,8 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
     } else {
       // Still cache authors from the historical first page
       for (const action of result?.actions ?? []) {
-        const chat = action.addChatItemAction?.item?.liveChatTextMessageRenderer;
-        if (!chat) continue;
-        _cacheParticipant(
-          chat.authorName?.simpleText,
-          chat.authorExternalChannelId,
-        );
+        if (action.type !== 'addChatItemAction') continue;
+        _cacheParticipant(action.authorName, action.authorChannelId);
       }
       skipDispatch = false;
     }
@@ -316,13 +314,27 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     _activeSessions.delete(videoId);
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
-    setTimeout(() => _startMasterchatSession(videoId, queue, nextDelay), nextDelay);
+    setTimeout(() => _startMasterchat(videoId, queue, nextDelay), nextDelay);
     return;
   }
 
   // Resolve liveChatId now while we have mc; store on the session so mod
   // actions never need to re-fetch or re-scrape.
-  const liveChatId = mc.liveChatId ?? null;
+  // mc.liveChatId can be null on fresh streams if YT's page payload didn't
+  // include it in the scraped continuation data (a timing/variant issue, not
+  // a permissions problem). Fall back to the Data API when that happens.
+  let liveChatId = mc.liveChatId ?? null;
+  if (!liveChatId && YT_API_KEY) {
+    try {
+      liveChatId = await _getLiveChatId(videoId);
+      log.info(`[YouTube] liveChatId resolved via Data API: ${liveChatId}`);
+    } catch (err) {
+      log.warn(`[YouTube] Could not resolve liveChatId via Data API: ${err.message}`);
+    }
+  }
+  if (!liveChatId) {
+    log.warn(`[YouTube] liveChatId still null for ${videoId} — mod actions and say() will resolve lazily on first use`);
+  }
 
   const stopSignal = { stopped: false };
 
@@ -432,9 +444,15 @@ async function _watchdog(queue) {
 // ── Live chat ID resolution ───────────────────────────────────────────────
 
 async function _resolveActiveLiveChatId() {
-  // Fast path — already stored on the active session
+  // Fast path — already stored on the active session.
+  // Also check mc.liveChatId lazily: masterchat may have populated it after
+  // init (e.g. once the first fetch response came back with the field).
   for (const [, session] of _activeSessions) {
-    if (session.liveChatId) return session.liveChatId;
+    const id = session.liveChatId ?? session.mc?.liveChatId ?? null;
+    if (id) {
+      session.liveChatId = id; // cache so we don't re-check mc next time
+      return id;
+    }
   }
   // Slow path — no session yet or liveChatId not populated
   const videoId = await _findLiveVideoId();
