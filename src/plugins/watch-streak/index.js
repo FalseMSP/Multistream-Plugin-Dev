@@ -3,20 +3,31 @@
 /**
  * watch-streak plugin
  *
- * Tracks how many consecutive stream-days a YouTube viewer has interacted.
+ * Tracks how many consecutive stream-days a viewer has chatted, across
+ * both YouTube and Twitch.
  *
  * Rules:
  *  - A viewer earns credit for a date the first time they send ANY message
- *    on YouTube during an active stream session on that date.
+ *    on either platform during an active stream session on that date.
  *  - Multiple streams on the same calendar date count as one — catching any
  *    of them is enough; missing the others on that day doesn't break the streak.
  *  - When a new stream session starts, anyone whose last-seen date is more than
  *    one calendar day before today has their streak reset to 0.
  *  - Streaks are written to disk so they survive bot restarts.
+ *  - When a Twitch viewer clicks "Share Watch Streak", their self-reported
+ *    count is written directly to the db if it exceeds the stored value.
+ *    Requires twitch.js to emit { type: 'watch-streak', streak: N } on
+ *    USERNOTICE viewermilestone events (see accompanying twitch.js change).
+ *  - Milestone announcements fire on YouTube only — never in Twitch chat.
+ *
+ * Data format (streaks.json):
+ *   Keys are "platform:username" (e.g. "twitch:Alice", "youtube:Bob").
+ *   If upgrading from a previous version that used bare username keys,
+ *   manually prefix existing keys with "youtube:" to preserve history.
  *
  * Slash commands:
- *   /streak user:<name>   — look up a specific viewer's streak
- *   /streaks              — leaderboard of top 10 streaks
+ *   /streak user:<name> [platform]  — look up a viewer's streak(s)
+ *   /streaks [platform]             — leaderboard of top 10 streaks
  */
 
 const fs   = require('fs');
@@ -83,7 +94,7 @@ let _sessionDate = null;
 const _creditedThisSession = new Set();
 
 /**
- * Called once per session when the first YouTube message arrives.
+ * Called once per session when the first message arrives on any platform.
  * Resets streaks for anyone who missed the previous session date.
  */
 function _startSession(today) {
@@ -120,21 +131,22 @@ function _startSession(today) {
  * Credit a viewer for today's stream.
  * Returns the new streak value, or null if they were already credited today.
  */
-function _credit(username, today) {
-  if (_creditedThisSession.has(username)) return null; // already counted this session
-  _creditedThisSession.add(username);
+function _credit(username, platform, today) {
+  const key = `${platform}:${username}`;
+  if (_creditedThisSession.has(key)) return null; // already counted this session
+  _creditedThisSession.add(key);
 
-  const record = _data[username] ?? { streak: 0, lastDate: null };
+  const record = _data[key] ?? { streak: 0, lastDate: null };
 
   if (record.lastDate === today) {
     // Edge case: bot restarted mid-stream — don't double-count
-    _data[username] = record;
+    _data[key] = record;
     return null;
   }
 
   record.streak  += 1;
   record.lastDate = today;
-  _data[username] = record;
+  _data[key] = record;
 
   _save();
   return record.streak;
@@ -145,21 +157,48 @@ function _credit(username, today) {
 // ---------------------------------------------------------------------------
 
 async function processMessage(msg) {
-  if (msg.platform !== 'youtube') return { message: msg };
+  if (msg.platform !== 'youtube' && msg.platform !== 'twitch') return { message: msg };
 
   const today = _today();
   _startSession(today);
 
-  const newStreak = _credit(msg.username, today);
+  // ── Twitch watch-streak share (USERNOTICE viewermilestone) ───────────────
+  // The viewer explicitly shared their streak count — trust it and write it
+  // directly to the db if it's higher than what we have recorded.
+  if (msg.platform === 'twitch' && msg.type === 'watch-streak') {
+    const reported = msg.streak;
+    const key      = `twitch:${msg.username}`;
+    const existing = _data[key]?.streak ?? 0;
+
+    if (reported > existing) {
+      _data[key] = { streak: reported, lastDate: today };
+      _save();
+      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} (was ${existing}) — updated.`);
+    } else {
+      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} (already have ${existing}) — no update.`);
+    }
+
+    // Also credit them for today so the normal increment path doesn't fire
+    _creditedThisSession.add(key);
+
+    // Pass the message through so Discord still sees the share notification
+    return { message: msg };
+  }
+
+  // ── Normal message — credit for today ────────────────────────────────────
+  const newStreak = _credit(msg.username, msg.platform, today);
 
   if (newStreak !== null) {
-    log.info(`[watch-streak] ${msg.username} — streak now ${newStreak} day(s).`);
+    log.info(`[watch-streak] ${msg.platform}/${msg.username} — streak now ${newStreak} day(s).`);
 
-    // Milestone announcements (optional — remove if you don't want chat messages)
-    if (_chatReply.youtube && [7, 14, 30, 50, 100].includes(newStreak)) {
-      _chatReply.youtube(
-        `🔥 ${msg.username} has watched ${newStreak} streams in a row — incredible streak!`
-      ).catch(e => log.error('[watch-streak] chat reply error:', e.message));
+    // Milestone announcements — YouTube only (not Twitch chat)
+    if (msg.platform === 'youtube' && [7, 14, 30, 50, 100].includes(newStreak)) {
+      const send = _chatReply.youtube;
+      if (send) {
+        send(
+          `🔥 ${msg.username} has watched ${newStreak} streams in a row — incredible streak!`
+        ).catch(e => log.error('[watch-streak] chat reply error:', e.message));
+      }
     }
   }
 
@@ -187,49 +226,98 @@ const commandStreak = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
   .addStringOption(o =>
     o.setName('user')
-      .setDescription('YouTube username to look up')
-      .setRequired(true));
+      .setDescription('Username to look up')
+      .setRequired(true))
+  .addStringOption(o =>
+    o.setName('platform')
+      .setDescription('Platform (default: shows best streak across both)')
+      .setRequired(false)
+      .addChoices(
+        { name: 'YouTube', value: 'youtube' },
+        { name: 'Twitch',  value: 'twitch'  },
+      ));
 
 const commandStreaks = new SlashCommandBuilder()
   .setName('streaks')
   .setDescription('Show the top-10 watch streak leaderboard')
-  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+  .addStringOption(o =>
+    o.setName('platform')
+      .setDescription('Filter by platform (default: all)')
+      .setRequired(false)
+      .addChoices(
+        { name: 'YouTube', value: 'youtube' },
+        { name: 'Twitch',  value: 'twitch'  },
+      ));
 
 async function handleInteraction(interaction) {
   await interaction.deferReply({ ephemeral: false });
 
   if (interaction.commandName === 'streak') {
-    const user   = interaction.options.getString('user');
-    const record = _data[user];
+    const user     = interaction.options.getString('user');
+    const platform = interaction.options.getString('platform'); // may be null
 
-    if (!record || record.streak === 0) {
+    if (platform) {
+      // Specific platform requested
+      const key    = `${platform}:${user}`;
+      const record = _data[key];
+      const emoji  = platform === 'twitch' ? '🟣' : '🔴';
+
+      if (!record || record.streak === 0) {
+        return interaction.editReply(`No ${platform} streak found for **${user}**.`);
+      }
+      return interaction.editReply(
+        `${emoji} **${user}** (${platform}) has a watch streak of **${record.streak}** day(s) ` +
+        `(last seen: ${record.lastDate}).`
+      );
+    }
+
+    // No platform specified — show both if present
+    const yt  = _data[`youtube:${user}`];
+    const tw  = _data[`twitch:${user}`];
+
+    if ((!yt || yt.streak === 0) && (!tw || tw.streak === 0)) {
       return interaction.editReply(`No streak found for **${user}** — they may not have chatted yet.`);
     }
 
-    const lastSeen = record.lastDate ?? 'unknown';
-    return interaction.editReply(
-      `📺 **${user}** has a watch streak of **${record.streak}** day(s) ` +
-      `(last seen: ${lastSeen}).`
-    );
+    const lines = [];
+    if (yt?.streak > 0) lines.push(`🔴 YouTube: **${yt.streak}** day(s) (last seen: ${yt.lastDate})`);
+    if (tw?.streak > 0) lines.push(`🟣 Twitch: **${tw.streak}** day(s) (last seen: ${tw.lastDate})`);
+
+    return interaction.editReply(`📺 **${user}**\n${lines.join('\n')}`);
   }
 
   if (interaction.commandName === 'streaks') {
-    const top = Object.entries(_data)
-      .filter(([, r]) => r.streak > 0)
-      .sort(([, a], [, b]) => b.streak - a.streak)
+    const platform = interaction.options.getString('platform'); // may be null
+
+    const entries = Object.entries(_data)
+      .filter(([key, r]) => r.streak > 0 && (!platform || key.startsWith(`${platform}:`)))
+      .map(([key, r]) => {
+        const colonIdx = key.indexOf(':');
+        const plat     = key.slice(0, colonIdx);
+        const name     = key.slice(colonIdx + 1);
+        return { plat, name, streak: r.streak, lastDate: r.lastDate };
+      })
+      .sort((a, b) => b.streak - a.streak)
       .slice(0, 10);
 
-    if (top.length === 0) {
+    if (entries.length === 0) {
       return interaction.editReply('No streaks recorded yet.');
     }
 
-    const medals = ['🥇', '🥈', '🥉'];
-    const lines  = top.map(([user, r], i) => {
+    const medals  = ['🥇', '🥈', '🥉'];
+    const platEmoji = { youtube: '🔴', twitch: '🟣' };
+    const lines   = entries.map((e, i) => {
       const medal = medals[i] ?? `**${i + 1}.**`;
-      return `${medal} **${user}** — ${r.streak} day(s) (last seen: ${r.lastDate})`;
+      const tag   = platform ? '' : ` ${platEmoji[e.plat] ?? ''}`;
+      return `${medal}${tag} **${e.name}** — ${e.streak} day(s) (last seen: ${e.lastDate})`;
     });
 
-    return interaction.editReply(`📺 **Watch Streak Leaderboard**\n\n${lines.join('\n')}`);
+    const title = platform
+      ? `📺 **Watch Streak Leaderboard — ${platform.charAt(0).toUpperCase() + platform.slice(1)}**`
+      : '📺 **Watch Streak Leaderboard — All Platforms**';
+
+    return interaction.editReply(`${title}\n\n${lines.join('\n')}`);
   }
 
   return interaction.editReply('⚠️ Unknown command.');

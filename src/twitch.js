@@ -361,6 +361,31 @@ async function startTwitch(queue) {
     queue.pushMessage({ platform: 'twitch', username, message });
   });
 
+  // ── Twitch watch-streak share (USERNOTICE msg-id=viewermilestone) ────────
+  // Fires when a viewer clicks "Share Watch Streak" in the Twitch UI.
+  // Tags of interest:
+  //   msg-id            = 'viewermilestone'
+  //   msg-param-value   = streak length in consecutive streams (string)
+  //   display-name      = viewer's display name
+  client.on('raw_message', (messageData) => {
+    if (messageData?.command !== 'USERNOTICE') return;
+    const tags = messageData.tags ?? {};
+    if (tags['msg-id'] !== 'viewermilestone') return;
+
+    const username    = tags['display-name'] ?? tags.login ?? 'unknown';
+    const streakCount = parseInt(tags['msg-param-value'] ?? '0', 10);
+    if (!streakCount || streakCount < 1) return;
+
+    log.info(`[Twitch] Watch streak share: ${username} — ${streakCount} stream(s)`);
+    queue.pushMessage({
+      platform: 'twitch',
+      username,
+      message:  tags['system-msg'] ?? `${username} has watched ${streakCount} streams in a row!`,
+      type:     'watch-streak',
+      streak:   streakCount,
+    });
+  });
+
   // ── IRC fallback for bits (fires while live even without EventSub) ──────
   client.on('cheer', (channel, tags, message) => {
     const username = tags['display-name'] ?? tags.username ?? 'anonymous';
