@@ -222,6 +222,7 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
   // On the very first fetch we skip dispatch to avoid replaying history.
   // We still need the continuation token though, so we always fetch once.
   let skipDispatch = true;
+  let _fetchWarnCount = 0;
 
   while (!stopSignal.stopped) {
     let result;
@@ -231,7 +232,9 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
       result = await mc.fetch(continuation?.token);
     } catch (err) {
       if (stopSignal.stopped) return;
-      log.warn(`[YouTube] Lane ${laneId} fetch error: ${err.message} — backing off 5 s`);
+      if (++_fetchWarnCount % 12 === 1) {
+        log.warn(`[YouTube] Lane ${laneId} fetch error: ${err.message} — backing off 5 s`);
+      }
       await new Promise(r => setTimeout(r, 5_000));
       continue;
     }
@@ -339,6 +342,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
   const stopSignal = { stopped: false };
 
   _activeSessions.set(videoId, { type: 'masterchat', mc, liveChatId, stopSignal });
+  _sayLiveChatId = null; // force say() to re-resolve for the new stream
   log.info(`[YouTube] masterchat connected for video=${videoId} liveChatId=${liveChatId}`);
   log.info(`[YouTube] Starting dual-lane pipelined chat reader`);
 
@@ -353,6 +357,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     log.info(`[YouTube] Stream ended for ${videoId}`);
     stopSignal.stopped = true;
     _activeSessions.delete(videoId);
+    _sayLiveChatId = null;
     _evictParticipantCache();
     _resetDedup();
     if (YT_VIDEO_ID) {
@@ -365,6 +370,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     log.error(`[YouTube] masterchat error (${videoId}): ${err.message}`);
     stopSignal.stopped = true;
     _activeSessions.delete(videoId);
+    _sayLiveChatId = null;
     _evictParticipantCache();
     _resetDedup();
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);

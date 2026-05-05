@@ -37,7 +37,7 @@ const { registerSection, updateSection } = require('../../overlay-server');
 const _queue = [];
 let _enabled = true;
 
-const CMD_ADD      = /^!(?:q|queue|r|request)\s+(\d+)(?:\s+(.+))?\s*$/i;
+const CMD_ADD      = /^!(?:q|queue|r|request)\s+(\S+)(?:\s+(.+))?\s*$/i;
 const CMD_LIST     = /^!q\s*$/i;
 const CMD_LENGTH   = /^!ql\s*$/i;
 const CMD_POS      = /^!p\s*$/i;
