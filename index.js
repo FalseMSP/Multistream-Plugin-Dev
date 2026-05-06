@@ -43,7 +43,13 @@ async function main() {
   // 2. Wire queue → Discord embeds.
   //    Use late-binding lambdas so any plugin wrappers applied during
   //    initPlugins() are always called — not the original bare functions.
-  queue.onMessage((msg)    => discord.sendChat(msg));
+  queue.onMessage(async (msg) => {
+  const { finalMsg, sideEffects } = await plugins.runPipeline(msg);
+    for (const fn of sideEffects) {
+      fn().catch(err => log.error('[main] sideEffect error:', err.message));
+    }
+    if (finalMsg) discord.sendChat(finalMsg);
+  });
   queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
   queue.onDonation((donation)  => discord.sendDonation(donation));
   
