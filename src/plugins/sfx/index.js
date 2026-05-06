@@ -31,7 +31,11 @@ const log = require('../../logger');
  * Add / remove entries to match your actual reward names.
  */
 const SFX_MAP = {
-  'vine boom':       '/sfx/vine-boom.mp3'
+  'airhorn':       '/sfx/airhorn.mp3',
+  'sad trombone':  '/sfx/sadtrombone.mp3',
+  'fart':          '/sfx/fart.mp3',
+  'hype':          '/sfx/hype.mp3',
+  'drum roll':     '/sfx/drumroll.mp3',
 };
 
 const MASTER_VOLUME  = parseFloat(process.env.SFX_VOLUME       ?? '1.0');
@@ -128,7 +132,8 @@ module.exports = {
   init(context) {
     // onModAction receives all moderation + redemption events.
     // Twitch redemption events have type === 'redeem' and a rewardTitle field.
-    context.discord.onModAction(event => {
+    // Note: context is flat — keys are directly on context, not context.discord.
+    context.onModAction(event => {
       if (event.type !== 'redeem') return;
       handleRedeem(event.rewardTitle);
     });
