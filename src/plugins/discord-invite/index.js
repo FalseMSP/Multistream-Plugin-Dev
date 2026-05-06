@@ -21,7 +21,6 @@ function onChatReady(chatReply) {
 }
 
 async function processMessage(msg) {
-  log.info(`[discord-link] processMessage called: "${msg.message}" platform=${msg.platform}`);
   if (!CMD_DISCORD.test(msg.message.trim())) return { message: msg };
 
   const send = _chatReply[msg.platform];
