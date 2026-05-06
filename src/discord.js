@@ -39,8 +39,14 @@ let chatWebhook   = null;
 let redeemWebhook = null;
 
 function getWebhooks() {
-  if (!chatWebhook   && CHAT_WEBHOOK_URL)   chatWebhook   = new WebhookClient({ url: CHAT_WEBHOOK_URL });
-  if (!redeemWebhook && REDEEM_WEBHOOK_URL) redeemWebhook = new WebhookClient({ url: REDEEM_WEBHOOK_URL });
+  if (!chatWebhook && CHAT_WEBHOOK_URL) {
+    try { chatWebhook = new WebhookClient({ url: CHAT_WEBHOOK_URL }); }
+    catch (e) { log.error('[discord] Invalid CHAT_WEBHOOK_URL:', CHAT_WEBHOOK_URL); }
+  }
+  if (!redeemWebhook && REDEEM_WEBHOOK_URL) {
+    try { redeemWebhook = new WebhookClient({ url: REDEEM_WEBHOOK_URL }); }
+    catch (e) { log.error('[discord] Invalid REDEEM_WEBHOOK_URL:', JSON.stringify(REDEEM_WEBHOOK_URL)); }
+  }
 }
 
 // Token-bucket rate limiter
