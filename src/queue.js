@@ -70,12 +70,15 @@ function _dispatch(handlers, payload, label) {
   for (const fn of handlers) {
     try {
       const result = fn(payload);
-      // Swallow promise rejections so one bad handler can't break others
       if (result && typeof result.catch === 'function') {
-        result.catch(err => log.error(`[queue] ${label} handler error:`, err?.message ?? err));
+        result.catch(err => {
+          log.error(`[queue] ${label} handler error:`, err?.message ?? err);
+          log.error(`[queue] ${label} handler stack:`, err?.stack ?? 'no stack');
+        });
       }
     } catch (err) {
       log.error(`[queue] ${label} handler threw:`, err?.message ?? err);
+      log.error(`[queue] ${label} handler stack:`, err?.stack ?? 'no stack');
     }
   }
 }
