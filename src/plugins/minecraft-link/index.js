@@ -200,13 +200,16 @@ async function processMessage(msg) {
     return { message: msg };
   }
 
-  if (!_regex.test(msg.message)) {
+  // Strip a leading "!" so "!tnt" is treated identically to "tnt"
+  const text = msg.message.replace(/^!/, '');
+
+  if (!_regex.test(text)) {
     return { message: msg };
   }
 
-  // Exact match ("tnt", "TNT") → suppress from stream chat, it's just a bare command.
+  // Exact match ("tnt", "!TNT") → suppress from stream chat, it's just a bare command.
   // Fuzzy match ("I summon tnt") → forward AND keep visible in stream chat.
-  const isExact   = _exactRegex.test(msg.message);
+  const isExact   = _exactRegex.test(text);
   const platform  = (msg.platform ?? 'UNKNOWN').toUpperCase();
   const formatted = `[${platform}] ${msg.username}: ${msg.message}`;
   const wh        = getWebhook();
