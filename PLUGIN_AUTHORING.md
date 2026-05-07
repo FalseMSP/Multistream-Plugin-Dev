@@ -93,6 +93,51 @@ module.exports = {
 
 ---
 
+## Registering commands with the `!commands` list
+
+The `commands-list` plugin exposes a shared registry so that `!commands` in chat always reflects every command that's actually loaded. **Any plugin that adds a chat command should register it** — otherwise it stays invisible to viewers.
+
+### Registering on startup
+
+Call `registerCommand` inside `onChatReady` (or `init`). Re-registering the same name just overwrites the description, so hot-reloads are safe.
+
+```js
+const commandsList = require('../commands-list');
+
+function onChatReady(chatReply) {
+  _chatReply = chatReply;
+  commandsList.registerCommand('!discord', 'Get the Discord invite link');
+}
+```
+
+### Removing a command
+
+Call `removeCommand` if your plugin disables a command at runtime (e.g. a toggle feature).
+
+```js
+commandsList.removeCommand('!discord');
+```
+
+### Reading the full list
+
+```js
+const cmds = commandsList.getCommands();
+// → [{ name: '!commands', description: '…' }, { name: '!discord', description: '…' }, …]
+// Always sorted alphabetically.
+```
+
+### Full registry API
+
+| Method | Signature | Description |
+|---|---|---|
+| `registerCommand` | `(name: string, description: string) => void` | Add or update a command entry |
+| `removeCommand` | `(name: string) => void` | Remove a command entry by name |
+| `getCommands` | `() => { name, description }[]` | Return all entries, sorted A–Z |
+
+> **Load order note.** Plugin directories are loaded alphabetically. If your plugin loads before `commands-list`, the `require('../commands-list')` call will still succeed — Node's module cache means it gets the same singleton once `commands-list` eventually loads. However, prefer registering inside `onChatReady` rather than at module-load time to avoid ordering surprises.
+
+---
+
 ## Multiple slash commands
 
 Export a `commands` array instead of a single `command`, then route inside `handleInteraction` using `interaction.commandName`.
@@ -185,6 +230,7 @@ function _notify() {
 'use strict';
 
 const log = require('../../logger');
+const commandsList = require('../commands-list');
 
 const CMD_DISCORD = /^!discord\s*$/i;
 
@@ -192,6 +238,7 @@ let _chatReply = { twitch: null, youtube: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
+  commandsList.registerCommand('!discord', 'Get the Discord invite link');
   log.info('[discord-link] Chat reply handlers registered.');
 }
 
@@ -310,3 +357,4 @@ module.exports = {
 - **`onChatReady(chatReply)`** is called once Twitch and YouTube clients are ready, after `init`. It's the correct hook for anything that sends replies to chat — by this point `chatReply.twitch` and `chatReply.youtube` are guaranteed to be populated.
 - **Suppress bot-trigger commands** from `#stream-chat` by returning `{ message: null }` — commands like `!q` or `!discord` are noise in the Discord feed.
 - **Serialise render functions** with `.toString()` when registering overlay sections. The function body must be fully self-contained.
+- **Register every chat command** with `commandsList.registerCommand()` inside `onChatReady` so it appears in `!commands`. This is the single source of truth viewers see — if it's not registered, it's invisible.

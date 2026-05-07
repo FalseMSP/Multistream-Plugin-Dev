@@ -3,54 +3,111 @@
 /**
  * Plugin: minecraft-link
  * ──────────────────────
- * When a viewer's chat message matches a configurable regex, the message is
- * forwarded to a dedicated #plugin-chat Discord channel in a structured format
- * that a Minecraft mod (or any external consumer) can read via the Discord API.
+ * When a viewer's chat message contains one of the configured keywords
+ * (case-insensitive, substring/fuzzy match), the message is forwarded to a
+ * dedicated #plugin-chat Discord channel in a structured format that the
+ * Minecraft mod reads via the Discord API.
  *
  * The message is suppressed from #stream-chat to avoid spam —
  * it is ONLY forwarded to #plugin-chat.
  *
- * Forwarded format (plain text, easy to parse):
+ * Forwarded format (plain text):
  *   [PLATFORM] Username: <original message>
  *
- * Example trigger: viewer types "tnt" → #plugin-chat receives:
- *   [TWITCH] Steve: tnt
+ * The Minecraft mod matches lines with:
+ *   ^\\[(twitch|youtube)\\]\\s+(.+?):\\s+(?!.*REDEEM:).*<keyword>.*$  (CASE_INSENSITIVE)
+ *
+ * So the JS side just needs to forward the line in that format — the mod does
+ * its own keyword filtering. The JS pattern here controls what gets forwarded;
+ * keep it in sync with the mod's keyword list.
+ *
+ * Example trigger: viewer types "can we get some tnt going" → #plugin-chat receives:
+ *   [TWITCH] Steve: can we get some tnt going
  *
  * All Twitch channel point redeems are ALWAYS forwarded to #plugin-chat as:
  *   [TWITCH] username: REDEEM: <redeem name>
+ * (The mod's negative lookahead (?!.*REDEEM:) excludes these from keyword routing.)
  *
  * Slash command: /minecraft_link
- *   status                — show enabled state, pattern, webhook
- *   enable                — start forwarding matched messages
- *   disable               — stop forwarding (main chat unaffected)
- *   set_pattern <regex>   — update the match regex live
- *   test <message>        — dry-run: check if a message would be forwarded
+ *   status                        — show enabled state, keywords, webhook
+ *   enable                        — start forwarding matched messages
+ *   disable                       — stop forwarding (main chat unaffected)
+ *   set_keywords <word,word,...>   — replace the keyword list live
+ *   add_keyword  <word>            — add a single keyword
+ *   remove_keyword <word>          — remove a single keyword
+ *   test <message>                 — dry-run: show which keyword(s) matched
  *
  * Environment variables:
  *   DISCORD_MINECRAFT_WEBHOOK_URL     — webhook URL for #plugin-chat
- *   MINECRAFT_LINK_DEFAULT_REGEX      — override the default pattern at startup
+ *   MINECRAFT_LINK_KEYWORDS           — comma-separated keywords at startup
+ *                                       default: tnt,william,creeper,penny,suzy
  *   MINECRAFT_LINK_ENABLED            — 'false' to start disabled (default: true)
  */
 
 const { SlashCommandBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
+const commandsList = require('../commands-list');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
 const WEBHOOK_URL = process.env.DISCORD_MINECRAFT_WEBHOOK_URL ?? '';
 
-const DEFAULT_PATTERN = process.env.MINECRAFT_LINK_DEFAULT_REGEX ?? String.raw`\b(tnt|william)\b`;
+const DEFAULT_KEYWORDS = (
+  process.env.MINECRAFT_LINK_KEYWORDS ?? 'tnt,william,creeper,penny,suzy'
+)
+  .split(',')
+  .map(k => k.trim().toLowerCase())
+  .filter(Boolean);
 
 // ── State ─────────────────────────────────────────────────────────────────
 
-let _enabled = (process.env.MINECRAFT_LINK_ENABLED ?? 'true').toLowerCase() !== 'false';
-let _pattern = DEFAULT_PATTERN;
-let _regex   = safeCompile(DEFAULT_PATTERN);
-let _webhook = null;
+let _enabled     = (process.env.MINECRAFT_LINK_ENABLED ?? 'true').toLowerCase() !== 'false';
+/** @type {Set<string>} lowercase keyword strings */
+let _keywords    = new Set(DEFAULT_KEYWORDS);
+/** Fuzzy: matches keyword anywhere in message */
+let _regex       = buildRegex(_keywords);
+/** Exact: matches only when the entire message is a single keyword */
+let _exactRegex  = buildExactRegex(_keywords);
+let _webhook     = null;
 
-function safeCompile(pattern) {
-  try   { return new RegExp(pattern, 'i'); }
-  catch { return null; }
+/**
+ * Build a case-insensitive regex that fuzzy-matches any keyword
+ * anywhere in the message text.
+ * @param {Set<string>} keywords
+ * @returns {RegExp|null}
+ */
+function buildRegex(keywords) {
+  if (!keywords.size) return null;
+  const alts = [...keywords].map(escapeRegex).join('|');
+  return new RegExp(alts, 'i');
+}
+
+/**
+ * Build a regex that matches ONLY when the entire trimmed message is exactly
+ * one of the keywords (case-insensitive, optional surrounding whitespace).
+ * e.g. "tnt" or "TNT" → exact. "I summon tnt" → not exact.
+ * @param {Set<string>} keywords
+ * @returns {RegExp|null}
+ */
+function buildExactRegex(keywords) {
+  if (!keywords.size) return null;
+  const alts = [...keywords].map(escapeRegex).join('|');
+  return new RegExp(`^\\s*(${alts})\\s*$`, 'i');
+}
+
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Returns which keywords matched a given message (for diagnostics / test cmd).
+ * @param {string} text
+ * @returns {string[]}
+ */
+function matchedKeywords(text) {
+  return [..._keywords].filter(kw =>
+    new RegExp(escapeRegex(kw), 'i').test(text)
+  );
 }
 
 function getWebhook() {
@@ -58,13 +115,8 @@ function getWebhook() {
   return _webhook;
 }
 
-// ── init — hook into sendRedeem ───────────────────────────────────────────
+// ── init — hook into sendRedeem / sendDonation ────────────────────────────
 
-/**
- * context is the shared api object: { sendChat, sendRedeem, registerCommands, onModAction }
- * We replace context.sendRedeem with a wrapper that mirrors every redeem to
- * #plugin-chat before calling the original.
- */
 function init(context) {
   log.info('[minecraft-link] init called, context keys:', Object.keys(context ?? {}));
 
@@ -72,7 +124,6 @@ function init(context) {
     log.warn('[minecraft-link] No sendRedeem found in context — redeem forwarding disabled.');
   } else {
     const _originalSendRedeem = context.sendRedeem;
-
     context.sendRedeem = async function (redeem) {
       const wh = getWebhook();
       if (wh && WEBHOOK_URL) {
@@ -84,6 +135,9 @@ function init(context) {
           ?? redeem?.user?.login
           ?? redeem?.user?.display_name
           ?? 'UNKNOWN';
+        // NOTE: The Minecraft mod's negative lookahead (?!.*REDEEM:) ensures
+        // these lines are never matched by keyword routes — they go to a
+        // dedicated redeem handler on the mod side.
         const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
         try {
           await wh.send({ content: formatted });
@@ -94,7 +148,6 @@ function init(context) {
       }
       return _originalSendRedeem(redeem);
     };
-
     log.info('[minecraft-link] Redeem forwarding hooked ✅');
   }
 
@@ -102,7 +155,6 @@ function init(context) {
     log.warn('[minecraft-link] No sendDonation found in context — donation forwarding disabled.');
   } else {
     const _originalSendDonation = context.sendDonation;
-
     context.sendDonation = async function (donation) {
       const wh = getWebhook();
       if (wh && WEBHOOK_URL) {
@@ -128,8 +180,16 @@ function init(context) {
       }
       return _originalSendDonation(donation);
     };
-
     log.info('[minecraft-link] Donation forwarding hooked ✅');
+  }
+}
+
+// ── onChatReady ───────────────────────────────────────────────────────────
+
+function onChatReady(_chatReply) {
+  // Register each keyword as its own !<keyword> command so they appear in !commands
+  for (const kw of _keywords) {
+    commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
   }
 }
 
@@ -144,17 +204,20 @@ async function processMessage(msg) {
     return { message: msg };
   }
 
-  const platform = (msg.platform ?? 'UNKNOWN').toUpperCase();
+  // Exact match ("tnt", "TNT") → suppress from stream chat, it's just a bare command.
+  // Fuzzy match ("I summon tnt") → forward AND keep visible in stream chat.
+  const isExact   = _exactRegex.test(msg.message);
+  const platform  = (msg.platform ?? 'UNKNOWN').toUpperCase();
   const formatted = `[${platform}] ${msg.username}: ${msg.message}`;
-  const wh = getWebhook();
+  const wh        = getWebhook();
 
   return {
-    message: null, // suppress from #stream-chat — only goes to #plugin-chat
+    message: isExact ? null : msg,
     sideEffect: wh
       ? async () => {
           try {
             await wh.send({ content: formatted });
-            log.debug(`[minecraft-link] Forwarded → "${formatted}"`);
+            log.debug(`[minecraft-link] Forwarded (${isExact ? 'exact' : 'fuzzy'}) → "${formatted}"`);
           } catch (err) {
             log.error('[minecraft-link] Webhook send error:', err.message);
           }
@@ -167,11 +230,11 @@ async function processMessage(msg) {
 
 const command = new SlashCommandBuilder()
   .setName('minecraft_link')
-  .setDescription('Manage Minecraft plugin chat trigger forwarding')
+  .setDescription('Manage Minecraft chat trigger forwarding')
   .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
   .addSubcommand(sub =>
     sub.setName('status')
-      .setDescription('Show current configuration'))
+      .setDescription('Show current configuration and keyword list'))
   .addSubcommand(sub =>
     sub.setName('enable')
       .setDescription('Start forwarding matched messages to #plugin-chat'))
@@ -179,15 +242,29 @@ const command = new SlashCommandBuilder()
     sub.setName('disable')
       .setDescription('Stop forwarding (main stream chat is unaffected)'))
   .addSubcommand(sub =>
-    sub.setName('set_pattern')
-      .setDescription('Update the regex that triggers a forward')
+    sub.setName('set_keywords')
+      .setDescription('Replace the entire keyword list')
       .addStringOption(o =>
-        o.setName('regex')
-          .setDescription('JavaScript regex (no slashes) — e.g.  \\btnt\\b|\\bbomb\\b')
+        o.setName('keywords')
+          .setDescription('Comma-separated keywords — e.g.  tnt, creeper, william')
+          .setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('add_keyword')
+      .setDescription('Add a single keyword to the trigger list')
+      .addStringOption(o =>
+        o.setName('keyword')
+          .setDescription('The keyword to add — e.g.  skeleton')
+          .setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('remove_keyword')
+      .setDescription('Remove a single keyword from the trigger list')
+      .addStringOption(o =>
+        o.setName('keyword')
+          .setDescription('The keyword to remove')
           .setRequired(true)))
   .addSubcommand(sub =>
     sub.setName('test')
-      .setDescription('Check whether a message would be forwarded without sending anything')
+      .setDescription('Check whether a message would be forwarded and which keyword(s) matched')
       .addStringOption(o =>
         o.setName('message')
           .setDescription('The chat message text to test')
@@ -197,57 +274,101 @@ async function handleInteraction(interaction) {
   await interaction.deferReply({ ephemeral: true });
   const sub = interaction.options.getSubcommand();
 
+  // ── status ──────────────────────────────────────────────────────────────
   if (sub === 'status') {
+    const kwList = _keywords.size
+      ? [..._keywords].sort().map(k => `\`${k}\``).join(', ')
+      : '_none — all messages pass through_';
     const lines = [
       `**Status:**   ${_enabled ? '✅ Enabled' : '❌ Disabled'}`,
-      `**Webhook:**  ${WEBHOOK_URL ? '✅ Configured' : '⚠️ Missing \`DISCORD_MINECRAFT_WEBHOOK_URL\`'}`,
-      `**Pattern:**  \`${_pattern}\``,
-      `**Regex OK:** ${_regex ? '✅' : '❌ Invalid — update with /minecraft_link set_pattern'}`,
+      `**Webhook:**  ${WEBHOOK_URL ? '✅ Configured' : '⚠️ Missing `DISCORD_MINECRAFT_WEBHOOK_URL`'}`,
+      `**Keywords (${_keywords.size}):** ${kwList}`,
       '',
       `Matched messages are **removed** from #stream-chat and forwarded to #plugin-chat as:`,
       `\`\`\`[PLATFORM] Username: <message>\`\`\``,
-      `All Twitch redeems are **always** forwarded to #plugin-chat as:`,
+      `Matching is **case-insensitive** and **fuzzy** (substring) — "omg TNT!!" matches \`tnt\`.`,
+      '',
+      `All Twitch redeems are **always** forwarded as:`,
       `\`\`\`[TWITCH] username: REDEEM: <redeem name>\`\`\``,
-      `Main stream chat is **never** affected.`,
     ];
     return interaction.editReply(lines.join('\n'));
   }
 
+  // ── enable / disable ─────────────────────────────────────────────────────
   if (sub === 'enable') {
     _enabled = true;
-    return interaction.editReply('✅ minecraft-link **enabled**. Matched messages will be forwarded to #plugin-chat and hidden from #stream-chat.');
+    return interaction.editReply('✅ minecraft-link **enabled**.');
   }
-
   if (sub === 'disable') {
     _enabled = false;
     return interaction.editReply('⏸ minecraft-link **disabled**. All messages flow to main chat only.');
   }
 
-  if (sub === 'set_pattern') {
-    const raw      = interaction.options.getString('regex');
-    const compiled = safeCompile(raw);
-    if (!compiled) {
-      return interaction.editReply(`❌ Invalid regex: \`${raw}\`\nPattern **not** updated — fix the syntax and try again.`);
+  // ── set_keywords ─────────────────────────────────────────────────────────
+  if (sub === 'set_keywords') {
+    const raw  = interaction.options.getString('keywords');
+    const list = raw.split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+    if (!list.length) {
+      return interaction.editReply('❌ No valid keywords found. Provide a comma-separated list, e.g. `tnt, creeper, william`.');
     }
-    _pattern = raw;
-    _regex   = compiled;
-    return interaction.editReply([
-      `✅ Pattern updated to:`,
-      `\`\`\`${raw}\`\`\``,
-      `Messages matching this regex will be forwarded as \`[PLATFORM] Username: <message>\`.`,
-    ].join('\n'));
+
+    // Sync commandsList: remove old keyword commands, add new ones
+    for (const kw of _keywords) commandsList.removeCommand(`!${kw}`);
+    _keywords   = new Set(list);
+    _regex      = buildRegex(_keywords);
+    _exactRegex = buildExactRegex(_keywords);
+    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+
+    const display = list.map(k => `\`${k}\``).join(', ');
+    return interaction.editReply(`✅ Keywords replaced with: ${display}`);
   }
 
+  // ── add_keyword ───────────────────────────────────────────────────────────
+  if (sub === 'add_keyword') {
+    const kw = interaction.options.getString('keyword').trim().toLowerCase();
+    if (!kw) return interaction.editReply('❌ Keyword cannot be empty.');
+    if (_keywords.has(kw)) return interaction.editReply(`ℹ️ \`${kw}\` is already in the list.`);
+
+    _keywords.add(kw);
+    _regex      = buildRegex(_keywords);
+    _exactRegex = buildExactRegex(_keywords);
+    commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+    return interaction.editReply(`✅ Added \`${kw}\`. Current keywords: ${[..._keywords].sort().map(k => `\`${k}\``).join(', ')}`);
+  }
+
+  // ── remove_keyword ────────────────────────────────────────────────────────
+  if (sub === 'remove_keyword') {
+    const kw = interaction.options.getString('keyword').trim().toLowerCase();
+    if (!_keywords.has(kw)) return interaction.editReply(`ℹ️ \`${kw}\` is not in the list.`);
+
+    _keywords.delete(kw);
+    _regex      = buildRegex(_keywords);
+    _exactRegex = buildExactRegex(_keywords);
+    commandsList.removeCommand(`!${kw}`);
+    const remaining = _keywords.size
+      ? [..._keywords].sort().map(k => `\`${k}\``).join(', ')
+      : '_none_';
+    return interaction.editReply(`✅ Removed \`${kw}\`. Remaining: ${remaining}`);
+  }
+
+  // ── test ──────────────────────────────────────────────────────────────────
   if (sub === 'test') {
     const text    = interaction.options.getString('message');
-    const matches = _regex ? _regex.test(text) : false;
-    if (!_regex) {
-      return interaction.editReply('❌ Current pattern is invalid — update it first with `/minecraft_link set_pattern`.');
+    const matched = matchedKeywords(text);
+    if (!_keywords.size) {
+      return interaction.editReply('⚠️ No keywords configured — nothing would ever be forwarded.');
     }
+    const isExact = matched.length > 0 && _exactRegex.test(text);
     const lines = [
       `**Message:** \`${text}\``,
-      `**Pattern:** \`${_pattern}\``,
-      `**Result:**  ${matches ? `✅ MATCH — would forward as \`[PLATFORM] SomeUser: ${text}\`` : '❌ No match — would not forward'}`,
+      `**Keywords:** ${[..._keywords].sort().map(k => `\`${k}\``).join(', ')}`,
+      matched.length
+        ? [
+            `**Result:** ✅ MATCH on ${matched.map(k => `\`${k}\``).join(', ')}`,
+            `**Type:** ${isExact ? '🔇 Exact — suppressed from stream chat' : '💬 Fuzzy — visible in stream chat + forwarded'}`,
+            `**Forwarded as:** \`[PLATFORM] SomeUser: ${text}\``,
+          ].join('\n')
+        : `**Result:** ❌ No match — would not forward`,
     ];
     return interaction.editReply(lines.join('\n'));
   }
@@ -263,4 +384,9 @@ module.exports = {
   handleInteraction,
   processMessage,
   init,
+  onChatReady,
+
+  // Exposed for testing / other plugins
+  matchedKeywords,
+  getKeywords: () => new Set(_keywords),
 };
