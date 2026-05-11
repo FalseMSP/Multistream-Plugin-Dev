@@ -38,7 +38,7 @@ const SCOPES = [
   'chat:read',
   'channel:manage:polls',
   'channel:read:polls',
-  'channel:read:followers'
+  'moderator:read:followers'
 ].join(' ');
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
