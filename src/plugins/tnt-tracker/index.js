@@ -2,29 +2,16 @@
 
 /**
  * tnt-tracker plugin
+ * ... (existing header unchanged) ...
  *
- * Twitch follows                → +50 TNT  (via channel.follow v2 EventSub — see twitch.js)
- * Twitch subs / resubs          → +50 TNT  (per subscriber)
- * Twitch gift subs              → +50 TNT  (× quantity, so a 5-gift = +250)
- * YouTube subscribers           → +50 TNT  (per subscriber, named or anonymous)
- *                                  Named events (new member, milestone, gifted membership)
- *                                  arrive immediately from the masterchat action stream.
- *                                  Anonymous events fire when the count-delta poller in
- *                                  youtube.js detects an increase not covered by a named
- *                                  event. Both carry { platform:'youtube', type:'subscribe' }.
+ * Game link:
+ *   POST http://localhost:<OVERLAY_PORT>/tnt_update
+ *   Body (JSON): { "action": "place", "amount": 1 }
+ *                { "action": "remove", "amount": 1 }
+ *                { "action": "set",    "amount": 500 }
+ *                { "action": "reset" }
  *
- * Twitch events arrive via queue.onDonation() (donation bus).
- * YouTube subscribe events arrive via queue.onMessage() (chat/message bus) — they are
- * routed there because masterchat pushes everything through pushMessage. This plugin
- * registers a message listener that filters for type === 'subscribe' and ignores all
- * ordinary chat messages.
- *
- * OBS browser source:  http://localhost:<overlay-port>/tnt_placing
- *
- * Discord slash command:
- *   /tnt set <n>    — hard-set the count
- *   /tnt add <n>    — add or subtract
- *   /tnt status     — show current count (ephemeral)
+ *   Response: { "ok": true, "count": <number> }
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
@@ -165,9 +152,85 @@ const TNT_PAGE_HTML = /* html */`<!DOCTYPE html>
 </body>
 </html>`;
 
-addRoute('/tnt_placing', (_req, res) => {
+addRoute('/tnt_update', (req, res) => {
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
+  }
+
+  // Auth check
+  const secret = process.env.TNT_UPDATE_SECRET;
+  if (secret && req.headers['x-tnt-secret'] !== secret) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+  }
+  
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(TNT_PAGE_HTML);
+});
+
+// ─── Game link endpoint ───────────────────────────────────────────────────────
+//
+//  POST /tnt_update   (on the overlay server port, same as /tnt_placing)
+//  Body JSON:
+//    { "action": "place",  "amount": 1 }   — subtract: player placed N TNT
+//    { "action": "remove", "amount": 1 }   — add back: player removed N TNT
+//    { "action": "set",    "amount": 500 } — hard-set the counter
+//    { "action": "reset" }                 — set to 0
+//
+//  Response: { "ok": true, "count": <number> }
+//
+//  From Minecraft (or any HTTP client), e.g.:
+//    curl -X POST http://localhost:<OVERLAY_PORT>/tnt_update \
+//         -H "Content-Type: application/json" \
+//         -d '{"action":"place","amount":1}'
+
+addRoute('/tnt_update', (req, res) => {
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
+  }
+
+  let body = '';
+  req.on('data', chunk => { body += chunk; });
+  req.on('end', () => {
+    let data;
+    try {
+      data = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
+    }
+
+    const { action, amount } = data;
+
+    switch (action) {
+      case 'place':
+        // Placing TNT subtracts from the "left to place" counter
+        addTnt(-(amount ?? 1));
+        log.info(`[tnt-tracker] Game: placed ${amount ?? 1} TNT → ${tntCount} remaining`);
+        break;
+      case 'remove':
+        // Removing/picking up TNT adds it back
+        addTnt(amount ?? 1);
+        log.info(`[tnt-tracker] Game: removed ${amount ?? 1} TNT → ${tntCount} remaining`);
+        break;
+      case 'set':
+        setTnt(amount ?? 0);
+        log.info(`[tnt-tracker] Game: set TNT to ${tntCount}`);
+        break;
+      case 'reset':
+        setTnt(0);
+        log.info('[tnt-tracker] Game: reset TNT to 0');
+        break;
+      default:
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ ok: false, error: `Unknown action: ${action}` }));
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, count: tntCount }));
+  });
 });
 
 // ─── Discord slash command ────────────────────────────────────────────────────
@@ -210,24 +273,8 @@ async function handleInteraction(interaction) {
 }
 
 // ─── Plugin entry point ───────────────────────────────────────────────────────
-//
-// How events actually flow (from reading twitch.js / youtube.js / index.js):
-//
-//  Twitch follows   → queue.pushDonation({ type: 'follow',  platform: 'twitch' })
-//                     Requires channel.follow v2 EventSub (added to twitch.js)
-//                     and moderator:read:followers OAuth scope — run twitch-auth.js.
-//
-//  Twitch subs      → queue.pushDonation({ type: 'sub',     platform: 'twitch' })
-//  Twitch resubs    → queue.pushDonation({ type: 'resub',   platform: 'twitch' })
-//  Twitch subgifts  → queue.pushDonation({ type: 'subgift', platform: 'twitch', quantity })
-//
-//  YouTube subs     → queue.pushMessage({ platform: 'youtube', type: 'subscribe', username })
-//                     Named: username is the display name string (from masterchat action stream)
-//                     Anonymous: username is null (from count-delta poller in youtube.js)
 
 function init(_context) {
-  // queue is required directly — it is not passed through context per the plugin spec.
-  // (context only carries { discord: { sendChat, sendRedeem, onModAction }, chatReply })
   if (!queue?.onDonation) {
     log.warn('[tnt-tracker] queue.onDonation not available — Twitch events will not be tracked.');
   } else {
@@ -240,14 +287,11 @@ function init(_context) {
         addTnt(TNT_PER_EVENT);
         return;
       }
-
       if (type === 'sub' || type === 'resub') {
         log.info(`[tnt-tracker] Twitch ${type}: ${username} → +${TNT_PER_EVENT} TNT`);
         addTnt(TNT_PER_EVENT);
         return;
       }
-
-      // subgift quantity can be > 1 for mystery gifts — credit each recipient
       if (type === 'subgift') {
         const qty = quantity ?? 1;
         log.info(`[tnt-tracker] Twitch subgift x${qty}: ${username} → +${TNT_PER_EVENT * qty} TNT`);
@@ -256,9 +300,6 @@ function init(_context) {
     });
   }
 
-  // YouTube subscribe events come through the message bus (pushMessage), not pushDonation,
-  // because masterchat routes everything via the same channel. We filter by type so that
-  // ordinary chat messages are ignored and only subscriber events trigger TNT additions.
   if (!queue?.onMessage) {
     log.warn('[tnt-tracker] queue.onMessage not available — YouTube subscriber events will not be tracked.');
   } else {
