@@ -250,7 +250,6 @@ function onModAction(action, fn) {
 
 async function startDiscordBot() {
   const plugins = require('./plugins/index');
-  plugins.loadPlugins();
 
   // Single shared object — plugins can wrap api.sendRedeem and the queue
   // will always call the current (possibly wrapped) version at call-time.
