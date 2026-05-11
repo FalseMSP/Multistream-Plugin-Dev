@@ -128,11 +128,9 @@ module.exports = {
   init(context) {
     // onModAction receives all moderation + redemption events.
     // Twitch redemption events have type === 'redeem' and a rewardTitle field.
-    // Note: context is flat — keys are directly on context, not context.discord.
-    context.onModAction(event => {
-      if (event.type !== 'redeem') return;
-      handleRedeem(event.rewardTitle);
-    });
+    context.onRedeem(redeem => {
+    handleRedeem(redeem.title);
+  });
 
     log.info('[sfx] Plugin loaded. Mapped rewards:', Object.keys(SFX_MAP).join(', '));
   },
