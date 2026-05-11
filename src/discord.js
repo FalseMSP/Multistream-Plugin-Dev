@@ -120,7 +120,7 @@ function buildRedeemEmbed(username, title, cost, input, timestamp) {
 function buildDonationEmbed(donation) {
   const { platform, type, username, amount, message, tier, months, streak, quantity, recipient } = donation;
 
-  let title, description;
+  let title, description = null;  // ← always initialise to null
 
   switch (type) {
     case 'bits':
@@ -128,7 +128,8 @@ function buildDonationEmbed(donation) {
       description = message || null;
       break;
     case 'sub':
-      title = `⭐ ${username} subscribed! (Tier ${_tierLabel(tier)})`;
+      title       = `⭐ ${username} subscribed! (Tier ${_tierLabel(tier)})`;
+      description = null;
       break;
     case 'resub':
       title       = `🔄 ${username} resubscribed! (${months} months, Tier ${_tierLabel(tier)})`;
@@ -140,9 +141,11 @@ function buildDonationEmbed(donation) {
       } else {
         title = `🎁 ${username} gifted ${quantity ?? 1}x Tier ${_tierLabel(tier)} sub${(quantity ?? 1) !== 1 ? 's' : ''}!`;
       }
+      description = null;
       break;
     default:
-      title = `💰 ${username} (${type})`;
+      title       = `💰 ${username} (${type})`;
+      description = null;
   }
 
   const embed = new EmbedBuilder()
@@ -151,7 +154,7 @@ function buildDonationEmbed(donation) {
     .setTitle(title)
     .setTimestamp();
 
-  if (description) embed.setDescription(description);
+  if (description) embed.setDescription(description);  // ← was: message.content ?? null
   return embed;
 }
 

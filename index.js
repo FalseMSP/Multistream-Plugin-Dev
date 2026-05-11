@@ -50,7 +50,18 @@ async function main() {
   //    Use late-binding lambdas so any plugin wrappers applied during
   //    initPlugins() are always called — not the original bare functions.
   queue.onMessage(async (msg) => {
-  const { finalMsg, sideEffects } = await plugins.runPipeline(msg);
+    // Subscribe/membership events have no chat text — build a simple announcement.
+    if (msg.type === 'subscribe') {
+      const name = msg.username ?? 'Someone';
+      discord.sendChat({
+        platform: msg.platform,
+        username: name,
+        message:  `⭐ ${name} just subscribed!`,
+      });
+      return;
+    }
+
+    const { finalMsg, sideEffects } = await plugins.runPipeline(msg);
     for (const fn of sideEffects) {
       fn().catch(err => log.error('[main] sideEffect error:', err.message));
     }
