@@ -31,11 +31,7 @@ const log = require('../../logger');
  * Add / remove entries to match your actual reward names.
  */
 const SFX_MAP = {
-  'airhorn':       '/sfx/airhorn.mp3',
-  'sad trombone':  '/sfx/sadtrombone.mp3',
-  'fart':          '/sfx/fart.mp3',
-  'hype':          '/sfx/hype.mp3',
-  'drum roll':     '/sfx/drumroll.mp3',
+  'Vine Boom':       '/sfx/vine-boom.mp3',
 };
 
 const MASTER_VOLUME  = parseFloat(process.env.SFX_VOLUME       ?? '1.0');
