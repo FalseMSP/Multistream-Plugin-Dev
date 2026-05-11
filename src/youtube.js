@@ -21,6 +21,18 @@
  *     Quota tracker retained; if quota is exhausted the channel-ID
  *     scan falls back gracefully with a clear error.
  *
+ * Subscriber tracking:
+ *  • Named events (newSponsorAction, memberMilestoneChatAction,
+ *    membershipGiftingAction) are captured from the masterchat action
+ *    stream. These fire immediately with the subscriber's display name.
+ *  • A count-based poller (channels.list?part=statistics, 1 quota unit
+ *    per call) runs every YT_SUB_POLL_INTERVAL seconds (default 60).
+ *    It detects count increases not covered by named events and fires
+ *    anonymous subscribe events (username: null) for the remainder.
+ *  • Both paths emit { platform:'youtube', type:'subscribe', username }
+ *    to the queue. username is the display name string when known, or
+ *    null when only a count delta was detected.
+ *
  * Latency stack vs Streamlabs:
  *  • masterchat hits the same internal YT endpoint the web player uses
  *  • Pipelined dual-lane fetch cuts average latency ~50% vs single-lane
@@ -36,7 +48,8 @@ const log = require('./logger');
 const YT_API_KEY    = process.env.YT_API_KEY       ?? '';
 const YT_VIDEO_ID   = process.env.YT_VIDEO_ID      ?? '';
 const YT_CHANNEL_ID = process.env.YT_CHANNEL_ID    ?? '';
-const POLL_INTERVAL = parseInt(process.env.YT_POLL_INTERVAL ?? '30', 10) * 1000;
+const POLL_INTERVAL     = parseInt(process.env.YT_POLL_INTERVAL     ?? '30', 10) * 1000;
+const SUB_POLL_INTERVAL = parseInt(process.env.YT_SUB_POLL_INTERVAL ?? '60', 10) * 1000;
 
 // ── Hoisted fetch ─────────────────────────────────────────────────────────
 
@@ -129,6 +142,99 @@ function _isDuplicate(id) {
 function _resetDedup() {
   _seenIds.clear();
   _seenRing.length = 0;
+}
+
+// ── Subscriber count poller ───────────────────────────────────────────────
+// Polls channels.list?part=statistics every SUB_POLL_INTERVAL ms using the
+// Data API key (1 quota unit per call). Detects subscriber count increases
+// and fires a 'subscribe' event on the queue.
+//
+// Named subscriber events (new members, milestones, gifts) are captured
+// directly from the masterchat action stream in _runFetchLane — those carry
+// a display name. The count poller fires for anonymous subs detected only via
+// the delta, in which case username is null.
+
+let _lastKnownSubCount  = null;   // last confirmed subscriber count (integer)
+let _subPollerTimer     = null;   // NodeJS timer handle
+let _namedSubThisCycle  = 0;      // named subscribe events fired since last count poll
+
+async function _fetchSubscriberCount() {
+  if (!YT_API_KEY || !YT_CHANNEL_ID) return null;
+  const fetch = await _getFetch();
+  const url   = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${YT_CHANNEL_ID}&key=${YT_API_KEY}`;
+  const res   = await fetch(url);
+  if (!res.ok) {
+    log.warn(`[YouTube] Subscriber count fetch failed: ${res.status}`);
+    return null;
+  }
+  const data  = await res.json();
+  _consumeQuota(1);
+  const raw = data?.items?.[0]?.statistics?.subscriberCount;
+  return raw != null ? parseInt(raw, 10) : null;
+}
+
+async function _pollSubscriberCount(queue) {
+  const count = await _fetchSubscriberCount().catch((err) => {
+    log.warn('[YouTube] Subscriber poll error:', err.message);
+    return null;
+  });
+
+  if (count == null) return;
+
+  if (_lastKnownSubCount == null) {
+    // First successful read — establish baseline, no event.
+    _lastKnownSubCount = count;
+    log.info(`[YouTube] Subscriber count baseline: ${count.toLocaleString()}`);
+    return;
+  }
+
+  const delta = count - _lastKnownSubCount;
+  if (delta <= 0) {
+    _namedSubThisCycle = 0;
+    return;
+  }
+
+  // delta > 0: new subscribers detected.
+  // Named events from the action stream may already account for some of them.
+  // Fire anonymous events for any delta beyond what was already named.
+  const anonymous = Math.max(0, delta - _namedSubThisCycle);
+  log.info(
+    `[YouTube] Subscriber delta +${delta} ` +
+    `(named: ${_namedSubThisCycle}, anonymous: ${anonymous}) — total: ${count.toLocaleString()}`
+  );
+
+  for (let i = 0; i < anonymous; i++) {
+    queue.pushMessage({ platform: 'youtube', type: 'subscribe', username: null, count });
+  }
+
+  _lastKnownSubCount = count;
+  _namedSubThisCycle = 0;
+}
+
+function _startSubscriberPoller(queue) {
+  if (_subPollerTimer) return;
+  if (!YT_API_KEY || !YT_CHANNEL_ID) {
+    log.warn('[YouTube] Subscriber poller disabled — YT_API_KEY and YT_CHANNEL_ID both required.');
+    return;
+  }
+  log.info(`[YouTube] Subscriber poller started (interval: ${SUB_POLL_INTERVAL / 1000}s)`);
+
+  // Prime the baseline immediately, then schedule recurring polls.
+  _pollSubscriberCount(queue).catch(() => {});
+  _subPollerTimer = setInterval(() => {
+    _pollSubscriberCount(queue).catch((err) => {
+      log.warn('[YouTube] Subscriber poll interval error:', err.message);
+    });
+  }, SUB_POLL_INTERVAL);
+}
+
+function _stopSubscriberPoller() {
+  if (_subPollerTimer) {
+    clearInterval(_subPollerTimer);
+    _subPollerTimer = null;
+  }
+  _lastKnownSubCount = null;
+  _namedSubThisCycle = 0;
 }
 
 // ── OAuth / googleapis cache ──────────────────────────────────────────────
@@ -256,8 +362,50 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
 
     if (!skipDispatch) {
       for (const action of result?.actions ?? []) {
-        // masterchat 1.5.0 returns pre-parsed typed action objects:
-        // { type: 'addChatItemAction', id, authorName, authorChannelId, message: YTRun[] }
+        // masterchat 1.5.0 returns pre-parsed typed action objects.
+
+        // ── Named subscribe / member events ──────────────────────────────
+        // These carry the subscriber's display name directly. We fire a
+        // 'subscribe' queue event and increment _namedSubThisCycle so the
+        // count-based poller doesn't double-count them.
+        if (
+          action.type === 'newSponsorAction' ||
+          action.type === 'memberMilestoneChatAction' ||
+          action.type === 'membershipGiftingAction'
+        ) {
+          const id = action.id;
+          if (id && _isDuplicate(id)) continue;
+
+          const displayName = action.authorName ?? null;
+          const channelId   = action.authorChannelId ?? null;
+          if (displayName && channelId) _cacheParticipant(displayName, channelId);
+
+          // membershipGiftingAction can gift multiple seats at once.
+          const giftCount =
+            action.type === 'membershipGiftingAction'
+              ? (action.memberCount ?? 1)
+              : 1;
+
+          _namedSubThisCycle += giftCount;
+
+          log.info(
+            `[YouTube] Subscriber event: type=${action.type}` +
+            (displayName ? ` user="${displayName}"` : ' user=<anonymous>') +
+            (giftCount > 1 ? ` x${giftCount}` : '')
+          );
+
+          // Emit one event per seat. username is null when name is unavailable.
+          for (let i = 0; i < giftCount; i++) {
+            queue.pushMessage({
+              platform: 'youtube',
+              type:     'subscribe',
+              username: displayName ?? null,
+            });
+          }
+          continue;
+        }
+
+        // ── Regular chat messages ─────────────────────────────────────────
         if (action.type !== 'addChatItemAction') continue;
 
         const id          = action.id;
@@ -360,6 +508,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     _sayLiveChatId = null;
     _evictParticipantCache();
     _resetDedup();
+    _namedSubThisCycle = 0;
     if (YT_VIDEO_ID) {
       log.info('[YouTube] Static override — retrying in 15 s…');
       setTimeout(() => _startSession(videoId, queue), 15_000);
@@ -373,6 +522,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     _sayLiveChatId = null;
     _evictParticipantCache();
     _resetDedup();
+    _namedSubThisCycle = 0;
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
     setTimeout(() => _startMasterchatSession(videoId, queue, nextDelay), nextDelay);
@@ -643,6 +793,7 @@ async function startYouTube(queue, websubRunning) {
 
   try { _getOAuthClient(); } catch { /* warn lazily on first use */ }
 
+  _startSubscriberPoller(queue);
   _watchdog(queue);
 }
 
@@ -658,6 +809,7 @@ module.exports = {
   say,
   startYouTube,
   triggerVideo,
+  stopSubscriberPoller: _stopSubscriberPoller,
   modHandlers: {
     ban:     ytBan,
     timeout: ytTimeout,

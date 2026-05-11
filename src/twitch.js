@@ -177,6 +177,12 @@ async function setupEventSub(callbackUrl, secret) {
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.subscription.message', '1');
 
+    // channel.follow v2 requires moderator_user_id in addition to broadcaster_user_id.
+    // Using the broadcaster as their own moderator is always valid.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.follow', '2',
+      { broadcaster_user_id: broadcasterId, moderator_user_id: broadcasterId });
+
   } catch (err) {
     log.warn('[Twitch] EventSub setup failed:', err.message);
   }
@@ -248,6 +254,16 @@ function handleEventSubNotification(type, event, queue) {
         timestamp:  new Date(),
       });
       log.info(`[Twitch] Gift subs: ${event.is_anonymous ? 'anonymous' : event.user_name} gifted ${event.total}x tier ${event.tier}`);
+      break;
+
+    case 'channel.follow':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'follow',
+        username:  event.user_name,
+        timestamp: new Date(event.followed_at),
+      });
+      log.info(`[Twitch] Follow: ${event.user_name}`);
       break;
 
     default:

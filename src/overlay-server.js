@@ -574,6 +574,24 @@ function _buildHtml() {
 </html>`;
 }
 
+// ── Extra route registry (plugins can add GET routes to this server) ──────
+
+/** @type {Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>} */
+const _extraRoutes = new Map();
+
+/**
+ * Register a custom GET route on the overlay server.
+ * Safe to call before startOverlayServer() — routes are stored in a Map
+ * and consulted at request time.
+ *
+ * @param {string}   path     Exact path to match, e.g. '/tnt_placing'
+ * @param {Function} handler  (req, res) => void
+ */
+function addRoute(path, handler) {
+  _extraRoutes.set(path, handler);
+  log.info(`[overlay] Extra route registered: GET ${path}`);
+}
+
 // ── HTTP server ───────────────────────────────────────────────────────────
 
 function startOverlayServer(port = 2999) {
@@ -627,6 +645,16 @@ function startOverlayServer(port = 2999) {
       return;
     }
 
+    // Plugin-registered extra routes
+    const extraHandler = _extraRoutes.get(url);
+    if (req.method === 'GET' && extraHandler) {
+      try { extraHandler(req, res); } catch (e) {
+        log.error('[overlay] Extra route error:', e.message);
+        res.writeHead(500); res.end('Internal error');
+      }
+      return;
+    }
+
     res.writeHead(404);
     res.end('Not found');
   });
@@ -639,4 +667,4 @@ function startOverlayServer(port = 2999) {
   return server;
 }
 
-module.exports = { startOverlayServer, registerSection, updateSection, updatePollOverlay };
+module.exports = { startOverlayServer, registerSection, updateSection, updatePollOverlay, addRoute };
