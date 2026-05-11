@@ -1,132 +1,126 @@
 'use strict';
 
 /**
- * queue.js
- * ────────
- * In-memory event bus that decouples platform modules (Twitch, YouTube)
- * from consumers (Discord, overlay, plugins).
+ * In-memory async queue.
+ * Producers call queue.pushMessage() / queue.pushRedeem().
+ * Discord module registers callbacks via queue.onMessage() / queue.onRedeem().
  *
- * Three event types:
- *  • message  — a chat message from any platform
- *  • redeem   — a Twitch channel point redemption
- *  • donation — bits, subs, resubscriptions, gifted subs
+ * All chat messages pass through the plugin pipeline (src/plugins/index.js)
+ * before being dispatched to Discord. This allows plugins to:
+ *   • modify the message (e.g. strip prefixes, translate)
+ *   • suppress the message from the main feed (return { message: null })
+ *   • send the message to an alternate channel (return { sideEffect: fn })
+ *   • do all of the above
  *
- * Usage (producer):
- *   queue.pushMessage({ platform, username, message });
- *   queue.pushRedeem({ username, title, cost, input, timestamp });
- *   queue.pushDonation({ platform, type, username, ... });
- *
- * Usage (consumer — called once at startup):
- *   queue.onMessage(msg     => discord.sendChat(msg));
- *   queue.onRedeem(redeem   => discord.sendRedeem(redeem));
- *   queue.onDonation(don    => discord.sendDonation(don));
+ * Redeems and donations bypass the pipeline intentionally — they are
+ * structured events, not freeform chat, and plugins should not need to
+ * intercept them.
  */
 
-const log = require('./logger');
+const log = require('./src/logger');
 
-// ── Internal handler registries ───────────────────────────────────────────
+const MAX = 500;
 
-/** @type {Array<(msg: object) => void>} */
-const _messageHandlers  = [];
+let _onMessage  = null;
+let _onRedeem   = null;
+let _onDonation = null;
 
-/** @type {Array<(redeem: object) => void>} */
-const _redeemHandlers   = [];
+const msgBuffer      = [];
+const redeemBuffer   = [];
+const donationBuffer = [];
 
-/** @type {Array<(donation: object) => void>} */
-const _donationHandlers = [];
-
-// ── Registration (consumer API) ───────────────────────────────────────────
-
-/**
- * Register a handler to be called for every chat message.
- * @param {(msg: { platform: string, username: string, message: string }) => void} fn
- */
-function onMessage(fn) {
-  if (typeof fn !== 'function') throw new TypeError('queue.onMessage: handler must be a function');
-  _messageHandlers.push(fn);
+// Lazy-load the plugin pipeline so queue.js can be required before plugins
+// are initialised (avoids circular-require issues at startup).
+let _pipeline = null;
+function getPipeline() {
+  if (!_pipeline) _pipeline = require('./plugins/index');
+  return _pipeline;
 }
 
-/**
- * Register a handler to be called for every channel point redemption.
- * @param {(redeem: { username: string, title: string, cost: number, input: string|null, timestamp: Date }) => void} fn
- */
-function onRedeem(fn) {
-  if (typeof fn !== 'function') throw new TypeError('queue.onRedeem: handler must be a function');
-  _redeemHandlers.push(fn);
+function _drain(buffer, handler) {
+  while (buffer.length) handler(buffer.shift()).catch((e) => log.error('Queue drain error:', e));
 }
 
+// ── Pipeline wrapper ──────────────────────────────────────────────────────
+
 /**
- * Register a handler to be called for every donation/sub/cheer event.
- * @param {(donation: object) => void} fn
+ * Run msg through the plugin pipeline, then dispatch to the main feed
+ * handler and any side-effect channels.
  */
-function onDonation(fn) {
-  if (typeof fn !== 'function') throw new TypeError('queue.onDonation: handler must be a function');
-  _donationHandlers.push(fn);
-}
+async function _dispatch(msg) {
+  let finalMsg, sideEffects;
 
-// ── Dispatch helpers ──────────────────────────────────────────────────────
+  try {
+    ({ finalMsg, sideEffects } = await getPipeline().runPipeline(msg));
+  } catch (err) {
+    log.error('[Queue] Plugin pipeline error:', err.message);
+    // Fail open — send the original message so nothing is silently lost
+    finalMsg    = msg;
+    sideEffects = [];
+  }
 
-function _dispatch(handlers, payload, label) {
-  for (const fn of handlers) {
-    try {
-      const result = fn(payload);
-      if (result && typeof result.catch === 'function') {
-        result.catch(err => {
-          log.error(`[queue] ${label} handler error:`, err?.message ?? err);
-          log.error(`[queue] ${label} handler stack:`, err?.stack ?? 'no stack');
-        });
-      }
-    } catch (err) {
-      log.error(`[queue] ${label} handler threw:`, err?.message ?? err);
-      log.error(`[queue] ${label} handler stack:`, err?.stack ?? 'no stack');
-    }
+  // Run side effects (alternate-channel sends) regardless of main feed routing
+  for (const fn of sideEffects) {
+    fn().catch((e) => log.error('[Queue] Side-effect error:', e));
+  }
+
+  // Send to main feed
+  if (finalMsg && _onMessage) {
+    _onMessage(finalMsg).catch((e) => log.error('[Queue] onMessage error:', e));
   }
 }
 
-// ── Push (producer API) ───────────────────────────────────────────────────
-
-/**
- * Push a chat message from a platform into the queue.
- * @param {{ platform: 'twitch'|'youtube', username: string, message: string }} msg
- */
-function pushMessage(msg) {
-  log.debug(`[queue] message | ${msg.platform} | ${msg.username}: ${msg.message}`);
-  _dispatch(_messageHandlers, msg, 'message');
-}
-
-/**
- * Push a channel point redemption into the queue.
- * @param {{ username: string, title: string, cost: number, input: string|null, timestamp: Date }} redeem
- */
-function pushRedeem(redeem) {
-  log.debug(`[queue] redeem  | ${redeem.username} → "${redeem.title}" (${redeem.cost} pts)`);
-  _dispatch(_redeemHandlers, redeem, 'redeem');
-}
-
-/**
- * Push a donation/sub/cheer event into the queue.
- *
- * Common shape:
- *   { platform, type, username, amount?, message?, tier?, months?, streak?,
- *     quantity?, recipient?, cumulative?, timestamp }
- *
- * type values: 'bits' | 'sub' | 'resub' | 'subgift'
- */
-function pushDonation(donation) {
-  log.debug(`[queue] donation| ${donation.platform} | ${donation.type} | ${donation.username}`);
-  _dispatch(_donationHandlers, donation, 'donation');
-}
-
-// ── Module exports ────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────
 
 module.exports = {
-  // Consumer registration
-  onMessage,
-  onRedeem,
-  onDonation,
+  onMessage(fn) {
+    _onMessage = fn;
+    _drain(msgBuffer, (msg) => _dispatch(msg));
+  },
 
-  // Producer push
-  pushMessage,
-  pushRedeem,
-  pushDonation,
+  onRedeem(fn) {
+    _onRedeem = fn;
+    _drain(redeemBuffer, fn);
+  },
+
+  onDonation(fn) {
+    _onDonation = fn;
+    _drain(donationBuffer, fn);
+  },
+
+  /**
+   * @param {{ platform: 'twitch'|'youtube', username: string, message: string }} msg
+   */
+  pushMessage(msg) {
+    if (_onMessage) {
+      _dispatch(msg);
+    } else {
+      if (msgBuffer.length >= MAX) { log.warn('Message queue full — dropping'); return; }
+      msgBuffer.push(msg);
+    }
+  },
+
+  /**
+   * @param {{ username: string, title: string, cost: number, input?: string, timestamp: Date }} redeem
+   */
+  pushRedeem(redeem) {
+    if (_onRedeem) {
+      _onRedeem(redeem).catch((e) => log.error('onRedeem error:', e));
+    } else {
+      if (redeemBuffer.length >= MAX) { log.warn('Redeem queue full — dropping'); return; }
+      redeemBuffer.push(redeem);
+    }
+  },
+
+  /**
+   * @param {{ platform: string, type: string, username: string, amount?: number, message?: string }} donation
+   */
+  pushDonation(donation) {
+    if (_onDonation) {
+      _onDonation(donation).catch((e) => log.error('onDonation error:', e));
+    } else {
+      if (donationBuffer.length >= MAX) { log.warn('Donation queue full — dropping'); return; }
+      donationBuffer.push(donation);
+    }
+  },
 };
