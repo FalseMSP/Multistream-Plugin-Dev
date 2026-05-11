@@ -305,6 +305,10 @@ async function startDiscordBot() {
 
   await client.login(BOT_TOKEN);
 
+  // Expose the raw Client on the api so plugins can use it (e.g. channel.setName()).
+  // Set after login so the client is authenticated before plugins try to use it.
+  api.client = client;
+
   return api;
 }
 
