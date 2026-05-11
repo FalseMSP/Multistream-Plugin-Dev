@@ -29,10 +29,60 @@
  *   GET /sse              — SSE stream (all sections share one connection)
  *   GET /state            — full JSON snapshot of all section data (debug)
  *   GET /state/:sectionId — single-section JSON snapshot
+ *   GET /sfx/*            — static audio files from src/overlay/public/sfx/
  */
 
 const http = require('http');
+const fs   = require('fs');
+const path = require('path');
 const log  = require('./logger');
+
+// ── Static file root ──────────────────────────────────────────────────────
+// Files in src/overlay/public/ are served at their relative path.
+// e.g. src/overlay/public/sfx/vine-boom.mp3 → GET /sfx/vine-boom.mp3
+
+const PUBLIC_DIR = path.resolve(__dirname, 'overlay', 'public');
+
+const MIME_TYPES = {
+  '.mp3':  'audio/mpeg',
+  '.ogg':  'audio/ogg',
+  '.wav':  'audio/wav',
+  '.webm': 'audio/webm',
+  '.mp4':  'video/mp4',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.svg':  'image/svg+xml',
+  '.css':  'text/css',
+  '.js':   'application/javascript',
+  '.json': 'application/json',
+  '.html': 'text/html; charset=utf-8',
+};
+
+function serveStatic(url, res) {
+  // Prevent path traversal
+  const rel     = path.normalize(url).replace(/^(\.\.[/\\])+/, '');
+  const absPath = path.join(PUBLIC_DIR, rel);
+  if (!absPath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403); res.end('Forbidden'); return true;
+  }
+
+  let stat;
+  try { stat = fs.statSync(absPath); } catch { return false; }
+  if (!stat.isFile()) return false;
+
+  const ext      = path.extname(absPath).toLowerCase();
+  const mimeType = MIME_TYPES[ext] ?? 'application/octet-stream';
+  res.writeHead(200, {
+    'Content-Type':  mimeType,
+    'Cache-Control': 'public, max-age=3600',
+    'Access-Control-Allow-Origin': '*',
+  });
+  fs.createReadStream(absPath).pipe(res);
+  return true;
+}
+
 
 // ── Section registry ──────────────────────────────────────────────────────
 
@@ -84,7 +134,7 @@ function updatePollOverlay(data) {
 // ── Poll overlay HTML ─────────────────────────────────────────────────────
 
 function _buildPollHtml() {
-  return /* html */`<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -188,7 +238,6 @@ function _buildPollHtml() {
     if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
 
     if (!data) {
-      // Animate out, then hide
       card.classList.remove('is-visible');
       card.classList.add('is-hiding');
       setTimeout(() => {
@@ -332,7 +381,7 @@ function _buildHtml() {
     [..._sections.entries()].map(([id, s]) => [id, s.data])
   );
 
-  return /* html */`<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -364,7 +413,6 @@ function _buildHtml() {
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ── card ─────────────────────────────────────────────────────── */
   .overlay-card {
     background: var(--bg);
     border: 1px solid var(--border);
@@ -385,7 +433,6 @@ function _buildHtml() {
     color: var(--muted);
   }
 
-  /* ── section header ───────────────────────────────────────────── */
   .section-header {
     display: flex;
     align-items: center;
@@ -410,7 +457,6 @@ function _buildHtml() {
     letter-spacing: 0.04em;
   }
 
-  /* ── entry rows ───────────────────────────────────────────────── */
   .entry {
     display: grid;
     grid-template-columns: 28px 1fr;
@@ -468,7 +514,6 @@ function _buildHtml() {
   .platform-dot.twitch  { background: var(--twitch); }
   .platform-dot.youtube { background: var(--youtube); }
 
-  /* ── utility ──────────────────────────────────────────────────── */
   .msg {
     padding: 16px 14px;
     font-size: 12px;
@@ -574,6 +619,7 @@ function _buildHtml() {
 </html>`;
 }
 
+
 // ── Extra route registry (plugins can add GET routes to this server) ──────
 
 /** @type {Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>} */
@@ -655,6 +701,11 @@ function startOverlayServer(port = 2999) {
       return;
     }
 
+    // ── Static files from src/overlay/public/ ─────────────────────────────
+    // Serves any file under that directory at its relative URL path.
+    // e.g. src/overlay/public/sfx/vine-boom.mp3 → GET /sfx/vine-boom.mp3
+    if (req.method === 'GET' && serveStatic(url, res)) return;
+
     res.writeHead(404);
     res.end('Not found');
   });
@@ -662,6 +713,7 @@ function startOverlayServer(port = 2999) {
   server.listen(port, () => {
     log.info(`[overlay] Listening  → ${port}`);
     log.info(`[overlay] OBS source → ${port}/overlay`);
+    log.info(`[overlay] Static files served from: ${PUBLIC_DIR}`);
   });
   server.on('error', (err) => log.error('[overlay] Server error:', err.message));
   return server;
