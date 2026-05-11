@@ -3,74 +3,91 @@
 /**
  * sub-counter plugin
  *
- * Keeps a Discord voice channel name in sync with the current YouTube
- * subscriber count.
+ * Keeps Discord voice channel names in sync with live counts:
+ *   • YouTube subscriber count  → voice channel VOICE_CHANNEL_ID
+ *   • Twitch follower count     → voice channel FOLLOWER_CHANNEL_ID
  *
- * The channel name is updated:
- *   • At startup — fetches the live count from the YouTube Data API.
- *   • On every subscribe event — increments the local count immediately
- *     (both named and anonymous events emitted by youtube.js).
+ * Counts are updated:
+ *   • At startup — fetched from the respective APIs.
+ *   • On every event — incremented locally and debounced before rename.
  *
  * Discord rate-limits channel renames to ~2 per 10 minutes per channel.
- * Updates are debounced: rapid bursts (e.g. gift subs) are coalesced into
- * a single rename, and a minimum interval is enforced between API calls.
+ * Updates are debounced: rapid bursts are coalesced into a single rename,
+ * and a minimum interval is enforced between API calls per channel.
  *
  * Required env vars:
- *   YT_API_KEY      — YouTube Data API v3 key (shared with youtube.js)
- *   YT_CHANNEL_ID   — YouTube channel ID     (shared with youtube.js)
+ *   YT_API_KEY            — YouTube Data API v3 key (shared with youtube.js)
+ *   YT_CHANNEL_ID         — YouTube channel ID     (shared with youtube.js)
+ *   TWITCH_CLIENT_ID      — Twitch app client ID   (shared with twitch.js)
+ *   TWITCH_CLIENT_SECRET  — Twitch app secret      (shared with twitch.js)
+ *   TWITCH_BROADCASTER_LOGIN — Twitch broadcaster login (shared with twitch.js)
  *
- * Voice channel ID: 1503249335884841060
- * Name format:      "📊 Subs: 1,234"
+ * Voice channel IDs:
+ *   YouTube subs:    1503249335884841060  →  "📊 Subs: 1,234"
+ *   Twitch followers: 1503266381989281813  →  "👥 Followers: 5,678"
  */
 
 const log = require('../../logger');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const VOICE_CHANNEL_ID = '1503249335884841060';
-const LABEL_PREFIX     = '📊 Subs: ';
+const VOICE_CHANNEL_ID    = '1503249335884841060';
+const FOLLOWER_CHANNEL_ID = '1503266381989281813';
+
+const YT_LABEL_PREFIX     = '📊 Subs: ';
+const TW_LABEL_PREFIX     = '👥 Followers: ';
 
 // Discord allows ~2 renames per 10 min. We enforce a 5-minute hard floor
 // between actual API calls, and debounce rapid bursts with a short window.
-const DEBOUNCE_MS    = 5_000;          // coalesce rapid events, then rename
+const DEBOUNCE_MS     = 5_000;          // coalesce rapid events, then rename
 const MIN_INTERVAL_MS = 5 * 60 * 1000; // never rename more often than once per 5 min
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let _client       = null;   // discord.js Client, captured from init context
-let _subCount     = null;   // current known count (null until first API fetch returns)
-let _lastRenameAt = 0;      // ms timestamp of last successful rename
-let _debounceTimer = null;  // pending debounce timer handle
-let _pendingCount  = null;  // count queued for when the timer fires
+let _client = null; // discord.js Client, captured from init context
+
+// Per-counter state — keyed by channel ID for symmetry
+const _state = {
+  [VOICE_CHANNEL_ID]: {
+    count:        null,
+    lastRenameAt: 0,
+    debounceTimer: null,
+    pendingCount:  null,
+    formatName:   n => YT_LABEL_PREFIX + Number(n).toLocaleString('en-US'),
+  },
+  [FOLLOWER_CHANNEL_ID]: {
+    count:        null,
+    lastRenameAt: 0,
+    debounceTimer: null,
+    pendingCount:  null,
+    formatName:   n => TW_LABEL_PREFIX + Number(n).toLocaleString('en-US'),
+  },
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function _formatName(n) {
-  return LABEL_PREFIX + Number(n).toLocaleString('en-US');
-}
-
 /**
- * Rename the voice channel immediately, unless we're inside the rate-limit
- * window — in which case schedule a retry for when the cooldown expires.
+ * Rename a voice channel immediately, unless inside the rate-limit window —
+ * in which case schedule a retry for when the cooldown expires.
  */
-async function _applyRename(count) {
+async function _applyRename(channelId, count) {
+  const s    = _state[channelId];
   const now  = Date.now();
-  const wait = MIN_INTERVAL_MS - (now - _lastRenameAt);
+  const wait = MIN_INTERVAL_MS - (now - s.lastRenameAt);
 
   if (wait > 0) {
-    // Too soon after the last rename — schedule a deferred attempt.
-    if (!_debounceTimer) {
-      log.info(`[sub-counter] Rate-limit cooldown — will rename in ${Math.ceil(wait / 1000)}s`);
-      _pendingCount  = count;
-      _debounceTimer = setTimeout(() => {
-        _debounceTimer = null;
-        const n = _pendingCount;
-        _pendingCount = null;
-        _applyRename(n).catch(err => log.error('[sub-counter] Deferred rename error:', err.message));
+    if (!s.debounceTimer) {
+      log.info(`[sub-counter] Rate-limit cooldown on ${channelId} — will rename in ${Math.ceil(wait / 1000)}s`);
+      s.pendingCount  = count;
+      s.debounceTimer = setTimeout(() => {
+        s.debounceTimer = null;
+        const n = s.pendingCount;
+        s.pendingCount = null;
+        _applyRename(channelId, n).catch(err =>
+          log.error(`[sub-counter] Deferred rename error (${channelId}):`, err.message));
       }, wait);
     } else {
-      // Timer already running — just update the queued count.
-      _pendingCount = count;
+      s.pendingCount = count;
     }
     return;
   }
@@ -81,46 +98,52 @@ async function _applyRename(count) {
   }
 
   try {
-    const channel = await _client.channels.fetch(VOICE_CHANNEL_ID);
+    const channel = await _client.channels.fetch(channelId);
     if (!channel) {
-      log.warn(`[sub-counter] Voice channel ${VOICE_CHANNEL_ID} not found`);
+      log.warn(`[sub-counter] Channel ${channelId} not found`);
       return;
     }
-    log.info(`[sub-counter] channel found: name="${channel.name}" guildId=${channel.guildId}`);
-    log.info(`[sub-counter] bot perms in channel: ${channel.permissionsFor(_client.user)?.toArray().join(', ')}`);
-    const newName = _formatName(count);
-    log.info(`[sub-counter] guild=${channel.guild?.id} botUser=${_client.user?.id} tag=${_client.user?.tag}`);
-    await channel.setName(newName);
-    _lastRenameAt = Date.now();
-    log.info(`[sub-counter] Voice channel renamed → "${newName}"`);
-  } catch (err) {
-    log.error(`[sub-counter] Failed to rename voice channel: code=${err.code} status=${err.status} message=${err.message}`);
+
+    const newName = s.formatName(count);
+    if (channel.name === newName) {
+      log.info(`[sub-counter] Channel ${channelId} name already correct — skipping rename`);
+      return;
     }
+
+    await channel.setName(newName);
+    s.lastRenameAt = Date.now();
+    log.info(`[sub-counter] Channel ${channelId} renamed → "${newName}"`);
+  } catch (err) {
+    if (err.code === 50013) {
+      log.error(`[sub-counter] Missing Permissions — grant the bot "Manage Channel" on channel ${channelId}`);
+    } else {
+      log.error(`[sub-counter] Failed to rename channel ${channelId}: code=${err.code} message=${err.message}`);
+    }
+  }
 }
 
 /**
- * Debounce wrapper — gift sub bursts fire many events in quick succession.
- * We wait DEBOUNCE_MS of quiet before issuing the rename, always using the
- * latest count.
+ * Debounce wrapper — gift sub / follow bursts fire many events quickly.
+ * Waits DEBOUNCE_MS of quiet before issuing the rename.
  */
-function _scheduleRename(count) {
-  _pendingCount = count;
+function _scheduleRename(channelId, count) {
+  const s = _state[channelId];
+  s.pendingCount = count;
 
-  if (_debounceTimer) return; // already pending; pendingCount updated above
+  if (s.debounceTimer) return; // already pending; pendingCount updated above
 
-  _debounceTimer = setTimeout(() => {
-    _debounceTimer = null;
-    const n = _pendingCount;
-    _pendingCount = null;
-    _applyRename(n).catch(err => log.error('[sub-counter] Rename error:', err.message));
+  s.debounceTimer = setTimeout(() => {
+    s.debounceTimer = null;
+    const n = s.pendingCount;
+    s.pendingCount = null;
+    _applyRename(channelId, n).catch(err =>
+      log.error(`[sub-counter] Rename error (${channelId}):`, err.message));
   }, DEBOUNCE_MS);
 }
 
-/**
- * Fetch the live subscriber count from the YouTube Data API v3.
- * Uses the same env vars as youtube.js. Returns null on any failure.
- */
-async function _fetchSubCount() {
+// ── YouTube ───────────────────────────────────────────────────────────────────
+
+async function _fetchYtSubCount() {
   const apiKey    = process.env.YT_API_KEY;
   const channelId = process.env.YT_CHANNEL_ID;
 
@@ -131,7 +154,7 @@ async function _fetchSubCount() {
 
   try {
     const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${channelId}&key=${apiKey}`;
-    const res = await fetch(url);
+    const res  = await fetch(url);
     if (!res.ok) {
       log.warn(`[sub-counter] YouTube API error ${res.status} fetching subscriber count`);
       return null;
@@ -144,7 +167,88 @@ async function _fetchSubCount() {
     }
     return parseInt(raw, 10);
   } catch (err) {
-    log.error('[sub-counter] Failed to fetch subscriber count:', err.message);
+    log.error('[sub-counter] Failed to fetch YouTube subscriber count:', err.message);
+    return null;
+  }
+}
+
+// ── Twitch ────────────────────────────────────────────────────────────────────
+
+/**
+ * Fetch a Twitch app access token (client credentials).
+ * We get our own here rather than importing from twitch.js to keep this
+ * plugin self-contained.
+ */
+let _twAppToken       = null;
+let _twAppTokenExpiry = 0;
+
+async function _getTwitchAppToken() {
+  if (_twAppToken && Date.now() < _twAppTokenExpiry) return _twAppToken;
+
+  const clientId     = process.env.TWITCH_CLIENT_ID;
+  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return null;
+
+  try {
+    const res  = await fetch(
+      `https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
+      { method: 'POST' }
+    );
+    const data = await res.json();
+    if (!data.access_token) throw new Error(JSON.stringify(data));
+    _twAppToken       = data.access_token;
+    _twAppTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+    return _twAppToken;
+  } catch (err) {
+    log.error('[sub-counter] Failed to get Twitch app token:', err.message);
+    return null;
+  }
+}
+
+async function _fetchTwitchFollowerCount() {
+  const clientId   = process.env.TWITCH_CLIENT_ID;
+  const broadcaster = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
+
+  if (!clientId || !broadcaster) {
+    log.warn('[sub-counter] TWITCH_CLIENT_ID or TWITCH_BROADCASTER_LOGIN not set — cannot fetch follower count');
+    return null;
+  }
+
+  try {
+    const appToken = await _getTwitchAppToken();
+    if (!appToken) return null;
+
+    // First resolve broadcaster login → ID
+    const userRes  = await fetch(
+      `https://api.twitch.tv/helix/users?login=${broadcaster}`,
+      { headers: { 'Client-ID': clientId, 'Authorization': `Bearer ${appToken}` } }
+    );
+    const userData = await userRes.json();
+    const broadcasterId = userData?.data?.[0]?.id;
+    if (!broadcasterId) {
+      log.warn('[sub-counter] Could not resolve Twitch broadcaster ID');
+      return null;
+    }
+
+    // /channels/followers returns total in the pagination object
+    const res  = await fetch(
+      `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${broadcasterId}&first=1`,
+      { headers: { 'Client-ID': clientId, 'Authorization': `Bearer ${appToken}` } }
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      log.warn(`[sub-counter] Twitch followers API error ${res.status}: ${text}`);
+      return null;
+    }
+    const data = await res.json();
+    const total = data?.total;
+    if (total == null) {
+      log.warn('[sub-counter] Follower count missing from Twitch API response');
+      return null;
+    }
+    return total;
+  } catch (err) {
+    log.error('[sub-counter] Failed to fetch Twitch follower count:', err.message);
     return null;
   }
 }
@@ -152,19 +256,11 @@ async function _fetchSubCount() {
 // ── Plugin lifecycle ──────────────────────────────────────────────────────────
 
 function init(context) {
-  // Grab the discord.js Client from context.
-  // discord.js sets api.client after login; plugins receive that api object as context.
-  // Because initPlugins() runs before client.login(), api.client may still be undefined
-  // here — we capture the reference and wait for the 'ready' event before using it.
   _client = context?.client ?? null;
 
-  // If the client isn't on context yet, poll briefly — it's set synchronously right
-  // after login returns, which is typically <2s after initPlugins is called.
-  // We defer our first fetch/rename until the client signals it's ready.
   function _whenReady(cb) {
     if (_client?.isReady?.()) { cb(); return; }
     if (_client) { _client.once('ready', cb); return; }
-    // client not on context yet — wait for it to appear (set after login)
     const poll = setInterval(() => {
       if (!context?.client) return;
       _client = context.client;
@@ -174,37 +270,60 @@ function init(context) {
     }, 500);
   }
 
-  // Subscribe to the message bus. youtube.js pushes subscriber events via
-  // queue.pushMessage({ platform:'youtube', type:'subscribe', username }).
   const queue = require('../../queue');
 
   if (!queue?.onMessage) {
-    log.warn('[sub-counter] queue.onMessage not available — no subscriber events will be received.');
+    log.warn('[sub-counter] queue.onMessage not available — no events will be received.');
   } else {
     queue.onMessage(msg => {
-      if (msg?.platform !== 'youtube' || msg?.type !== 'subscribe') return;
+      // YouTube subscriber
+      if (msg?.platform === 'youtube' && msg?.type === 'subscribe') {
+        const s = _state[VOICE_CHANNEL_ID];
+        if (s.count !== null) {
+          s.count += 1;
+          log.info(
+            `[sub-counter] New YouTube subscriber: ${msg.username ?? '<anonymous>'} ` +
+            `— count now ${s.count.toLocaleString()}`
+          );
+          _scheduleRename(VOICE_CHANNEL_ID, s.count);
+        }
+        return;
+      }
 
-      // Optimistically increment the local count so we don't need an API
-      // call per event. If the initial fetch hasn't resolved yet we leave
-      // _subCount as null and let the fetch callback handle the first rename.
-      if (_subCount !== null) {
-        _subCount += 1;
-        log.info(
-          `[sub-counter] New subscriber: ${msg.username ?? '<anonymous>'} ` +
-          `— count now ${_subCount.toLocaleString()}`
-        );
-        _scheduleRename(_subCount);
+      // Twitch follow
+      if (msg?.platform === 'twitch' && msg?.type === 'follow') {
+        const s = _state[FOLLOWER_CHANNEL_ID];
+        if (s.count !== null) {
+          s.count += 1;
+          log.info(
+            `[sub-counter] New Twitch follower: ${msg.username ?? '<anonymous>'} ` +
+            `— count now ${s.count.toLocaleString()}`
+          );
+          _scheduleRename(FOLLOWER_CHANNEL_ID, s.count);
+        }
+        return;
       }
     });
   }
 
-  // Fetch the real count and do the first rename once Discord is ready.
+  // Fetch both counts and do initial renames once Discord is ready.
   _whenReady(() => {
-    _fetchSubCount().then(count => {
+    // YouTube subs
+    _fetchYtSubCount().then(count => {
       if (count == null) return;
-      _subCount = count;
-      log.info(`[sub-counter] Initial subscriber count: ${count.toLocaleString()}`);
-      _applyRename(count).catch(err => log.error('[sub-counter] Initial rename error:', err.message));
+      _state[VOICE_CHANNEL_ID].count = count;
+      log.info(`[sub-counter] Initial YouTube subscriber count: ${count.toLocaleString()}`);
+      _applyRename(VOICE_CHANNEL_ID, count).catch(err =>
+        log.error('[sub-counter] Initial YT rename error:', err.message));
+    });
+
+    // Twitch followers
+    _fetchTwitchFollowerCount().then(count => {
+      if (count == null) return;
+      _state[FOLLOWER_CHANNEL_ID].count = count;
+      log.info(`[sub-counter] Initial Twitch follower count: ${count.toLocaleString()}`);
+      _applyRename(FOLLOWER_CHANNEL_ID, count).catch(err =>
+        log.error('[sub-counter] Initial Twitch rename error:', err.message));
     });
   });
 }
