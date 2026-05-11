@@ -86,6 +86,8 @@ async function _applyRename(count) {
       log.warn(`[sub-counter] Voice channel ${VOICE_CHANNEL_ID} not found`);
       return;
     }
+    log.info(`[sub-counter] channel found: name="${channel.name}" guildId=${channel.guildId}`);
+    log.info(`[sub-counter] bot perms in channel: ${channel.permissionsFor(_client.user)?.toArray().join(', ')}`);
     const newName = _formatName(count);
     await channel.setName(newName);
     _lastRenameAt = Date.now();
