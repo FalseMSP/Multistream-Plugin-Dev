@@ -719,4 +719,14 @@ function startOverlayServer(port = 2999) {
   return server;
 }
 
-module.exports = { startOverlayServer, registerSection, updateSection, updatePollOverlay, addRoute };
+function _getSectionMeta(id) {
+  const s = _sections.get(id);
+  if (!s) return null;
+  return { id, title: s.title, icon: s.icon, render: s.render };
+}
+
+function _getSectionData(id) {
+  return _sections.get(id)?.data ?? null;
+}
+
+module.exports = { startOverlayServer, registerSection, updateSection, updatePollOverlay, addRoute, _getSectionMeta, _getSectionData };
