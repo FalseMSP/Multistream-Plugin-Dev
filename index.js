@@ -35,7 +35,13 @@ async function main() {
   // 1. Discord bot (also loads + inits plugins)
   const discord = await startDiscordBot();
 
-  // 1b. ▶ ADD THIS LINE — start the overlay HTTP server.
+  // 1b. Re-init plugins with a merged context so queue-aware plugins (e.g. sfx)
+  //     can subscribe to queue events. loadPlugins() is idempotent — skips
+  //     already-loaded ids. initPlugins() runs init() again with the richer context.
+  plugins.loadPlugins();
+  plugins.initPlugins({ ...discord, queue });
+
+  // 1c. ▶ ADD THIS LINE — start the overlay HTTP server.
   //     Port is optional; defaults to 2999.
   //     OBS Browser Source URL: http://127.0.0.1:2999/overlay
   startOverlayServer(2999);

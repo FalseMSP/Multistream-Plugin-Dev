@@ -126,11 +126,17 @@ module.exports = {
   id: 'sfx',
 
   init(context) {
-    // onModAction receives all moderation + redemption events.
-    // Twitch redemption events have type === 'redeem' and a rewardTitle field.
-    context.onRedeem(redeem => {
-    handleRedeem(redeem.title);
-  });
+    // context is the merged object: { ...discord, queue }
+    // Use context.queue.onRedeem so we hear every channel point redemption
+    // regardless of whether it arrived via EventSub or IRC fallback.
+    const q = context.queue ?? context;
+    if (typeof q.onRedeem !== 'function') {
+      log.warn('[sfx] context.queue.onRedeem not available — plugin will not fire');
+      return;
+    }
+    q.onRedeem(redeem => {
+      handleRedeem(redeem.title);
+    });
 
     log.info('[sfx] Plugin loaded. Mapped rewards:', Object.keys(SFX_MAP).join(', '));
   },
