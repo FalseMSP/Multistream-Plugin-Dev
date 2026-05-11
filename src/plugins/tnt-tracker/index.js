@@ -2,16 +2,28 @@
 
 /**
  * tnt-tracker plugin
- * ... (existing header unchanged) ...
+ *
+ * Twitch follows                → +50 TNT
+ * Twitch subs / resubs          → +50 TNT
+ * Twitch gift subs              → +50 TNT (× quantity)
+ * YouTube subscribers           → +50 TNT
  *
  * Game link:
  *   POST http://localhost:<OVERLAY_PORT>/tnt_update
- *   Body (JSON): { "action": "place", "amount": 1 }
+ *   Body (JSON): { "action": "place",  "amount": 1 }
  *                { "action": "remove", "amount": 1 }
  *                { "action": "set",    "amount": 500 }
  *                { "action": "reset" }
+ *   Header (optional): x-tnt-secret: <TNT_UPDATE_SECRET from .env>
  *
  *   Response: { "ok": true, "count": <number> }
+ *
+ * OBS browser source:  http://localhost:<OVERLAY_PORT>/tnt_placing
+ *
+ * Discord slash command:
+ *   /tnt set <n>    — hard-set the count
+ *   /tnt add <n>    — add or subtract
+ *   /tnt status     — show current count (ephemeral)
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
@@ -152,43 +164,24 @@ const TNT_PAGE_HTML = /* html */`<!DOCTYPE html>
 </body>
 </html>`;
 
-addRoute('/tnt_update', (req, res) => {
-  if (req.method !== 'POST') {
-    res.writeHead(405, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
-  }
-
-  // Auth check
-  const secret = process.env.TNT_UPDATE_SECRET;
-  if (secret && req.headers['x-tnt-secret'] !== secret) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
-  }
-  
+addRoute('/tnt_placing', (_req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(TNT_PAGE_HTML);
 });
 
 // ─── Game link endpoint ───────────────────────────────────────────────────────
-//
-//  POST /tnt_update   (on the overlay server port, same as /tnt_placing)
-//  Body JSON:
-//    { "action": "place",  "amount": 1 }   — subtract: player placed N TNT
-//    { "action": "remove", "amount": 1 }   — add back: player removed N TNT
-//    { "action": "set",    "amount": 500 } — hard-set the counter
-//    { "action": "reset" }                 — set to 0
-//
-//  Response: { "ok": true, "count": <number> }
-//
-//  From Minecraft (or any HTTP client), e.g.:
-//    curl -X POST http://localhost:<OVERLAY_PORT>/tnt_update \
-//         -H "Content-Type: application/json" \
-//         -d '{"action":"place","amount":1}'
 
 addRoute('/tnt_update', (req, res) => {
   if (req.method !== 'POST') {
     res.writeHead(405, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: false, error: 'Method not allowed' }));
+  }
+
+  // Optional auth — set TNT_UPDATE_SECRET in .env to enable
+  const secret = process.env.TNT_UPDATE_SECRET;
+  if (secret && req.headers['x-tnt-secret'] !== secret) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
   }
 
   let body = '';
@@ -206,12 +199,10 @@ addRoute('/tnt_update', (req, res) => {
 
     switch (action) {
       case 'place':
-        // Placing TNT subtracts from the "left to place" counter
         addTnt(-(amount ?? 1));
         log.info(`[tnt-tracker] Game: placed ${amount ?? 1} TNT → ${tntCount} remaining`);
         break;
       case 'remove':
-        // Removing/picking up TNT adds it back
         addTnt(amount ?? 1);
         log.info(`[tnt-tracker] Game: removed ${amount ?? 1} TNT → ${tntCount} remaining`);
         break;
