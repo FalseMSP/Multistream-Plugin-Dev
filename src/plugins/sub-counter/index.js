@@ -94,8 +94,8 @@ async function _applyRename(count) {
     _lastRenameAt = Date.now();
     log.info(`[sub-counter] Voice channel renamed → "${newName}"`);
   } catch (err) {
-    log.error('[sub-counter] Failed to rename voice channel:', err.message);
-  }
+    log.error(`[sub-counter] Failed to rename voice channel: code=${err.code} status=${err.status} message=${err.message}`);
+    }
 }
 
 /**
