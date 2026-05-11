@@ -693,7 +693,7 @@ function startOverlayServer(port = 2999) {
 
     // Plugin-registered extra routes
     const extraHandler = _extraRoutes.get(url);
-    if (req.method === 'GET' && extraHandler) {
+    if (extraHandler) {
       try { extraHandler(req, res); } catch (e) {
         log.error('[overlay] Extra route error:', e.message);
         res.writeHead(500); res.end('Internal error');
