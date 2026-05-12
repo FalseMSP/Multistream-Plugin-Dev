@@ -233,6 +233,18 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
       result = await mc.fetch(continuation?.token);
     } catch (err) {
       if (stopSignal.stopped) return;
+
+      // Terminal errors — stream is over, no point retrying
+      if (
+        /chat is disabled for this live stream/i.test(err.message) ||
+        /this live event has ended/i.test(err.message) ||
+        /no longer live/i.test(err.message)
+      ) {
+        log.info(`[YouTube] Lane ${laneId}: stream ended (${err.message}) — stopping lane`);
+        stopSignal.stopped = true;
+        return;
+      }
+
       if (++_fetchWarnCount % 12 === 1) {
         log.warn(`[YouTube] Lane ${laneId} fetch error: ${err.message} — backing off 5 s`);
       }
@@ -391,6 +403,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
   _sayLiveChatId = null; // force say() to re-resolve for the new stream
   log.info(`[YouTube] masterchat connected for video=${videoId} liveChatId=${liveChatId}`);
   log.info(`[YouTube] Starting dual-lane pipelined chat reader`);
+  _startLikePoller(videoId, queue);
 
   // Run both lanes concurrently. Neither lane throws — errors are caught
   // internally and retried. We watch for stream-end via mc events.
@@ -407,6 +420,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     _evictParticipantCache();
     _resetDedup();
     _namedSubThisCycle = 0;
+    module.exports.stopLikePoller();
     if (YT_VIDEO_ID) {
       log.info('[YouTube] Static override — retrying in 15 s…');
       setTimeout(() => _startSession(videoId, queue), 15_000);
@@ -421,6 +435,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     _evictParticipantCache();
     _resetDedup();
     _namedSubThisCycle = 0;
+    module.exports.stopLikePoller();
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
     setTimeout(() => _startMasterchatSession(videoId, queue, nextDelay), nextDelay);
@@ -729,6 +744,63 @@ function _startSubscriberPoller(queue) {
   }, SUB_POLL_INTERVAL);
 }
 
+// ── Like count poller ─────────────────────────────────────────────────────
+// Polls videos.list?part=statistics (1 quota unit/call) every POLL_INTERVAL
+// seconds. Emits one 'like' event per new like since the last poll.
+// Like counts can be hidden by the creator — returns null when hidden.
+
+let _lastKnownLikeCount = null;
+let _likePollerTimer    = null;
+
+async function _fetchLikeCount(videoId) {
+  if (!YT_API_KEY || !videoId) return null;
+  const fetch = await _getFetch();
+  const url   = `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${videoId}&key=${YT_API_KEY}`;
+  const res   = await fetch(url);
+  if (!res.ok) { log.warn(`[YouTube] Like count fetch failed: ${res.status}`); return null; }
+  const data  = await res.json();
+  _consumeQuota(1);
+  const raw = data?.items?.[0]?.statistics?.likeCount;
+  return raw != null ? parseInt(raw, 10) : null;
+}
+
+async function _pollLikeCount(videoId, queue) {
+  const count = await _fetchLikeCount(videoId).catch(err => {
+    log.warn('[YouTube] Like poll error:', err.message);
+    return null;
+  });
+  if (count == null) return;
+
+  if (_lastKnownLikeCount == null) {
+    _lastKnownLikeCount = count;
+    log.info(`[YouTube] Like count baseline: ${count.toLocaleString()}`);
+    return;
+  }
+
+  const delta = count - _lastKnownLikeCount;
+  if (delta <= 0) return;
+
+  log.info(`[YouTube] Like delta +${delta} — total: ${count.toLocaleString()}`);
+  for (let i = 0; i < delta; i++) {
+    queue.pushMessage({ platform: 'youtube', type: 'like' });
+  }
+
+  _lastKnownLikeCount = count;
+}
+
+function _startLikePoller(videoId, queue) {
+  if (_likePollerTimer) return;
+  if (!YT_API_KEY) {
+    log.warn('[YouTube] Like count poller disabled — YT_API_KEY required.');
+    return;
+  }
+  log.info(`[YouTube] Like poller started for video=${videoId} (interval: ${POLL_INTERVAL / 1000}s)`);
+  _pollLikeCount(videoId, queue).catch(() => {});
+  _likePollerTimer = setInterval(() => {
+    _pollLikeCount(videoId, queue).catch(err => log.warn('[YouTube] Like poll error:', err.message));
+  }, POLL_INTERVAL);
+}
+
 async function startYouTube(queue, websubRunning) {
   if (!YT_CHANNEL_ID && !YT_VIDEO_ID) {
     log.warn('[YouTube] No channel/video ID configured — YouTube disabled.');
@@ -773,6 +845,10 @@ module.exports = {
     if (_subPollerTimer) { clearInterval(_subPollerTimer); _subPollerTimer = null; }
     _lastKnownSubCount = null;
     _namedSubThisCycle = 0;
+  },
+  stopLikePoller() {
+    if (_likePollerTimer) { clearInterval(_likePollerTimer); _likePollerTimer = null; }
+    _lastKnownLikeCount = null;
   },
   modHandlers: {
     ban:     ytBan,
