@@ -126,13 +126,37 @@ async function getUserToken() {
 
 async function subscribeEventSub(broadcasterId, callbackUrl, secret, type, version, condition) {
   const existing = await helixRequest('GET', `/eventsub/subscriptions?type=${type}`);
-  const alreadySubscribed = existing?.data?.some(
-    s => s.condition?.broadcaster_user_id === broadcasterId && s.status === 'enabled'
+
+  // Bug 2 fix: also check that the callback URL matches the current public URL.
+  // A sub can be 'enabled' but pointing at a stale tunnel URL from a previous
+  // run — in that case Twitch is sending events to a dead endpoint. We must
+  // delete it and create a fresh one with the correct callback URL.
+  const activeMatch = existing?.data?.find(
+    s => s.condition?.broadcaster_user_id === broadcasterId
+      && s.status === 'enabled'
+      && s.transport?.callback === callbackUrl
   );
-  if (alreadySubscribed) {
+  if (activeMatch) {
     log.info(`[Twitch] EventSub subscription already active: ${type}`);
     return;
   }
+
+  // Delete any enabled subs for this type that point at the wrong URL so
+  // we don't accumulate orphaned subscriptions.
+  const staleEnabled = existing?.data?.filter(
+    s => s.condition?.broadcaster_user_id === broadcasterId
+      && s.status === 'enabled'
+      && s.transport?.callback !== callbackUrl
+  ) ?? [];
+  for (const sub of staleEnabled) {
+    try {
+      await helixRequest('DELETE', `/eventsub/subscriptions?id=${sub.id}`);
+      log.info(`[Twitch] Deleted stale enabled sub ${sub.id} (old callback: ${sub.transport?.callback})`);
+    } catch (err) {
+      log.warn(`[Twitch] Could not delete stale sub ${sub.id}:`, err.message);
+    }
+  }
+
   await helixRequest('POST', '/eventsub/subscriptions', {
     type,
     version,
@@ -205,30 +229,41 @@ function handleEventSubNotification(type, event, queue) {
       queue.pushDonation({
         platform:  'twitch',
         type:      'bits',
-        username:  event.is_anonymous ? 'anonymous' : event.user_name,
+        username:  event.user_name ?? 'anonymous',
         amount:    event.bits,
         message:   event.message || null,
-        timestamp: new Date(),
+        timestamp: new Date(event.broadcasted_at ?? Date.now()),
       });
-      log.info(`[Twitch] Cheer: ${event.is_anonymous ? 'anonymous' : event.user_name} cheered ${event.bits} bits`);
+      log.info(`[Twitch] Cheer: ${event.user_name} cheered ${event.bits} bits`);
       break;
 
     case 'channel.subscribe':
-      // New or returning sub (no attached message)
       queue.pushDonation({
         platform:  'twitch',
         type:      'sub',
-        username:  event.is_gift ? 'gifted' : event.user_name,
-        tier:      event.tier,           // '1000' | '2000' | '3000'
+        username:  event.user_name,
+        tier:      event.tier,
         gifted:    event.is_gift,
-        message:   null,
         timestamp: new Date(),
       });
-      log.info(`[Twitch] Sub: ${event.user_name} (tier ${event.tier})${event.is_gift ? ' [gifted]' : ''}`);
+      log.info(`[Twitch] Sub: ${event.user_name} (Tier ${event.tier})`);
+      break;
+
+    case 'channel.subscription.gift':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'subgift',
+        username:  event.user_name ?? 'anonymous',
+        recipient: null,
+        tier:      event.tier,
+        quantity:  event.total,
+        cumulative: event.cumulative_total ?? null,
+        timestamp: new Date(),
+      });
+      log.info(`[Twitch] Sub gift: ${event.user_name} gifted ${event.total} subs`);
       break;
 
     case 'channel.subscription.message':
-      // Resub with a message
       queue.pushDonation({
         platform:  'twitch',
         type:      'resub',
@@ -239,128 +274,72 @@ function handleEventSubNotification(type, event, queue) {
         message:   event.message?.text || null,
         timestamp: new Date(),
       });
-      log.info(`[Twitch] Resub: ${event.user_name} (tier ${event.tier}, ${event.cumulative_months} months)`);
-      break;
-
-    case 'channel.subscription.gift':
-      // Gifted sub batch
-      queue.pushDonation({
-        platform:   'twitch',
-        type:       'subgift',
-        username:   event.is_anonymous ? 'anonymous' : event.user_name,
-        tier:       event.tier,
-        quantity:   event.total,
-        cumulative: event.cumulative_total ?? null,
-        timestamp:  new Date(),
-      });
-      log.info(`[Twitch] Gift subs: ${event.is_anonymous ? 'anonymous' : event.user_name} gifted ${event.total}x tier ${event.tier}`);
+      log.info(`[Twitch] Resub: ${event.user_name} (${event.cumulative_months} months)`);
       break;
 
     case 'channel.follow':
-      queue.pushDonation({
-        platform:  'twitch',
-        type:      'follow',
-        username:  event.user_name,
-        timestamp: new Date(event.followed_at),
-      });
       log.info(`[Twitch] Follow: ${event.user_name}`);
       break;
 
     default:
-      log.debug('[Twitch] Unhandled EventSub type:', type);
+      log.warn('[Twitch] Unhandled EventSub type:', type);
   }
 }
+
 // ── Mod actions ───────────────────────────────────────────────────────────
-async function twitchVip(_, username) {
+
+async function twitchBan(platform, username, reason) {
   const broadcasterId = await getBroadcasterId();
-  const userRes = await helixRequest('GET', `/users?login=${username}`);
-  const userId  = userRes?.data?.[0]?.id;
-  if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-  
-  // Must use user token — app token returns 401 for this endpoint
-  const { default: fetch } = await import('node-fetch');
-  const userToken = await getUserToken();
-  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
-  const res = await fetch(
-    `https://api.twitch.tv/helix/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`,
-    { method: 'POST', headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}` } }
-  );
-  if (!res.ok) throw new Error(`Twitch VIP API ${res.status}: ${await res.text()}`);
-  log.info(`[Twitch] VIP granted to ${username}`);
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  await helixRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
+    data: { user_id: userId, reason: reason ?? '' },
+  });
 }
 
-async function twitchUnvip(_, username) {
+async function twitchVip(platform, username) {
   const broadcasterId = await getBroadcasterId();
-  const userRes = await helixRequest('GET', `/users?login=${username}`);
-  const userId  = userRes?.data?.[0]?.id;
-  if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-
-  const { default: fetch } = await import('node-fetch');
-  const userToken = await getUserToken();
-  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
-  const res = await fetch(
-    `https://api.twitch.tv/helix/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`,
-    { method: 'DELETE', headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}` } }
-  );
-  if (!res.ok) throw new Error(`Twitch unVIP API ${res.status}: ${await res.text()}`);
-  log.info(`[Twitch] VIP removed from ${username}`);
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  await helixRequest('POST', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
 }
 
-async function twitchBan(_, username, reason) {
+async function twitchUnvip(platform, username) {
   const broadcasterId = await getBroadcasterId();
-  const userRes = await helixRequest('GET', `/users?login=${username}`);
-  const userId  = userRes?.data?.[0]?.id;
-  if (!userId) throw new Error(`User "${username}" not found on Twitch`);
-
-  const { default: fetch } = await import('node-fetch');
-  const userToken = await getUserToken();
-  if (!userToken) throw new Error('No Twitch user token — run twitch-auth.js');
-  const res = await fetch(
-    // moderator_id must be the account that owns the user token (the broadcaster in this case)
-    `https://api.twitch.tv/helix/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`,
-    {
-      method: 'POST',
-      headers: { 'Client-ID': CLIENT_ID, 'Authorization': `Bearer ${userToken}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ data: { user_id: userId, reason } }),
-    }
-  );
-  if (!res.ok) throw new Error(`Twitch ban API ${res.status}: ${await res.text()}`);
-  log.info(`[Twitch] Banned ${username}`);
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  await helixRequest('DELETE', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
 }
+
+// ── IRC client ────────────────────────────────────────────────────────────
 
 let _tmiClient = null;
 
-/**
- * Send a message to all monitored Twitch channels.
- */
-async function say(text) {
-  if (!_tmiClient) { log.warn("[Twitch] say() called before client ready"); return; }
-  for (const ch of CHANNELS) {
-    try { await _tmiClient.say(ch, text); }
-    catch (err) { log.error("[Twitch] say() error on " + ch + ":", err.message); }
-  }
+function say(text) {
+  if (!_tmiClient || !CHANNELS.length) return;
+  _tmiClient.say(CHANNELS[0], text).catch(err => log.error('[Twitch] say() error:', err.message));
 }
 
-// ── tmi.js client ─────────────────────────────────────────────────────────
 async function startTwitch(queue) {
   if (!TOKEN || !BOT_NICK || !CHANNELS.length) {
-    log.warn('[Twitch] Credentials incomplete — Twitch mirroring disabled.');
-    return;
+    log.warn('[Twitch] IRC credentials incomplete — chat mirroring disabled.');
+    return null;
   }
-  // Wire up EventSub for redeems, bits, and subs (works offline, unlike IRC tags)
-  const { getEventSubCallbackUrl, getTwitchSecret } = require('./websub');
-  
+
   const client = new tmi.Client({
-    options:  { debug: false },
-    identity: { username: BOT_NICK, password: TOKEN },
-    channels: CHANNELS,
+    options:    { debug: false },
+    identity:   { username: BOT_NICK, password: TOKEN },
+    channels:   CHANNELS,
+    connection: { reconnect: true, secure: true },
   });
-  client.on('connected', (addr, port) =>
-    log.info(`[Twitch] Connected to ${addr}:${port} | channels: ${CHANNELS.join(', ')}`)
-  );
+
   client.on('message', (channel, tags, message, self) => {
     if (self) return;
     const username = tags['display-name'] ?? tags.username ?? 'unknown';
+
     // IRC tag fallback for redeems (only fires while live, cost not available)
     if (tags['custom-reward-id']) {
       log.debug('[Twitch] Redeem via IRC tag (no cost):', username);

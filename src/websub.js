@@ -73,22 +73,14 @@ function verifyTwitchSignature(body, headers) {
   const msgTimestamp = headers[TWITCH_MSG_TIMESTAMP] ?? '';
   const msgSig       = headers[TWITCH_MSG_SIGNATURE] ?? '';
 
-  // body is a Buffer from express.raw — feed parts to .update() separately
-  // so the bytes are hashed as-is rather than coerced to "[object Buffer]"
+  // body is a raw Buffer collected by the app-level middleware in buildApp().
+  // Feed each HMAC component via separate .update() calls so the bytes are
+  // hashed exactly as Twitch signed them.
   const hmac = crypto.createHmac('sha256', TWITCH_SECRET);
   hmac.update(msgId);
   hmac.update(msgTimestamp);
   hmac.update(body);
   const expected = 'sha256=' + hmac.digest('hex');
-
-  // DEBUG — remove once redeems are confirmed working
-  log.info('[EventSub] sig verify | bodyIsBuffer:', Buffer.isBuffer(body));
-  log.info('[EventSub] sig verify | bodyLen:', body.length);
-  log.info('[EventSub] sig verify | msgId:', msgId);
-  log.info('[EventSub] sig verify | timestamp:', msgTimestamp);
-  log.info('[EventSub] sig verify | expected:', expected);
-  log.info('[EventSub] sig verify | received:', msgSig);
-  log.info('[EventSub] sig verify | match:', expected === msgSig);
 
   try {
     return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(msgSig));
@@ -141,6 +133,17 @@ async function purgeStaleTwitchSubs(appToken) {
 function buildApp() {
   const app = express();
 
+  // ── Raw body collector ─────────────────────────────────────────────────
+  // Must be the FIRST middleware. Collects req.body as a Buffer before any
+  // other parser can touch it. This is intentionally on the isolated app
+  // instance created here, so nothing outside can interfere.
+  app.use((req, res, next) => {
+    const chunks = [];
+    req.on('data',  chunk => chunks.push(chunk));
+    req.on('end',   ()    => { req.body = Buffer.concat(chunks); next(); });
+    req.on('error', err   => { log.error('[WebSub] Body read error:', err.message); res.status(400).end(); });
+  });
+
   // ── YouTube WebSub routes ──────────────────────────────────────────────
 
   app.get('/websub', (req, res) => {
@@ -149,7 +152,7 @@ function buildApp() {
     res.send(challenge ?? '');
   });
 
-  app.post('/websub', express.raw({ type: '*/*' }), async (req, res) => {
+  app.post('/websub', async (req, res) => {
     const sig = req.headers['x-hub-signature'] ?? '';
     if (YT_SECRET && !verifyYtSignature(req.body, sig)) {
       log.warn('[WebSub] YouTube signature mismatch — ignoring');
@@ -177,11 +180,8 @@ function buildApp() {
 
   // ── Twitch EventSub route ──────────────────────────────────────────────
 
-  app.post('/eventsub', express.raw({ type: '*/*' }), (req, res) => {
+  app.post('/eventsub', (req, res) => {
     // TEMP: log every incoming request
-    log.info('[EventSub] Incoming request headers:', JSON.stringify(req.headers, null, 2));
-    log.info('[EventSub] Incoming request body:', req.body?.toString('utf8'));
-
     if (!verifyTwitchSignature(req.body, req.headers)) {
       log.warn('[EventSub] Twitch signature mismatch — ignoring');
       return res.sendStatus(403);
@@ -237,15 +237,10 @@ async function startWebSub(queue) {
   );
   log.info(`[WebSub/EventSub] Server listening on port ${PORT}`);
 
-  // Purge any stale EventSub subs from previous runs before Twitch reconnects.
-  // We need the app token — borrow it from twitch.js if available.
-  try {
-    const twitch   = require('./twitch');
-    const appToken = await twitch.getAppToken?.();
-    if (appToken) await purgeStaleTwitchSubs(appToken);
-  } catch {
-    // twitch module may not expose getAppToken — silently skip
-  }
+  // NOTE: purgeStaleTwitchSubs is intentionally NOT called here.
+  // index.js calls it once in the correct order: purge → setupEventSub.
+  // Calling it here too risks deleting a freshly-created subscription whose
+  // challenge handshake is still in-flight (status not yet 'enabled').
 
   if (YT_CHANNEL_ID) {
     await ytSubscribe(YT_CHANNEL_ID);
