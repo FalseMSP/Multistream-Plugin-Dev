@@ -197,16 +197,12 @@ function buildApp() {
     }
 
     if (msgType === 'notification') {
+      const type  = body.subscription?.type;
       const event = body.event;
-      if (event && _queue) {
-        log.info(`[EventSub] Redeem: ${event.user_name} → ${event.reward?.title}`);
-        _queue.pushRedeem({
-          username:  event.user_name,
-          title:     event.reward?.title ?? 'Unknown Reward',
-          cost:      event.reward?.cost  ?? 0,
-          input:     event.user_input    || null,
-          timestamp: new Date(event.redeemed_at),
-        });
+      if (type && event && _queue) {
+        log.info(`[EventSub] Notification: ${type}`);
+        const twitch = require('./twitch');
+        twitch.handleEventSubNotification(type, event, _queue);
       }
       return res.sendStatus(204);
     }
