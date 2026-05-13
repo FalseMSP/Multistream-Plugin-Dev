@@ -61,6 +61,12 @@ async function main() {
       return;
     }
 
+    // Like events have no chat text — route to sendDonation for a proper embed.
+    if (msg.type === 'like') {
+      discord.sendDonation(msg);
+      return;
+    }
+
     const { finalMsg, sideEffects } = await plugins.runPipeline(msg);
     for (const fn of sideEffects) {
       fn().catch(err => log.error('[main] sideEffect error:', err.message));

@@ -51,7 +51,7 @@ function onChatReady(chatReply) {
 }
 
 async function processMessage(msg) {
-  if (!CMD_RANK.test(msg.message.trim())) return { message: msg };
+  if (!msg.message || !CMD_RANK.test(msg.message.trim())) return { message: msg };
 
   const send = _chatReply[msg.platform];
   if (send) {

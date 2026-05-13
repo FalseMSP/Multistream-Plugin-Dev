@@ -85,7 +85,7 @@ function onChatReady(chatReply) {
 }
 
 async function processMessage(msg) {
-  if (!CMD_COMMANDS.test(msg.message.trim())) return { message: msg };
+  if (!msg.message || !CMD_COMMANDS.test(msg.message.trim())) return { message: msg };
 
   const cmds = getCommands();
   const reply = cmds.length

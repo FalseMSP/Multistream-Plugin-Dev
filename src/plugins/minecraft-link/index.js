@@ -200,6 +200,9 @@ async function processMessage(msg) {
     return { message: msg };
   }
 
+  // Non-chat messages (like, subscribe, etc.) have no message text — skip them.
+  if (!msg.message) return { message: msg };
+
   // Strip a leading "!" so "!tnt" is treated identically to "tnt"
   const text = msg.message.replace(/^!/, '');
 

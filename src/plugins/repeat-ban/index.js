@@ -92,7 +92,7 @@ async function processMessage(msg) {
   if (!_enabled) return { message: msg };
 
   const key        = msg.username.toLowerCase();
-  const normalised = _normalise(msg.message);
+  const normalised = _normalise(msg.message ?? '');
 
   // Ignore empty messages (shouldn't happen, but be safe)
   if (!normalised) return { message: msg };
