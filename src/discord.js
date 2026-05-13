@@ -123,6 +123,14 @@ function buildDonationEmbed(donation) {
   let title, description = null;  // ← always initialise to null
 
   switch (type) {
+    case 'like':
+      title = `❤️ Someone liked the stream!`;
+      break;
+    case 'subscribe':
+      title = username
+        ? `🔔 ${username} subscribed to the channel!`
+        : `🔔 Someone subscribed to the channel!`;
+      break;
     case 'bits':
       title       = `💎 ${username} cheered ${amount} bits!`;
       description = message || null;
