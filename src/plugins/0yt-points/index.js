@@ -202,6 +202,13 @@ const _rewards = new Map();
 /** @type {Array<Function>} */
 const _changeListeners = [];
 
+/**
+ * Per-reward cooldown tracking for !redeem.
+ * Maps reward key → timestamp of last successful redemption (ms).
+ * Cooldown duration comes from the reward's own cooldownSeconds field.
+ */
+const _redeemCooldowns = new Map();
+
 let _chatReply = { twitch: null, youtube: null };
 let _queue     = null; // set in init()
 
@@ -282,11 +289,14 @@ async function syncTwitchRewards() {
   for (const r of twitchRewards) {
     if (!r.is_enabled) continue;
 
-    const key         = r.title.toLowerCase().trim().replace(/\s+/g, '-');
-    const cost        = r.cost;
-    const description = r.prompt?.trim() || r.title;
-    const twitchId    = r.id;
-    const rewardTitle = r.title; // captured for the closure below
+    const key             = r.title.toLowerCase().trim().replace(/\s+/g, '-');
+    const cost            = r.cost;
+    const description     = r.prompt?.trim() || r.title;
+    const twitchId        = r.id;
+    const rewardTitle     = r.title; // captured for the closure below
+    const cooldownSeconds = r.global_cooldown_setting?.is_enabled
+      ? (r.global_cooldown_setting.global_cooldown_seconds ?? 0)
+      : 0;
 
     registerReward({
       name:        key,
@@ -294,6 +304,7 @@ async function syncTwitchRewards() {
       description,
       fromTwitch:  true,
       twitchId,
+      cooldownSeconds,
       handler: async (username, chatReply) => {
         // 1. Announce in YouTube chat
         if (chatReply) {
@@ -364,13 +375,13 @@ function setPoints(username, amount) {
  * Register a redeemable reward.
  * @param {Reward} reward
  */
-function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null }) {
+function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null, cooldownSeconds = 0 }) {
   if (!name || !cost || !description || typeof handler !== 'function') {
     log.warn('[yt-points] registerReward: missing required field(s)');
     return;
   }
   const key = name.toLowerCase().trim();
-  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId });
+  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId, cooldownSeconds });
   log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}`);
 }
 
@@ -404,6 +415,14 @@ function init(context) {
     _queue = require('../../queue');
   } catch {
     log.warn('[yt-points] Could not require queue — pushRedeem will be unavailable.');
+  }
+
+  if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET && TWITCH_BROADCASTER) {
+    syncTwitchRewards()
+      .then(count => log.info(`[yt-points] Auto-synced ${count} Twitch reward(s) on startup.`))
+      .catch(err  => log.warn('[yt-points] Auto-sync failed:', err.message));
+  } else {
+    log.warn('[yt-points] Skipping auto-sync — Twitch env vars not set.');
   }
 }
 
@@ -489,6 +508,22 @@ async function processMessage(msg) {
       return { message: null };
     }
 
+    // ── Per-reward cooldown (mirrors Twitch global_cooldown_setting) ──────────
+    if (reward.cooldownSeconds > 0) {
+      const lastRedeem    = _redeemCooldowns.get(rewardKey) ?? 0;
+      const elapsedMs     = now - lastRedeem;
+      const cooldownMs    = reward.cooldownSeconds * 1000;
+      if (elapsedMs < cooldownMs) {
+        const remainingSecs = Math.ceil((cooldownMs - elapsedMs) / 1000);
+        const mm = Math.floor(remainingSecs / 60);
+        const ss = remainingSecs % 60;
+        const timeStr = mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
+        if (send) send(`⏳ "${reward.name}" is on cooldown — available again in ${timeStr}.`)
+          .catch(e => log.error('[yt-points] send error:', e.message));
+        return { message: null };
+      }
+    }
+
     // Deduct first — handler is responsible for returning false to trigger refund
     deductPoints(username, reward.cost);
 
@@ -503,6 +538,8 @@ async function processMessage(msg) {
       addPoints(username, reward.cost, 'redeem-refund');
       if (send) send(`⚠️ ${username}: "${reward.name}" couldn't be fulfilled right now. Points refunded.`)
         .catch(e => log.error('[yt-points] send error:', e.message));
+    } else if (reward.cooldownSeconds > 0) {
+      _redeemCooldowns.set(rewardKey, now);
     }
 
     return { message: null };
