@@ -92,12 +92,15 @@ registerSection('sfx', {
  * @returns {boolean}           true if a sound was dispatched.
  */
 function handleRedeem(rewardTitle) {
+  // Strip the "[YT]" suffix that yt-points appends when mirroring YouTube
+  // redeems into the pipeline, so the SFX_MAP lookup still matches.
+  const normalised = rewardTitle.replace(/\s*\[YT\]\s*$/i, '').trim();
   const key = Object.keys(SFX_MAP).find(
-    k => k.toLowerCase() === rewardTitle.toLowerCase()
+    k => k.toLowerCase() === normalised.toLowerCase()
   );
 
   if (!key) {
-    log.debug(`[sfx] No sound mapped for reward: "${rewardTitle}"`);
+    log.debug(`[sfx] No sound mapped for reward: "${normalised}"${normalised !== rewardTitle ? ` (original: "${rewardTitle}")` : ''}`);
     return false;
   }
 
