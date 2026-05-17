@@ -1,0 +1,716 @@
+'use strict';
+/**
+ * Plugin: yt-points
+ * ─────────────────
+ * A channel-point-adjacent earn-and-spend system for YouTube chat exclusively.
+ * Twitch already has native channel points; this plugin mirrors the streamer's
+ * actual Twitch custom rewards so YouTube viewers can redeem the same things.
+ *
+ * ── How viewers earn points ───────────────────────────────────────────────────
+ *   • +1  per chat message (passive accrual, rate-limited to 1 per 30 s)
+ *   • +5  for using !points (once per 5 min — curiosity reward)
+ *
+ * ── Chat commands (YouTube only) ─────────────────────────────────────────────
+ *   !points              — Check your current balance
+ *   !points top          — Show the top 5 viewers by points
+ *   !redeem <reward>     — Spend points on a registered reward
+ *   !rewards             — List all available rewards and costs
+ *
+ * ── Twitch reward sync ────────────────────────────────────────────────────────
+ *   Rewards are scraped from the Twitch Helix API on demand via:
+ *     Discord slash command:  /sync-rewards
+ *   Requires TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BROADCASTER_LOGIN,
+ *   and a broadcaster OAuth token in .twitch-tokens.json (written by twitch-auth.js).
+ *   The channel:read:redemptions scope must be granted — run twitch-auth.js if needed.
+ *
+ *   When a YouTube viewer redeems a Twitch-sourced reward:
+ *     1. Confirmed in YouTube chat: "✅ {user} redeemed {reward}!"
+ *     2. Injected into the redeem pipeline via queue.pushRedeem() — appears in
+ *        #redeem-feed exactly like a real Twitch redemption (tagged [YT]).
+ *
+ * ── Public API (for other plugins) ───────────────────────────────────────────
+ *   const pts = require('../yt-points');
+ *
+ *   pts.getPoints(username)                        → number
+ *   pts.addPoints(username, amount, reason?)       → number  (new total)
+ *   pts.deductPoints(username, amount)             → number | false  (false = insufficient)
+ *   pts.setPoints(username, amount)                → void
+ *
+ *   pts.registerReward({ name, cost, description, handler })
+ *     handler: async (username, chatReply) => boolean  (return true = success)
+ *   pts.removeReward(name)
+ *   pts.getRewards()                               → reward[]
+ *
+ *   pts.syncTwitchRewards()                        → Promise<number>  (count synced)
+ *
+ *   pts.onPointsChange(fn)   — subscribe: fn(username, newTotal, delta, reason)
+ *   pts.offPointsChange(fn)  — unsubscribe
+ *
+ * ── Discord slash commands ────────────────────────────────────────────────────
+ *   /sync-rewards                  — Scrape & import rewards from Twitch
+ *   /yt-points inspect|set|give|take|top
+ *   /yt-rewards list|add|remove
+ *
+ * ── Required env vars ─────────────────────────────────────────────────────────
+ *   TWITCH_CLIENT_ID
+ *   TWITCH_CLIENT_SECRET
+ *   TWITCH_BROADCASTER_LOGIN
+ *   (broadcaster OAuth token in .twitch-tokens.json — run twitch-auth.js once
+ *    with scope channel:read:redemptions to enable reward scraping)
+ */
+
+const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
+const fs   = require('fs');
+const path = require('path');
+const log  = require('../../logger');
+const commandsList = require('../commands-list');
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const PASSIVE_COOLDOWN_MS = 30  * 1000;      // 30 s between passive +1 awards
+const CHECKIN_COOLDOWN_MS = 5   * 60 * 1000; // 5 min between !points bonus
+const CHECKIN_BONUS       = 5;
+
+const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
+const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
+const CMD_REWARDS = /^!rewards\s*$/i;
+
+// ─── Twitch Helix helpers ─────────────────────────────────────────────────────
+// Self-contained — we don't import twitch.js to avoid tight coupling.
+
+const TWITCH_CLIENT_ID     = process.env.TWITCH_CLIENT_ID     ?? '';
+const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET ?? '';
+const TWITCH_BROADCASTER   = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
+const TOKEN_FILE           = path.resolve('.twitch-tokens.json');
+
+let _appToken       = null;
+let _appTokenExpiry = 0;
+
+async function _getAppToken() {
+  if (_appToken && Date.now() < _appTokenExpiry) return _appToken;
+  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) return null;
+
+  const res  = await fetch(
+    `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`,
+    { method: 'POST' }
+  );
+  const data = await res.json();
+  if (!data.access_token) throw new Error(`Twitch app token failed: ${JSON.stringify(data)}`);
+  _appToken       = data.access_token;
+  _appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return _appToken;
+}
+
+/**
+ * Load (and auto-refresh) the broadcaster's user OAuth token from
+ * .twitch-tokens.json. Requires channel:read:redemptions scope —
+ * run twitch-auth.js once to grant it.
+ */
+let _userTokenCache = null;
+
+async function _getUserToken() {
+  if (!_userTokenCache) {
+    if (!fs.existsSync(TOKEN_FILE)) return null;
+    try {
+      _userTokenCache = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+    } catch {
+      log.warn('[yt-points] Could not read .twitch-tokens.json');
+      return null;
+    }
+  }
+
+  if (Date.now() >= (_userTokenCache.expires_at ?? 0)) {
+    log.info('[yt-points] Broadcaster token expired — refreshing…');
+    try {
+      const res  = await fetch('https://id.twitch.tv/oauth2/token', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body:    new URLSearchParams({
+          grant_type:    'refresh_token',
+          refresh_token: _userTokenCache.refresh_token,
+          client_id:     TWITCH_CLIENT_ID,
+          client_secret: TWITCH_CLIENT_SECRET,
+        }),
+      });
+      const data = await res.json();
+      if (!data.access_token) throw new Error(JSON.stringify(data));
+      _userTokenCache = {
+        access_token:  data.access_token,
+        refresh_token: data.refresh_token ?? _userTokenCache.refresh_token,
+        expires_at:    Date.now() + (data.expires_in - 60) * 1000,
+        scopes:        data.scope ?? _userTokenCache.scopes,
+      };
+      fs.writeFileSync(TOKEN_FILE, JSON.stringify(_userTokenCache, null, 2));
+      log.info('[yt-points] Broadcaster token refreshed.');
+    } catch (err) {
+      log.error('[yt-points] Token refresh failed:', err.message);
+      _userTokenCache = null;
+      return null;
+    }
+  }
+
+  return _userTokenCache.access_token;
+}
+
+/**
+ * @param {string}  pathAndQuery  e.g. '/channel_points/custom_rewards?broadcaster_id=...'
+ * @param {boolean} useUserToken  true = broadcaster OAuth, false = app token
+ */
+async function _helixGet(pathAndQuery, useUserToken = false) {
+  const token = useUserToken ? await _getUserToken() : await _getAppToken();
+  if (!token) throw new Error('No Twitch token available');
+
+  const res = await fetch(`https://api.twitch.tv/helix${pathAndQuery}`, {
+    headers: {
+      'Client-ID':     TWITCH_CLIENT_ID,
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Helix ${res.status}: ${text}`);
+  }
+  return res.json();
+}
+
+async function _getBroadcasterId() {
+  const data = await _helixGet(`/users?login=${TWITCH_BROADCASTER}`);
+  return data?.data?.[0]?.id ?? null;
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+/** @type {Map<string, number>} username → point balance */
+const _balances = new Map();
+/** @type {Map<string, number>} username → last passive-award timestamp */
+const _passiveCooldowns = new Map();
+/** @type {Map<string, number>} username → last check-in bonus timestamp */
+const _checkinCooldowns = new Map();
+
+/**
+ * @typedef  {Object} Reward
+ * @property {string}   name
+ * @property {number}   cost
+ * @property {string}   description
+ * @property {boolean}  fromTwitch    true if scraped from Twitch
+ * @property {string}   [twitchId]    Twitch reward ID
+ * @property {(username: string, chatReply: Function) => Promise<boolean>} handler
+ */
+/** @type {Map<string, Reward>} */
+const _rewards = new Map();
+
+/** @type {Array<Function>} */
+const _changeListeners = [];
+
+let _chatReply = { twitch: null, youtube: null };
+let _queue     = null; // set in init()
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+function _applyDelta(username, delta, reason = 'unspecified') {
+  const current = _balances.get(username) ?? 0;
+  const next    = Math.max(0, current + delta);
+  _balances.set(username, next);
+  if (delta !== 0) {
+    log.debug(`[yt-points] ${username}: ${current} → ${next} (${delta > 0 ? '+' : ''}${delta}, ${reason})`);
+    for (const fn of _changeListeners) {
+      try { fn(username, next, delta, reason); } catch { /* listener errors must not crash */ }
+    }
+  }
+  return next;
+}
+
+function _leaderboardText(limit = 5) {
+  const sorted = [..._balances.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit);
+  if (!sorted.length) return 'No points awarded yet!';
+  return sorted.map(([name, pts], i) => `#${i + 1} ${name} (${pts})`).join(' | ');
+}
+
+// ─── Twitch reward sync ───────────────────────────────────────────────────────
+
+/**
+ * Fetch all enabled custom rewards from the broadcaster's Twitch channel and
+ * register them as yt-points rewards. Previously-synced Twitch rewards are
+ * cleared first so stale entries don't accumulate.
+ *
+ * When a YouTube viewer redeems a synced reward the handler:
+ *   1. Announces the redemption in YouTube chat ("✅ user redeemed X!")
+ *   2. Calls queue.pushRedeem() so it appears in #redeem-feed like a real
+ *      Twitch redemption, with "[YT]" appended to the title.
+ *
+ * @returns {Promise<number>} number of rewards synced
+ */
+async function syncTwitchRewards() {
+  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !TWITCH_BROADCASTER) {
+    throw new Error(
+      'TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_BROADCASTER_LOGIN must all be set in .env'
+    );
+  }
+
+  const broadcasterId = await _getBroadcasterId();
+  if (!broadcasterId) {
+    throw new Error(`Could not resolve Twitch broadcaster ID for "${TWITCH_BROADCASTER}"`);
+  }
+
+  // channel:read:redemptions requires the broadcaster's user token, not the app token
+  let data;
+  try {
+    data = await _helixGet(
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=false`,
+      true // useUserToken
+    );
+  } catch (err) {
+    if (err.message.includes('401') || err.message.includes('403')) {
+      throw new Error(
+        'Twitch returned an auth error fetching rewards. ' +
+        'Ensure the broadcaster has granted channel:read:redemptions — run: node twitch-auth.js'
+      );
+    }
+    throw err;
+  }
+
+  const twitchRewards = data?.data ?? [];
+
+  // Clear previously-synced Twitch rewards before importing fresh ones
+  for (const [key, reward] of _rewards) {
+    if (reward.fromTwitch) _rewards.delete(key);
+  }
+
+  let synced = 0;
+  for (const r of twitchRewards) {
+    if (!r.is_enabled) continue;
+
+    const key         = r.title.toLowerCase().trim().replace(/\s+/g, '-');
+    const cost        = r.cost;
+    const description = r.prompt?.trim() || r.title;
+    const twitchId    = r.id;
+    const rewardTitle = r.title; // captured for the closure below
+
+    registerReward({
+      name:        key,
+      cost,
+      description,
+      fromTwitch:  true,
+      twitchId,
+      handler: async (username, chatReply) => {
+        // 1. Announce in YouTube chat
+        if (chatReply) {
+          await chatReply(`✅ ${username} redeemed "${rewardTitle}"!`)
+            .catch(e => log.error('[yt-points] YT chat reply error:', e.message));
+        }
+
+        // 2. Inject into the redeem pipeline → shows in #redeem-feed
+        if (_queue?.pushRedeem) {
+          _queue.pushRedeem({
+            username,
+            title:     `${rewardTitle} [YT]`,
+            cost,
+            input:     null,
+            timestamp: new Date(),
+          });
+          log.info(
+            `[yt-points] Injected redeem into pipeline: ` +
+            `${username} → "${rewardTitle}" (${cost} pts)`
+          );
+        } else {
+          log.warn('[yt-points] queue.pushRedeem not available — redeem not mirrored to Discord');
+        }
+
+        return true;
+      },
+    });
+
+    log.info(`[yt-points] Synced Twitch reward: "${rewardTitle}" (${cost} pts)`);
+    synced++;
+  }
+
+  log.info(`[yt-points] Sync complete — ${synced} reward(s) imported from Twitch.`);
+  return synced;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+/** Get current point balance for a viewer (0 if unseen). */
+function getPoints(username) {
+  return _balances.get(username.toLowerCase()) ?? 0;
+}
+
+/** Add points; returns new total. */
+function addPoints(username, amount, reason = 'external') {
+  return _applyDelta(username.toLowerCase(), Math.abs(amount), reason);
+}
+
+/**
+ * Deduct points; returns new total or false if the viewer can't afford it.
+ * @returns {number|false}
+ */
+function deductPoints(username, amount) {
+  const lc      = username.toLowerCase();
+  const current = _balances.get(lc) ?? 0;
+  if (current < amount) return false;
+  return _applyDelta(lc, -Math.abs(amount), 'spend');
+}
+
+/** Force-set a viewer's balance (mod action). */
+function setPoints(username, amount) {
+  const lc  = username.toLowerCase();
+  const cur = _balances.get(lc) ?? 0;
+  _applyDelta(lc, amount - cur, 'mod-set');
+}
+
+/**
+ * Register a redeemable reward.
+ * @param {Reward} reward
+ */
+function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null }) {
+  if (!name || !cost || !description || typeof handler !== 'function') {
+    log.warn('[yt-points] registerReward: missing required field(s)');
+    return;
+  }
+  const key = name.toLowerCase().trim();
+  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId });
+  log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}`);
+}
+
+/** Remove a reward by name. */
+function removeReward(name) {
+  const key = name.toLowerCase().trim();
+  if (_rewards.delete(key)) log.info(`[yt-points] Reward removed: ${key}`);
+}
+
+/** Returns all rewards sorted by cost. */
+function getRewards() {
+  return [..._rewards.values()].sort((a, b) => a.cost - b.cost);
+}
+
+/** Subscribe to any point balance change. */
+function onPointsChange(fn) {
+  _changeListeners.push(fn);
+}
+
+/** Unsubscribe from point balance changes. */
+function offPointsChange(fn) {
+  const idx = _changeListeners.indexOf(fn);
+  if (idx !== -1) _changeListeners.splice(idx, 1);
+}
+
+// ─── Plugin lifecycle ─────────────────────────────────────────────────────────
+
+function init(context) {
+  // Capture queue so reward handlers can call pushRedeem()
+  try {
+    _queue = require('../../queue');
+  } catch {
+    log.warn('[yt-points] Could not require queue — pushRedeem will be unavailable.');
+  }
+}
+
+function onChatReady(chatReply) {
+  _chatReply = chatReply;
+
+  commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)');
+  commandsList.registerCommand('!redeem',  'Spend points on a reward — !redeem <reward name>');
+  commandsList.registerCommand('!rewards', 'List available point rewards and their costs');
+
+  log.info('[yt-points] Ready. Chat commands registered.');
+}
+
+// ─── processMessage ───────────────────────────────────────────────────────────
+
+async function processMessage(msg) {
+  // YouTube only — Twitch has native channel points
+  if (msg.platform !== 'youtube') return { message: msg };
+
+  const username = (msg.username ?? msg.author ?? 'unknown').toLowerCase();
+  const text     = (msg.message ?? '').trim();
+  const send     = _chatReply.youtube;
+  const now      = Date.now();
+
+  // ── Passive earn (1 pt per message, cooldown-gated) ──────────────────────
+  const lastPassive = _passiveCooldowns.get(username) ?? 0;
+  if (now - lastPassive >= PASSIVE_COOLDOWN_MS) {
+    _passiveCooldowns.set(username, now);
+    _applyDelta(username, 1, 'passive');
+  }
+
+  // ── !points / !points top ─────────────────────────────────────────────────
+  const pointsMatch = CMD_POINTS.exec(text);
+  if (pointsMatch) {
+    if (pointsMatch[1]?.toLowerCase() === 'top') {
+      if (send) send('🏆 Top viewers: ' + _leaderboardText(5))
+        .catch(e => log.error('[yt-points] send error:', e.message));
+    } else {
+      const lastCheckin = _checkinCooldowns.get(username) ?? 0;
+      let total = getPoints(username);
+      let bonus = false;
+      if (now - lastCheckin >= CHECKIN_COOLDOWN_MS) {
+        _checkinCooldowns.set(username, now);
+        total = _applyDelta(username, CHECKIN_BONUS, 'checkin-bonus');
+        bonus = true;
+      }
+      const reply = bonus
+        ? `⭐ ${username}: ${total} pts (+${CHECKIN_BONUS} check-in bonus!)`
+        : `⭐ ${username}: ${total} pts`;
+      if (send) send(reply).catch(e => log.error('[yt-points] send error:', e.message));
+    }
+    return { message: null };
+  }
+
+  // ── !rewards ──────────────────────────────────────────────────────────────
+  if (CMD_REWARDS.test(text)) {
+    const rewards = getRewards();
+    const reply   = rewards.length
+      ? '🎁 Rewards: ' + rewards.map(r => `${r.name} (${r.cost} pts — ${r.description})`).join(' | ')
+      : 'No rewards yet — check back soon!';
+    if (send) send(reply).catch(e => log.error('[yt-points] send error:', e.message));
+    return { message: null };
+  }
+
+  // ── !redeem <reward> ──────────────────────────────────────────────────────
+  const redeemMatch = CMD_REDEEM.exec(text);
+  if (redeemMatch) {
+    // Normalise the typed name the same way registerReward does
+    const rewardKey = redeemMatch[1].trim().toLowerCase().replace(/\s+/g, '-');
+    const reward    = _rewards.get(rewardKey);
+
+    if (!reward) {
+      if (send) send(`❌ Unknown reward "${redeemMatch[1].trim()}". Type !rewards to see options.`)
+        .catch(e => log.error('[yt-points] send error:', e.message));
+      return { message: null };
+    }
+
+    const balance = getPoints(username);
+    if (balance < reward.cost) {
+      const short = reward.cost - balance;
+      if (send) send(`❌ ${username}: need ${reward.cost} pts, have ${balance} (${short} more needed).`)
+        .catch(e => log.error('[yt-points] send error:', e.message));
+      return { message: null };
+    }
+
+    // Deduct first — handler is responsible for returning false to trigger refund
+    deductPoints(username, reward.cost);
+
+    let success = false;
+    try {
+      success = await reward.handler(username, send);
+    } catch (e) {
+      log.error(`[yt-points] reward handler error (${rewardKey}):`, e.message);
+    }
+
+    if (!success) {
+      addPoints(username, reward.cost, 'redeem-refund');
+      if (send) send(`⚠️ ${username}: "${reward.name}" couldn't be fulfilled right now. Points refunded.`)
+        .catch(e => log.error('[yt-points] send error:', e.message));
+    }
+
+    return { message: null };
+  }
+
+  return { message: msg };
+}
+
+// ─── Slash commands ───────────────────────────────────────────────────────────
+
+const commandSyncRewards = new SlashCommandBuilder()
+  .setName('sync-rewards')
+  .setDescription('Scrape enabled custom rewards from Twitch and import them into the YouTube points system')
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers);
+
+const commandYtPoints = new SlashCommandBuilder()
+  .setName('yt-points')
+  .setDescription('Manage the YouTube viewer points system')
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+  .addSubcommand(sub =>
+    sub.setName('inspect')
+      .setDescription("Check a viewer's point balance")
+      .addStringOption(o =>
+        o.setName('username').setDescription('YouTube username').setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('set')
+      .setDescription("Force-set a viewer's balance")
+      .addStringOption(o =>
+        o.setName('username').setDescription('YouTube username').setRequired(true))
+      .addIntegerOption(o =>
+        o.setName('amount').setDescription('New balance').setRequired(true).setMinValue(0)))
+  .addSubcommand(sub =>
+    sub.setName('give')
+      .setDescription('Give points to a viewer')
+      .addStringOption(o =>
+        o.setName('username').setDescription('YouTube username').setRequired(true))
+      .addIntegerOption(o =>
+        o.setName('amount').setDescription('Points to give').setRequired(true).setMinValue(1)))
+  .addSubcommand(sub =>
+    sub.setName('take')
+      .setDescription("Remove points from a viewer's balance")
+      .addStringOption(o =>
+        o.setName('username').setDescription('YouTube username').setRequired(true))
+      .addIntegerOption(o =>
+        o.setName('amount').setDescription('Points to remove').setRequired(true).setMinValue(1)))
+  .addSubcommand(sub =>
+    sub.setName('top')
+      .setDescription('Show the full points leaderboard')
+      .addIntegerOption(o =>
+        o.setName('limit').setDescription('How many to show (default 10)').setMinValue(1).setMaxValue(50)));
+
+const commandYtRewards = new SlashCommandBuilder()
+  .setName('yt-rewards')
+  .setDescription('Manage redeemable rewards for the YouTube points system')
+  .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+  .addSubcommand(sub =>
+    sub.setName('list')
+      .setDescription('List all registered rewards (🟣 = synced from Twitch)'))
+  .addSubcommand(sub =>
+    sub.setName('add')
+      .setDescription('Manually add a reward (use /sync-rewards to import from Twitch)')
+      .addStringOption(o =>
+        o.setName('name').setDescription('Reward key, no spaces — use hyphens').setRequired(true))
+      .addIntegerOption(o =>
+        o.setName('cost').setDescription('Point cost').setRequired(true).setMinValue(1))
+      .addStringOption(o =>
+        o.setName('description').setDescription('Short description shown in !rewards').setRequired(true)))
+  .addSubcommand(sub =>
+    sub.setName('remove')
+      .setDescription('Remove a reward by key')
+      .addStringOption(o =>
+        o.setName('name').setDescription('Reward key to remove').setRequired(true)));
+
+async function handleInteraction(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+  const { commandName } = interaction;
+
+  // ── /sync-rewards ─────────────────────────────────────────────────────────
+  if (commandName === 'sync-rewards') {
+    try {
+      const count = await syncTwitchRewards();
+      if (count === 0) {
+        return interaction.editReply('ℹ️ No enabled custom rewards found on the Twitch channel.');
+      }
+      const lines = getRewards()
+        .filter(r => r.fromTwitch)
+        .map(r => `• \`${r.name}\` — **${r.cost} pts** — ${r.description}`);
+      return interaction.editReply(
+        `✅ Synced **${count}** reward(s) from Twitch:\n${lines.join('\n')}`
+      );
+    } catch (err) {
+      log.error('[yt-points] /sync-rewards error:', err.message);
+      return interaction.editReply(`❌ Sync failed: ${err.message}`);
+    }
+  }
+
+  // ── /yt-points ────────────────────────────────────────────────────────────
+  if (commandName === 'yt-points') {
+    const sub      = interaction.options.getSubcommand();
+    const username = interaction.options.getString('username')?.trim().toLowerCase();
+    const amount   = interaction.options.getInteger('amount');
+
+    if (sub === 'inspect') {
+      return interaction.editReply(`⭐ **${username}** has **${getPoints(username)} pts**.`);
+    }
+    if (sub === 'set') {
+      setPoints(username, amount);
+      return interaction.editReply(`✅ Set **${username}** to **${amount} pts**.`);
+    }
+    if (sub === 'give') {
+      const next = addPoints(username, amount, 'mod-gift');
+      return interaction.editReply(
+        `✅ Gave **${amount} pts** to **${username}** → new total: **${next} pts**.`
+      );
+    }
+    if (sub === 'take') {
+      const result = deductPoints(username, amount);
+      if (result === false) {
+        return interaction.editReply(
+          `❌ **${username}** only has **${getPoints(username)} pts** — can't take ${amount}.`
+        );
+      }
+      return interaction.editReply(
+        `✅ Removed **${amount} pts** from **${username}** → new total: **${result} pts**.`
+      );
+    }
+    if (sub === 'top') {
+      const limit  = interaction.options.getInteger('limit') ?? 10;
+      const sorted = [..._balances.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit);
+      if (!sorted.length) return interaction.editReply('ℹ️ No points awarded yet.');
+      const lines = sorted.map(
+        ([name, pts], i) => `\`${String(i + 1).padStart(2, ' ')}\` **${name}** — ${pts} pts`
+      );
+      return interaction.editReply(
+        `🏆 **YouTube Points Leaderboard (top ${sorted.length}):**\n${lines.join('\n')}`
+      );
+    }
+  }
+
+  // ── /yt-rewards ───────────────────────────────────────────────────────────
+  if (commandName === 'yt-rewards') {
+    const sub = interaction.options.getSubcommand();
+
+    if (sub === 'list') {
+      const rewards = getRewards();
+      if (!rewards.length) {
+        return interaction.editReply(
+          'ℹ️ No rewards registered. Run `/sync-rewards` to import from Twitch, or use `/yt-rewards add`.'
+        );
+      }
+      const lines = rewards.map(r =>
+        `• \`${r.name}\` — **${r.cost} pts** — ${r.description}${r.fromTwitch ? ' 🟣' : ''}`
+      );
+      return interaction.editReply(
+        `🎁 **Rewards (${rewards.length})** _(🟣 = synced from Twitch)_:\n${lines.join('\n')}`
+      );
+    }
+
+    if (sub === 'add') {
+      const rawName = interaction.options.getString('name').trim().toLowerCase().replace(/\s+/g, '-');
+      const cost    = interaction.options.getInteger('cost');
+      const desc    = interaction.options.getString('description').trim();
+      const send    = _chatReply.youtube;
+
+      registerReward({
+        name: rawName, cost, description: desc,
+        handler: async (username) => {
+          if (send) await send(`🎉 ${username} redeemed: ${rawName}! (${desc})`);
+          return true;
+        },
+      });
+      return interaction.editReply(`✅ Reward \`${rawName}\` added — **${cost} pts** — "${desc}"`);
+    }
+
+    if (sub === 'remove') {
+      const rawName = interaction.options.getString('name').trim().toLowerCase();
+      if (!_rewards.has(rawName)) {
+        return interaction.editReply(`ℹ️ \`${rawName}\` is not a registered reward.`);
+      }
+      removeReward(rawName);
+      return interaction.editReply(`✅ Removed reward \`${rawName}\`.`);
+    }
+  }
+
+  return interaction.editReply('⚠️ Unknown subcommand.');
+}
+
+// ─── Exports ──────────────────────────────────────────────────────────────────
+
+module.exports = {
+  id: 'yt-points',
+
+  init,
+  onChatReady,
+  processMessage,
+
+  commands: [commandSyncRewards, commandYtPoints, commandYtRewards],
+  handleInteraction,
+
+  // Public API for other plugins
+  getPoints,
+  addPoints,
+  deductPoints,
+  setPoints,
+  registerReward,
+  removeReward,
+  getRewards,
+  syncTwitchRewards,
+  onPointsChange,
+  offPointsChange,
+};

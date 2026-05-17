@@ -29,7 +29,16 @@ let _queue = null;
 function verifyYtSignature(body, header) {
   if (!header?.startsWith('sha1=')) return false;
   const expected = crypto.createHmac('sha1', YT_SECRET).update(body).digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header.slice(5)));
+  // FIX: wrap in try/catch — timingSafeEqual throws if buffers differ in
+  // length (e.g. a bad secret or truncated header), which previously caused
+  // an unhandled exception that silently dropped the request.
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(header.slice(5)));
+  } catch (e) {
+    log.error('[WebSub] YT sig verify timingSafeEqual threw:', e.message,
+      '| expected.len:', expected.length, '| received.len:', header.slice(5).length);
+    return false;
+  }
 }
 
 async function ytSubscribe(channelId) {
@@ -181,14 +190,23 @@ function buildApp() {
   // ── Twitch EventSub route ──────────────────────────────────────────────
 
   app.post('/eventsub', (req, res) => {
-    // TEMP: log every incoming request
     if (!verifyTwitchSignature(req.body, req.headers)) {
       log.warn('[EventSub] Twitch signature mismatch — ignoring');
       return res.sendStatus(403);
     }
 
     const msgType = req.headers[TWITCH_MSG_TYPE];
-    const body    = JSON.parse(req.body.toString('utf8'));
+
+    // FIX: wrap JSON.parse in try/catch — an unhandled throw here meant the
+    // challenge response was never sent, leaving the subscription permanently
+    // in webhook_callback_verification_failed and killing all Twitch events.
+    let body;
+    try {
+      body = JSON.parse(req.body.toString('utf8'));
+    } catch (err) {
+      log.error('[EventSub] Failed to parse request body as JSON:', err.message);
+      return res.sendStatus(400);
+    }
 
     // Twitch sends a webhook_callback_verification challenge on first subscribe
     if (msgType === 'webhook_callback_verification') {

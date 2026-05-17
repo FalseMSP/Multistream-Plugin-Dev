@@ -291,16 +291,34 @@ function init(_context) {
     });
   }
 
+  // FIX: YouTube WebSub pushes video notifications via yt.triggerVideo() which
+  // calls queue.onMessage (or similar) with { platform: 'youtube', type: 'video', ... }.
+  // The previous listener checked for type === 'subscribe' which never matches a
+  // WebSub video-push event — so YouTube notifications were silently dropped.
+  //
+  // The listener now accepts both 'video' (WebSub livestream push) and 'subscribe'
+  // (direct subscriber event, if your youtube.js emits one), and logs the full
+  // message shape the first time it sees an unrecognised YouTube event so you can
+  // confirm the exact type string your youtube.js uses.
   if (!queue?.onMessage) {
-    log.warn('[tnt-tracker] queue.onMessage not available — YouTube subscriber events will not be tracked.');
+    log.warn('[tnt-tracker] queue.onMessage not available — YouTube events will not be tracked.');
   } else {
     queue.onMessage(msg => {
       const { type, platform, username } = msg ?? {};
-      if (platform !== 'youtube' || type !== 'subscribe') return;
+      if (platform !== 'youtube') return;
 
-      const who = username ?? '<anonymous>';
-      log.info(`[tnt-tracker] YouTube subscriber: ${who} → +${TNT_PER_EVENT} TNT`);
-      addTnt(TNT_PER_EVENT);
+      // 'video'     — emitted by yt.triggerVideo() via WebSub push
+      // 'subscribe' — emitted by a direct YouTube subscriber event (if supported)
+      if (type === 'video' || type === 'subscribe') {
+        const who = username ?? '<anonymous>';
+        log.info(`[tnt-tracker] YouTube ${type}: ${who} → +${TNT_PER_EVENT} TNT`);
+        addTnt(TNT_PER_EVENT);
+        return;
+      }
+
+      // Safety net: log any other YouTube event shape so the type string is
+      // visible in your logs and you can add it above if needed.
+      log.debug('[tnt-tracker] Unhandled YouTube message shape:', JSON.stringify(msg));
     });
   }
 }
