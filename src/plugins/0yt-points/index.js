@@ -8,7 +8,7 @@
  *
  * ── How viewers earn points ───────────────────────────────────────────────────
  *   • +1  per chat message (passive accrual, rate-limited to 1 per 30 s)
- *   • +5  for using !points (once per 5 min — curiosity reward)
+ *   • +10 per 5 min since last message, awarded silently on next message (max +60)
  *
  * ── Chat commands (YouTube only) ─────────────────────────────────────────────
  *   !points              — Check your current balance
@@ -72,9 +72,10 @@ const commandsList = require('../commands-list');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const PASSIVE_COOLDOWN_MS = 30  * 1000;      // 30 s between passive +1 awards
-const CHECKIN_COOLDOWN_MS = 5   * 60 * 1000; // 5 min between !points bonus
-const CHECKIN_BONUS       = 5;
+const PASSIVE_COOLDOWN_MS  = 30  * 1000;      // 30 s between passive +1 awards
+const CHECKIN_WINDOW_MS    = 5   * 60 * 1000; // each 5-min block since last msg = +10 pts
+const CHECKIN_PTS_PER_TICK = 10;              // points per completed 5-min window
+const CHECKIN_MAX_PTS      = 60;              // cap: max bonus per message
 
 const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
 const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
@@ -190,8 +191,8 @@ async function _getBroadcasterId() {
 const _balances = new Map();
 /** @type {Map<string, number>} username → last passive-award timestamp */
 const _passiveCooldowns = new Map();
-/** @type {Map<string, number>} username → last check-in bonus timestamp */
-const _checkinCooldowns = new Map();
+/** @type {Map<string, number>} username → timestamp of their last chat message (for check-in bonus) */
+const _lastMessageTime = new Map();
 
 /**
  * @typedef  {Object} Reward
@@ -531,6 +532,20 @@ async function processMessage(msg) {
     _applyDelta(username, 1, 'passive');
   }
 
+  // ── Watch-time bonus (10 pts per 5 min since last message, max 60) ────────
+  // Mimics Twitch channel-point accrual: the longer a viewer was away, the
+  // more points their next message earns (silently, no chat announcement).
+  const prevMessageTime = _lastMessageTime.get(username);
+  _lastMessageTime.set(username, now);
+  if (prevMessageTime != null) {
+    const elapsedMs = now - prevMessageTime;
+    const ticks     = Math.floor(elapsedMs / CHECKIN_WINDOW_MS);
+    if (ticks >= 1) {
+      const bonus = Math.min(ticks * CHECKIN_PTS_PER_TICK, CHECKIN_MAX_PTS);
+      _applyDelta(username, bonus, 'watchtime-bonus');
+    }
+  }
+
   // ── !points / !points top ─────────────────────────────────────────────────
   const pointsMatch = CMD_POINTS.exec(text);
   if (pointsMatch) {
@@ -538,18 +553,9 @@ async function processMessage(msg) {
       if (send) send('🏆 Top viewers: ' + _leaderboardText(5))
         .catch(e => log.error('[yt-points] send error:', e.message));
     } else {
-      const lastCheckin = _checkinCooldowns.get(username) ?? 0;
-      let total = getPoints(username);
-      let bonus = false;
-      if (now - lastCheckin >= CHECKIN_COOLDOWN_MS) {
-        _checkinCooldowns.set(username, now);
-        total = _applyDelta(username, CHECKIN_BONUS, 'checkin-bonus');
-        bonus = true;
-      }
-      const reply = bonus
-        ? `⭐ ${username}: ${total} pts (+${CHECKIN_BONUS} check-in bonus!)`
-        : `⭐ ${username}: ${total} pts`;
-      if (send) send(reply).catch(e => log.error('[yt-points] send error:', e.message));
+      const total = getPoints(username);
+      if (send) send(`⭐ ${username}: ${total} pts`)
+        .catch(e => log.error('[yt-points] send error:', e.message));
     }
     return { message: null };
   }
