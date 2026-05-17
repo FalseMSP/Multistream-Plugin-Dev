@@ -36,12 +36,17 @@
  *   pts.deductPoints(username, amount)             → number | false  (false = insufficient)
  *   pts.setPoints(username, amount)                → void
  *
- *   pts.registerReward({ name, cost, description, handler })
+ *   pts.registerReward({ name, cost, description, handler, oncePerStream? })
  *     handler: async (username, chatReply) => boolean  (return true = success)
+ *     oncePerStream: true = reward can only be redeemed once per stream session
  *   pts.removeReward(name)
  *   pts.getRewards()                               → reward[]
  *
  *   pts.syncTwitchRewards()                        → Promise<number>  (count synced)
+ *     Rewards with max_per_stream_setting = 1 are automatically flagged oncePerStream.
+ *
+ *   pts.onStreamStart()  — call when stream goes live; resets once-per-stream redeems
+ *   pts.onStreamEnd()    — call when stream ends; locks once-per-stream rewards
  *
  *   pts.onPointsChange(fn)   — subscribe: fn(username, newTotal, delta, reason)
  *   pts.offPointsChange(fn)  — unsubscribe
@@ -194,7 +199,8 @@ const _checkinCooldowns = new Map();
  * @property {number}   cost
  * @property {string}   description
  * @property {boolean}  fromTwitch    true if scraped from Twitch
- * @property {string}   [twitchId]    Twitch reward ID
+ * @property {string}   [twitchId]      Twitch reward ID
+ * @property {boolean}  [oncePerStream] true = can only be redeemed once per stream session
  * @property {(username: string, chatReply: Function) => Promise<boolean>} handler
  */
 /** @type {Map<string, Reward>} */
@@ -209,6 +215,14 @@ const _changeListeners = [];
  * Cooldown duration comes from the reward's own cooldownSeconds field.
  */
 const _redeemCooldowns = new Map();
+
+/**
+ * Once-per-stream tracking.
+ * _streamActive: true while a stream session is live (set via onStreamStart/onStreamEnd).
+ * _redeemedThisStream: set of reward keys already redeemed during the current session.
+ */
+let _streamActive = false;
+const _redeemedThisStream = new Set();
 
 let _chatReply = { twitch: null, youtube: null };
 let _queue     = null; // set in init()
@@ -331,6 +345,8 @@ async function syncTwitchRewards() {
     const cooldownSeconds = r.global_cooldown_setting?.is_enabled
       ? (r.global_cooldown_setting.global_cooldown_seconds ?? 0)
       : 0;
+    const oncePerStream   = r.max_per_stream_setting?.is_enabled
+      && (r.max_per_stream_setting.max_per_stream ?? 0) === 1;
 
     registerReward({
       name:        key,
@@ -339,6 +355,7 @@ async function syncTwitchRewards() {
       fromTwitch:  true,
       twitchId,
       cooldownSeconds,
+      oncePerStream,
       handler: async (username, chatReply) => {
         // 1. Announce in YouTube chat
         if (chatReply) {
@@ -409,14 +426,14 @@ function setPoints(username, amount) {
  * Register a redeemable reward.
  * @param {Reward} reward
  */
-function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null, cooldownSeconds = 0 }) {
+function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null, cooldownSeconds = 0, oncePerStream = false }) {
   if (!name || !cost || !description || typeof handler !== 'function') {
     log.warn('[yt-points] registerReward: missing required field(s)');
     return;
   }
   const key = name.toLowerCase().trim();
-  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId, cooldownSeconds });
-  log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}`);
+  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId, cooldownSeconds, oncePerStream });
+  log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}${oncePerStream ? ' [once-per-stream]' : ''}`);
 }
 
 /** Remove a reward by name. */
@@ -439,6 +456,29 @@ function onPointsChange(fn) {
 function offPointsChange(fn) {
   const idx = _changeListeners.indexOf(fn);
   if (idx !== -1) _changeListeners.splice(idx, 1);
+}
+
+// ─── Stream lifecycle ─────────────────────────────────────────────────────────
+
+/**
+ * Call when a stream session goes live.
+ * Resets all once-per-stream redemption records so those rewards are
+ * available again for the new session.
+ */
+function onStreamStart() {
+  _streamActive = true;
+  _redeemedThisStream.clear();
+  log.info('[yt-points] Stream started — once-per-stream redemptions reset.');
+}
+
+/**
+ * Call when a stream session ends.
+ * Marks the session as inactive; once-per-stream rewards stay locked until
+ * the next onStreamStart() call (so late redeems after go-offline are blocked).
+ */
+function onStreamEnd() {
+  _streamActive = false;
+  log.info('[yt-points] Stream ended — once-per-stream rewards are now locked until next stream.');
 }
 
 // ─── Plugin lifecycle ─────────────────────────────────────────────────────────
@@ -561,6 +601,20 @@ async function processMessage(msg) {
       }
     }
 
+    // ── Once-per-stream gate ──────────────────────────────────────────────────
+    if (reward.oncePerStream) {
+      if (!_streamActive) {
+        if (send) send(`❌ "${reward.name}" can only be redeemed while the stream is live.`)
+          .catch(e => log.error('[yt-points] send error:', e.message));
+        return { message: null };
+      }
+      if (_redeemedThisStream.has(rewardKey)) {
+        if (send) send(`❌ "${reward.name}" has already been redeemed this stream — it's a once-per-stream reward!`)
+          .catch(e => log.error('[yt-points] send error:', e.message));
+        return { message: null };
+      }
+    }
+
     // Deduct first — handler is responsible for returning false to trigger refund
     deductPoints(username, reward.cost);
 
@@ -575,8 +629,9 @@ async function processMessage(msg) {
       addPoints(username, reward.cost, 'redeem-refund');
       if (send) send(`⚠️ ${username}: "${reward.name}" couldn't be fulfilled right now. Points refunded.`)
         .catch(e => log.error('[yt-points] send error:', e.message));
-    } else if (reward.cooldownSeconds > 0) {
-      _redeemCooldowns.set(rewardKey, now);
+    } else {
+      if (reward.cooldownSeconds > 0) _redeemCooldowns.set(rewardKey, now);
+      if (reward.oncePerStream)       _redeemedThisStream.add(rewardKey);
     }
 
     return { message: null };
@@ -787,4 +842,6 @@ module.exports = {
   syncTwitchRewards,
   onPointsChange,
   offPointsChange,
+  onStreamStart,
+  onStreamEnd,
 };

@@ -135,7 +135,15 @@ module.exports = {
       return;
     }
     q.onRedeem(redeem => {
-      handleRedeem(redeem.title);
+      // Twitch EventSub payload nests the title under reward.title;
+      // some queue implementations hoist it to a top-level title field.
+      // Support both so this works regardless of how twitch.js normalises it.
+      const title = redeem.title ?? redeem.reward?.title;
+      if (!title) {
+        log.warn('[sfx] Redeem event missing title — skipping. Keys:', Object.keys(redeem).join(', '));
+        return;
+      }
+      handleRedeem(title);
     });
 
     log.info('[sfx] Plugin loaded. Mapped rewards:', Object.keys(SFX_MAP).join(', '));
