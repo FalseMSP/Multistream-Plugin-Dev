@@ -82,6 +82,7 @@ const TWITCH_CLIENT_ID     = process.env.TWITCH_CLIENT_ID     ?? '';
 const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET ?? '';
 const TWITCH_BROADCASTER   = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
 const TOKEN_FILE           = path.resolve('.twitch-tokens.json');
+const POINTS_FILE          = path.resolve('.yt-points.json');
 
 let _appToken       = null;
 let _appTokenExpiry = 0;
@@ -220,6 +221,7 @@ function _applyDelta(username, delta, reason = 'unspecified') {
   _balances.set(username, next);
   if (delta !== 0) {
     log.debug(`[yt-points] ${username}: ${current} → ${next} (${delta > 0 ? '+' : ''}${delta}, ${reason})`);
+    _scheduleSave();
     for (const fn of _changeListeners) {
       try { fn(username, next, delta, reason); } catch { /* listener errors must not crash */ }
     }
@@ -233,6 +235,38 @@ function _leaderboardText(limit = 5) {
     .slice(0, limit);
   if (!sorted.length) return 'No points awarded yet!';
   return sorted.map(([name, pts], i) => `#${i + 1} ${name} (${pts})`).join(' | ');
+}
+
+// ─── Persistence ─────────────────────────────────────────────────────────────
+
+let _saveTimer = null;
+
+/** Persist balances to disk (debounced — batches rapid changes). */
+function _scheduleSave() {
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    try {
+      const data = Object.fromEntries(_balances);
+      fs.writeFileSync(POINTS_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+      log.error('[yt-points] Failed to save points:', err.message);
+    }
+  }, 2000); // write at most once every 2 s
+}
+
+/** Load balances from disk on startup. */
+function _loadPoints() {
+  if (!fs.existsSync(POINTS_FILE)) return;
+  try {
+    const data = JSON.parse(fs.readFileSync(POINTS_FILE, 'utf8'));
+    for (const [username, pts] of Object.entries(data)) {
+      if (typeof pts === 'number' && pts >= 0) _balances.set(username, pts);
+    }
+    log.info(`[yt-points] Loaded ${_balances.size} balance(s) from ${POINTS_FILE}`);
+  } catch (err) {
+    log.warn('[yt-points] Could not read points file:', err.message);
+  }
 }
 
 // ─── Twitch reward sync ───────────────────────────────────────────────────────
@@ -410,6 +444,9 @@ function offPointsChange(fn) {
 // ─── Plugin lifecycle ─────────────────────────────────────────────────────────
 
 function init(context) {
+  // Load persisted balances before anything else
+  _loadPoints();
+
   // Capture queue so reward handlers can call pushRedeem()
   try {
     _queue = require('../../queue');
