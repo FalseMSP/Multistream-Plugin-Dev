@@ -646,6 +646,16 @@ async function ytUnvip(_, username) {
 
 let _sayLiveChatId = null;
 
+const SAY_CHUNK_SIZE = 200;
+
+function _chunkText(text, size) {
+  const chunks = [];
+  for (let i = 0; i < text.length; i += size) {
+    chunks.push(text.slice(i, i + size));
+  }
+  return chunks;
+}
+
 async function say(text) {
   let youtube;
   try {
@@ -662,21 +672,25 @@ async function say(text) {
       return;
     }
   }
-  try {
-    await youtube.liveChatMessages.insert({
-      part: ['snippet'],
-      requestBody: {
-        snippet: {
-          liveChatId: _sayLiveChatId,
-          type: 'textMessageEvent',
-          textMessageDetails: { messageText: text },
+  const chunks = _chunkText(text, SAY_CHUNK_SIZE);
+  for (const chunk of chunks) {
+    try {
+      await youtube.liveChatMessages.insert({
+        part: ['snippet'],
+        requestBody: {
+          snippet: {
+            liveChatId: _sayLiveChatId,
+            type: 'textMessageEvent',
+            textMessageDetails: { messageText: chunk },
+          },
         },
-      },
-    });
-    log.debug('[YouTube] say():', text);
-  } catch (err) {
-    log.error('[YouTube] say() error:', err.message);
-    _sayLiveChatId = null;
+      });
+      log.debug('[YouTube] say():', chunk);
+    } catch (err) {
+      log.error('[YouTube] say() error:', err.message);
+      _sayLiveChatId = null;
+      return;
+    }
   }
 }
 
