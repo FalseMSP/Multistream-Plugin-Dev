@@ -210,9 +210,11 @@ function init(context) {
 // ── onChatReady ───────────────────────────────────────────────────────────
 
 function onChatReady(_chatReply) {
-  // Register each keyword as its own !<keyword> command so they appear in !commands
-  for (const kw of _keywords) {
-    commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+  // Only register keyword commands if the plugin starts enabled
+  if (_enabled) {
+    for (const kw of _keywords) {
+      commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+    }
   }
 }
 
@@ -327,11 +329,13 @@ async function handleInteraction(interaction) {
   if (sub === 'enable') {
     _enabled = true;
     await syncManagedRedeems(true);
+    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
     return interaction.editReply('✅ minecraft-link **enabled**. Twitch redeems (Summon Wither, Disable 60s) **enabled**.');
   }
   if (sub === 'disable') {
     _enabled = false;
     await syncManagedRedeems(false);
+    for (const kw of _keywords) commandsList.removeCommand(`!${kw}`);
     return interaction.editReply('⏸ minecraft-link **disabled**. Twitch redeems (Summon Wither, Disable 60s) **disabled**. All messages flow to main chat only.');
   }
 
