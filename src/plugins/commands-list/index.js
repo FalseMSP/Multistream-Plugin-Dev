@@ -262,13 +262,6 @@ async function handleInteraction(interaction) {
 registerCommand('!commands', 'Lists all chat commands');
 registerCommand('!discord',  'Get the Discord invite link');
 
-// Minecraft / viewer interaction commands (both platforms)
-registerCommand('!tnt',      'Spawns TNT near the streamer');
-registerCommand('!william',  'Spawns a dog');
-registerCommand('!creeper',  'Spawns a charged creeper');
-registerCommand('!penny',    'Spawns a cat');
-registerCommand('!suzy',     'Spawns a bunny');
-
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
