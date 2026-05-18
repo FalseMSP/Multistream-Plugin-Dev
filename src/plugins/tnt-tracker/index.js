@@ -7,6 +7,7 @@
  * Twitch subs / resubs          → +50 TNT
  * Twitch gift subs              → +50 TNT (× quantity)
  * YouTube subscribers           → +50 TNT
+ * YouTube likes                 → +10 TNT
  *
  * Game link:
  *   POST http://localhost:<OVERLAY_PORT>/tnt_update
@@ -35,6 +36,7 @@ const log = require('../../logger');
 
 let tntCount = 0;
 const TNT_PER_EVENT = 50;
+const TNT_PER_LIKE  = 10;
 
 // ─── Overlay section ──────────────────────────────────────────────────────────
 
@@ -313,6 +315,13 @@ function init(_context) {
         const who = username ?? '<anonymous>';
         log.info(`[tnt-tracker] YouTube ${type}: ${who} → +${TNT_PER_EVENT} TNT`);
         addTnt(TNT_PER_EVENT);
+        return;
+      }
+
+      // 'like' — emitted by youtube.js _pollLikeCount(), one event per new like
+      if (type === 'like') {
+        log.info(`[tnt-tracker] YouTube like → +${TNT_PER_LIKE} TNT`);
+        addTnt(TNT_PER_LIKE);
         return;
       }
 
