@@ -114,6 +114,31 @@ async function getUserToken() {
   return _userTokenCache.access_token;
 }
 
+/**
+ * Like helixRequest but authenticates with the broadcaster's user OAuth token
+ * instead of the app token. Required for endpoints that need user-level scopes
+ * (e.g. channel:manage:redemptions for PATCH custom_rewards).
+ */
+async function helixUserRequest(method, path, body) {
+  const { default: fetch } = await import('node-fetch');
+  const userToken = await getUserToken();
+  if (!userToken) throw new Error('Missing User OAUTH Token — run twitch-auth.js');
+  const res = await fetch(`https://api.twitch.tv/helix${path}`, {
+    method,
+    headers: {
+      'Client-ID':     CLIENT_ID,
+      'Authorization': `Bearer ${userToken}`,
+      'Content-Type':  'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Twitch API ${res.status}: ${text}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+
 
 // ── EventSub — channel point redeems + bits + subs ───────────────────────
 //
@@ -558,7 +583,7 @@ async function setRewardEnabled(rewardName, enabled) {
       return false;
     }
 
-    const data = await helixRequest(
+    const data = await helixUserRequest(
       'GET',
       `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=true`
     );
@@ -570,7 +595,7 @@ async function setRewardEnabled(rewardName, enabled) {
       return false;
     }
 
-    await helixRequest(
+    await helixUserRequest(
       'PATCH',
       `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${reward.id}`,
       { is_enabled: enabled }
