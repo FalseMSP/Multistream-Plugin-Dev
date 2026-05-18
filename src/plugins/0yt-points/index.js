@@ -504,12 +504,15 @@ function init(context) {
   }
 }
 
+// yt-points/index.js  —  onChatReady patch
+// Replace your existing onChatReady function with this:
+
 function onChatReady(chatReply) {
   _chatReply = chatReply;
 
-  commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)');
-  commandsList.registerCommand('!redeem',  'Spend points on a reward — !redeem <reward name>');
-  commandsList.registerCommand('!rewards', 'List available point rewards and their costs');
+  commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)', 'youtube');
+  commandsList.registerCommand('!redeem',  'Spend points on a reward — !redeem <reward name>', 'youtube');
+  commandsList.registerCommand('!rewards', 'List available point rewards and their costs', 'youtube');
 
   log.info('[yt-points] Ready. Chat commands registered.');
 }
@@ -609,10 +612,13 @@ async function processMessage(msg) {
 
     // ── Once-per-stream gate ──────────────────────────────────────────────────
     if (reward.oncePerStream) {
+      // YouTube chat messages can only arrive during a live stream, so if we
+      // receive a message the stream must be live.  Auto-activate the session
+      // the first time a YT message arrives so once-per-stream rewards work
+      // without requiring an explicit onStreamStart() call.
       if (!_streamActive) {
-        if (send) send(`❌ "${reward.name}" can only be redeemed while the stream is live.`)
-          .catch(e => log.error('[yt-points] send error:', e.message));
-        return { message: null };
+        log.info('[yt-points] Auto-activating stream session on first YouTube message.');
+        onStreamStart();
       }
       if (_redeemedThisStream.has(rewardKey)) {
         if (send) send(`❌ "${reward.name}" has already been redeemed this stream — it's a once-per-stream reward!`)
