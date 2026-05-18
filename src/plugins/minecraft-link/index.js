@@ -47,21 +47,15 @@
 const { SlashCommandBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 const commandsList = require('../commands-list');
+const { setRewardEnabled } = require('../../twitch');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
 const WEBHOOK_URL = process.env.DISCORD_MINECRAFT_WEBHOOK_URL ?? '';
 
-// Twitch channel point redeems to enable/disable alongside this plugin.
-// Requires TWITCH_CLIENT_ID, TWITCH_OAUTH_TOKEN (user token with
-// channel:manage:redemptions scope), and TWITCH_BROADCASTER_ID env vars.
-const TWITCH_CLIENT_ID      = process.env.TWITCH_CLIENT_ID ?? '';
-const TWITCH_OAUTH_TOKEN    = process.env.TWITCH_OAUTH_TOKEN ?? '';
-const TWITCH_BROADCASTER_ID = process.env.TWITCH_BROADCASTER_ID ?? '';
-
 /**
- * Names of Twitch channel point redeems that should be enabled when this
- * plugin is enabled and disabled when this plugin is disabled.
+ * Names of Twitch channel point redeems to enable/disable with this plugin.
+ * Uses twitch.js → setRewardEnabled() (app token, no extra env vars needed).
  */
 const MANAGED_REDEEMS = ['Summon Wither', 'Disable 60s'];
 
@@ -131,84 +125,16 @@ function getWebhook() {
 // ── Twitch redeem helpers ─────────────────────────────────────────────────
 
 /**
- * Fetch all custom channel point rewards for the broadcaster.
- * Returns an array of reward objects, or [] on failure.
- */
-async function fetchTwitchRewards() {
-  if (!TWITCH_CLIENT_ID || !TWITCH_OAUTH_TOKEN || !TWITCH_BROADCASTER_ID) {
-    log.warn('[minecraft-link] Twitch env vars missing — cannot manage redeems.');
-    return [];
-  }
-  try {
-    const res = await fetch(
-      `https://api.twitch.tv/helix/channel_points/custom_rewards?broadcaster_id=${TWITCH_BROADCASTER_ID}&only_manageable_rewards=true`,
-      {
-        headers: {
-          'Client-Id': TWITCH_CLIENT_ID,
-          'Authorization': `Bearer ${TWITCH_OAUTH_TOKEN}`,
-        },
-      }
-    );
-    if (!res.ok) {
-      log.error(`[minecraft-link] Failed to fetch Twitch rewards: ${res.status} ${res.statusText}`);
-      return [];
-    }
-    const json = await res.json();
-    return json.data ?? [];
-  } catch (err) {
-    log.error('[minecraft-link] Error fetching Twitch rewards:', err.message);
-    return [];
-  }
-}
-
-/**
- * Set is_enabled on a single Twitch custom reward by its ID.
- * @param {string} rewardId
- * @param {boolean} enabled
- */
-async function setTwitchRewardEnabled(rewardId, enabled) {
-  try {
-    const res = await fetch(
-      `https://api.twitch.tv/helix/channel_points/custom_rewards?broadcaster_id=${TWITCH_BROADCASTER_ID}&id=${rewardId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'Client-Id': TWITCH_CLIENT_ID,
-          'Authorization': `Bearer ${TWITCH_OAUTH_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ is_enabled: enabled }),
-      }
-    );
-    if (!res.ok) {
-      log.error(`[minecraft-link] Failed to update reward ${rewardId}: ${res.status} ${res.statusText}`);
-    }
-  } catch (err) {
-    log.error(`[minecraft-link] Error updating reward ${rewardId}:`, err.message);
-  }
-}
-
-/**
- * Enable or disable all redeems listed in MANAGED_REDEEMS.
- * Fetches the full reward list first to resolve names → IDs.
+ * Enable or disable all redeems listed in MANAGED_REDEEMS via twitch.js.
  * @param {boolean} enabled
  */
 async function syncManagedRedeems(enabled) {
-  const rewards = await fetchTwitchRewards();
-  if (!rewards.length) return;
-
-  const targets = rewards.filter(r => MANAGED_REDEEMS.includes(r.title));
-  const found   = targets.map(r => r.title);
-  const missing = MANAGED_REDEEMS.filter(name => !found.includes(name));
-
-  if (missing.length) {
-    log.warn(`[minecraft-link] Could not find Twitch redeems: ${missing.join(', ')}`);
-  }
-
-  await Promise.all(targets.map(r => setTwitchRewardEnabled(r.id, enabled)));
-
-  if (targets.length) {
-    log.info(`[minecraft-link] Twitch redeems ${enabled ? 'enabled' : 'disabled'}: ${found.join(', ')}`);
+  const results = await Promise.all(
+    MANAGED_REDEEMS.map(name => setRewardEnabled(name, enabled))
+  );
+  const failed = MANAGED_REDEEMS.filter((_, i) => !results[i]);
+  if (failed.length) {
+    log.warn(`[minecraft-link] Could not toggle redeems: ${failed.join(', ')}`);
   }
 }
 

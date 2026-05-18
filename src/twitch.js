@@ -57,7 +57,7 @@ async function getBroadcasterId() {
 }
 // ── User token (broadcaster OAuth) ───────────────────────────────────────
 // Required for EventSub subscriptions that need broadcaster-level scopes:
-//   bits:read, channel:read:subscriptions
+//   bits:read, channel:read:subscriptions, channel:manage:redemptions
 // Loaded from .twitch-tokens.json written by twitch-auth.js.
 // The token is refreshed automatically when it expires.
 
@@ -535,12 +535,61 @@ async function startTwitch(queue) {
   _tmiClient = client;
   return client;
 }
+// ── Channel point reward management ──────────────────────────────────────
+
+/**
+ * Enable or disable a custom channel point reward by name.
+ * Uses the app token + helixRequest — no extra env vars needed beyond
+ * what twitch.js already requires (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET,
+ * TWITCH_BROADCASTER_LOGIN).
+ *
+ * Note: the app must be the one that created the reward
+ * (only_manageable_rewards=true) for the PATCH to succeed.
+ *
+ * @param {string}  rewardName  Exact display name of the reward
+ * @param {boolean} enabled
+ * @returns {Promise<boolean>}  true if the reward was found and updated
+ */
+async function setRewardEnabled(rewardName, enabled) {
+  try {
+    const broadcasterId = await getBroadcasterId();
+    if (!broadcasterId) {
+      log.warn('[Twitch] setRewardEnabled: could not resolve broadcaster ID');
+      return false;
+    }
+
+    const data = await helixRequest(
+      'GET',
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=true`
+    );
+    const rewards = data?.data ?? [];
+    const reward  = rewards.find(r => r.title === rewardName);
+
+    if (!reward) {
+      log.warn(`[Twitch] setRewardEnabled: reward not found — "${rewardName}"`);
+      return false;
+    }
+
+    await helixRequest(
+      'PATCH',
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${reward.id}`,
+      { is_enabled: enabled }
+    );
+    log.info(`[Twitch] Reward "${rewardName}" ${enabled ? 'enabled' : 'disabled'}`);
+    return true;
+  } catch (err) {
+    log.error(`[Twitch] setRewardEnabled("${rewardName}", ${enabled}) failed:`, err.message);
+    return false;
+  }
+}
+
 module.exports = {
   say,
   startTwitch,
   setupEventSub,
   getAppToken,
   handleEventSubNotification,
+  setRewardEnabled,
   modHandlers: {
     ban:   twitchBan,
     vip:   twitchVip,
