@@ -34,6 +34,7 @@ const CLIENT_ID      = process.env.TWITCH_CLIENT_ID      ?? '';
 const CLIENT_SECRET  = process.env.TWITCH_CLIENT_SECRET  ?? '';
 const BROADCASTER    = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
 const TOKEN_FILE     = path.resolve('.twitch-tokens.json');
+const REWARDS_FILE   = path.resolve('src/plugins/create-reward/rewards.json');
 
 // ── Rewards to auto-select (skips interactive prompt if all are found) ─────
 // These match the names used in minecraft-link/index.js MANAGED_REDEEMS.
@@ -121,6 +122,12 @@ function prompt(rl, question) {
     console.log('No custom rewards found on this channel.');
     process.exit(0);
   }
+
+  // Save all rewards to rewards.json
+  const rewardsDir = path.dirname(REWARDS_FILE);
+  if (!fs.existsSync(rewardsDir)) fs.mkdirSync(rewardsDir, { recursive: true });
+  fs.writeFileSync(REWARDS_FILE, JSON.stringify(rewards, null, 2));
+  console.log(`\nSaved ${rewards.length} reward(s) to ${REWARDS_FILE}`);
 
   console.log('\nAll current channel point rewards:');
   rewards.forEach((r, i) => {

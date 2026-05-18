@@ -611,6 +611,8 @@ module.exports = {
   getAppToken,
   handleEventSubNotification,
   setRewardEnabled,
+  helixUserRequest,
+  getBroadcasterId,
   modHandlers: {
     ban:   twitchBan,
     vip:   twitchVip,
