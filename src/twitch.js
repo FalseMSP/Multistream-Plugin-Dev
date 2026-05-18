@@ -564,12 +564,8 @@ async function startTwitch(queue) {
 
 /**
  * Enable or disable a custom channel point reward by name.
- * Uses the app token + helixRequest — no extra env vars needed beyond
- * what twitch.js already requires (TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET,
- * TWITCH_BROADCASTER_LOGIN).
- *
- * Note: the app must be the one that created the reward
- * (only_manageable_rewards=true) for the PATCH to succeed.
+ * Uses the broadcaster's user OAuth token (helixUserRequest) so it works on
+ * manually-created rewards too, not just ones created by this app's client ID.
  *
  * @param {string}  rewardName  Exact display name of the reward
  * @param {boolean} enabled
@@ -585,7 +581,7 @@ async function setRewardEnabled(rewardName, enabled) {
 
     const data = await helixUserRequest(
       'GET',
-      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=true`
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}`
     );
     const rewards = data?.data ?? [];
     const reward  = rewards.find(r => r.title === rewardName);
