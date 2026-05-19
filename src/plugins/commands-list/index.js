@@ -32,7 +32,7 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 
-const CMD_COMMANDS = /^!commands\s*$/i;
+const CMD_COMMANDS = /^!(commands|help)\s*$/i;
 
 const VALID_PLATFORMS = ['twitch', 'youtube', 'both'];
 

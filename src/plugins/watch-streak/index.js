@@ -20,8 +20,23 @@
  *    USERNOTICE viewermilestone events (see accompanying twitch.js change).
  *  - Milestone announcements fire on YouTube only — never in Twitch chat.
  *
+ * Channel points (per-stream streak bonus):
+ *  - Points are awarded every stream a viewer attends as part of a streak,
+ *    mirroring Twitch's exact watch-streak bonus schedule:
+ *      streak 1  → no bonus
+ *      streak 2  → +300 points
+ *      streak 3  → +350 points
+ *      streak 4  → +400 points
+ *      streak 5+ → +450 points (flat)
+ *  - Applies to both platforms — YouTube viewers earn points too.
+ *  - Requires a points plugin registered via onPointsReady().
+ *    The plugin must expose: awardPoints(username, platform, amount, reason) → Promise<void>
+ *  - For a Twitch streak-share that jumps the count by multiple steps, only
+ *    the bonus for the final streak value is awarded (matches Twitch behaviour).
+ *
  * Data format (streaks.json):
  *   Keys are "platform:username" (e.g. "twitch:Alice", "youtube:Bob").
+ *   Each record: { streak, lastDate }
  *   If upgrading from a previous version that used bare username keys,
  *   manually prefix existing keys with "youtube:" to preserve history.
  *
@@ -36,12 +51,38 @@ const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const log  = require('../../logger');
 
 // ---------------------------------------------------------------------------
+// Streak point rewards — mirrors Twitch's exact watch-streak bonus schedule.
+//
+// Points are awarded every stream (not just at sparse milestones).
+// The amount depends on where the viewer is in their current streak:
+//   streak 1  → no bonus (first attendance, no streak yet)
+//   streak 2  → +300 points
+//   streak 3  → +350 points
+//   streak 4  → +400 points
+//   streak 5+ → +450 points (flat forever)
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the channel-point bonus for attending stream number `streak` in a row.
+ * Returns 0 for streak === 1 (no bonus on first attendance).
+ * @param {number} streak
+ * @returns {number}
+ */
+function _streakPoints(streak) {
+  if (streak <= 1) return 0;
+  if (streak === 2) return 300;
+  if (streak === 3) return 350;
+  if (streak === 4) return 400;
+  return 450; // 5+
+}
+
+// ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 
 const DATA_PATH = path.join(__dirname, 'streaks.json');
 
-/** @type {{ [username: string]: { streak: number, lastDate: string } }} */
+/** @type {{ [key: string]: { streak: number, lastDate: string | null } }} */
 let _data = {};
 
 function _load() {
@@ -124,6 +165,44 @@ function _startSession(today) {
 }
 
 // ---------------------------------------------------------------------------
+// Points plugin bridge
+// ---------------------------------------------------------------------------
+
+/**
+ * The points plugin, once registered via onPointsReady().
+ * Must expose: awardPoints(username, platform, amount, reason) → Promise<void>
+ */
+let _pointsPlugin = null;
+
+function onPointsReady(plugin) {
+  _pointsPlugin = plugin;
+  log.info('[watch-streak] Points plugin registered.');
+}
+
+/**
+ * Award the per-stream streak bonus for the viewer's current streak count.
+ * Called once per session after the streak is incremented (or set via share).
+ *
+ * @param {string} username
+ * @param {string} platform
+ * @param {number} streak  — the new streak value after crediting this session
+ */
+async function _awardStreakPoints(username, platform, streak) {
+  if (!_pointsPlugin) return;
+
+  const points = _streakPoints(streak);
+  if (points === 0) return; // streak 1 — no bonus
+
+  const reason = `Watch streak day ${streak} bonus`;
+  log.info(`[watch-streak] Awarding ${points} points to ${platform}/${username} (streak ${streak}).`);
+  try {
+    await _pointsPlugin.awardPoints(username, platform, points, reason);
+  } catch (e) {
+    log.error(`[watch-streak] Failed to award points to ${platform}/${username}:`, e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Core logic
 // ---------------------------------------------------------------------------
 
@@ -168,14 +247,19 @@ async function processMessage(msg) {
   if (msg.platform === 'twitch' && msg.type === 'watch-streak') {
     const reported = msg.streak;
     const key      = `twitch:${msg.username}`;
-    const existing = _data[key]?.streak ?? 0;
+    const existing = _data[key] ?? { streak: 0, lastDate: null };
 
-    if (reported > existing) {
-      _data[key] = { streak: reported, lastDate: today };
+    if (reported > existing.streak) {
+      existing.streak   = reported;
+      existing.lastDate = today;
+      _data[key] = existing;
       _save();
-      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} (was ${existing}) — updated.`);
+      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} — updated.`);
+
+      // Award the bonus for the reported streak value (one award per share event)
+      await _awardStreakPoints(msg.username, 'twitch', reported);
     } else {
-      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} (already have ${existing}) — no update.`);
+      log.info(`[watch-streak] Twitch streak share: ${msg.username} reported ${reported} (already have ${existing.streak}) — no update.`);
     }
 
     // Also credit them for today so the normal increment path doesn't fire
@@ -190,6 +274,9 @@ async function processMessage(msg) {
 
   if (newStreak !== null) {
     log.info(`[watch-streak] ${msg.platform}/${msg.username} — streak now ${newStreak} day(s).`);
+
+    // Award per-stream streak bonus
+    await _awardStreakPoints(msg.username, msg.platform, newStreak);
 
     // Milestone announcements — YouTube only (not Twitch chat)
     if (msg.platform === 'youtube' && [7, 14, 30, 50, 100].includes(newStreak)) {
@@ -305,9 +392,9 @@ async function handleInteraction(interaction) {
       return interaction.editReply('No streaks recorded yet.');
     }
 
-    const medals  = ['🥇', '🥈', '🥉'];
+    const medals    = ['🥇', '🥈', '🥉'];
     const platEmoji = { youtube: '🔴', twitch: '🟣' };
-    const lines   = entries.map((e, i) => {
+    const lines     = entries.map((e, i) => {
       const medal = medals[i] ?? `**${i + 1}.**`;
       const tag   = platform ? '' : ` ${platEmoji[e.plat] ?? ''}`;
       return `${medal}${tag} **${e.name}** — ${e.streak} day(s) (last seen: ${e.lastDate})`;
@@ -339,6 +426,7 @@ module.exports = {
   id: 'watch-streak',
   init,
   onChatReady,
+  onPointsReady,
   processMessage,
   commands: [commandStreak, commandStreaks],
   handleInteraction,
