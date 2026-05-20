@@ -79,7 +79,7 @@ const CHECKIN_MAX_PTS      = 60;              // cap: max bonus per message
 
 const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
 const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
-const CMD_REWARDS = /^!rewards\s*$/i;
+const CMD_REWARDS = /^!(rewards|shop)\s*$/i;
 
 // ─── Twitch Helix helpers ─────────────────────────────────────────────────────
 // Self-contained — we don't import twitch.js to avoid tight coupling.
