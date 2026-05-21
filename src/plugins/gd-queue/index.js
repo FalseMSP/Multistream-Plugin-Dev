@@ -29,6 +29,7 @@
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 const { registerSection, updateSection, addRoute } = require('../../overlay-server');
+const dashboard = require('../../dashboard');
 
 // ── State ─────────────────────────────────────────────────────────────────
 // Queue entries: Array<{ username, platform, levelId, notes, addedAt }>
@@ -45,9 +46,10 @@ const CMD_POS      = /^!p\s*$/i;
 // Injected by onChatReady()
 let _chatReply = { twitch: null, youtube: null };
 
-// Push current state to the overlay
+// Push current state to the overlay and dashboard
 function _notify() {
   updateSection('gd-queue', { queue: _queue, enabled: _enabled });
+  dashboard.updateWidget('gd-queue', { queue: _queue, enabled: _enabled });
 }
 
 // ── Overlay section registration ──────────────────────────────────────────
@@ -93,7 +95,64 @@ registerSection('gd-queue', {
     }).toString(),
 });
 
-// ── Standalone /gd-queue page ─────────────────────────────────────────────
+// ── Dashboard widget ──────────────────────────────────────────────────────────
+
+dashboard.registerWidget('gd-queue', {
+  title: 'GD Level Queue',
+  order: 10,
+  icon: `<svg width="20" height="20" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <polygon points="11,2 13.5,8.5 20.5,8.5 14.9,12.7 17,19.5 11,15.3 5,19.5 7.1,12.7 1.5,8.5 8.5,8.5"
+             fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+  </svg>`,
+  render: (function render(data, el, esc, { card, badge }) {
+    if (!data) {
+      el.innerHTML = '<p style="color:var(--muted);font-size:12px">Waiting for data…</p>';
+      badge.textContent = '';
+      return;
+    }
+    var queue   = data.queue   || [];
+    var enabled = data.enabled !== false;
+
+    card.dataset.state = enabled ? '' : 'closed';
+    badge.textContent  = queue.length === 1 ? '1 level' : queue.length + ' levels';
+
+    if (queue.length === 0) {
+      el.innerHTML =
+        '<p style="color:var(--muted);font-size:12px;text-align:center;padding:10px 0">' +
+        (enabled ? 'No levels in queue' : '🔒 Queue closed') + '</p>';
+      return;
+    }
+
+    el.innerHTML = queue.map(function (e, i) {
+      var platformColor = e.platform === 'twitch' ? '#9147ff' : '#ff0000';
+      var notesHtml = e.notes
+        ? '<div style="font-size:10px;color:var(--muted);font-style:italic;margin-top:1px;' +
+          'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(e.notes) + '</div>'
+        : '';
+      return '<div style="display:grid;grid-template-columns:24px 1fr;gap:4px 8px;' +
+          'align-items:center;padding:6px 0;border-bottom:1px solid var(--border)">' +
+        '<span style="font-family:var(--mono);font-size:10px;color:var(--muted);text-align:right">' +
+          '#' + (i + 1) +
+        '</span>' +
+        '<div style="min-width:0">' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<span style="font-family:var(--mono);font-size:15px;font-weight:700;color:var(--accent)">' +
+              esc(e.levelId) +
+            '</span>' +
+            '<span style="display:inline-block;width:6px;height:6px;border-radius:50%;flex-shrink:0;background:' +
+              platformColor + '"></span>' +
+            '<span style="font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+              esc(e.username) +
+            '</span>' +
+          '</div>' +
+          notesHtml +
+        '</div>' +
+      '</div>';
+    }).join('');
+  }).toString(),
+});
+
+
 // Serves a self-contained overlay page showing only the queue section.
 // Add http://<host>:2999/gd-queue as a Browser Source in OBS.
 

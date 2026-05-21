@@ -29,6 +29,7 @@
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { addRoute, updateSection, registerSection } = require('../../overlay-server');
+const dashboard = require('../../dashboard');
 const queue = require('../../queue');
 const log = require('../../logger');
 
@@ -63,12 +64,40 @@ registerSection('tnt-tracker', {
   }).toString(),
 });
 
-// ─── State helpers ────────────────────────────────────────────────────────────
+// ─── Dashboard widget ─────────────────────────────────────────────────────────
+
+dashboard.registerWidget('tnt-tracker', {
+  title: 'TNT Tracker',
+  order: 99,
+  icon: `<svg width="20" height="20" viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges">
+    <rect width="22" height="22" fill="#c0392b"/>
+    <rect x="0" y="0" width="22" height="5" fill="#e74c3c"/>
+    <rect x="0" y="17" width="22" height="5" fill="#e74c3c"/>
+    <rect x="3" y="8" width="2" height="7" fill="#fff"/>
+    <rect x="2" y="8" width="4" height="1" fill="#fff"/>
+    <rect x="9" y="8" width="2" height="7" fill="#fff"/>
+    <rect x="8" y="8" width="1" height="4" fill="#fff"/>
+    <rect x="11" y="8" width="1" height="4" fill="#fff"/>
+    <rect x="16" y="8" width="2" height="7" fill="#fff"/>
+    <rect x="15" y="8" width="4" height="1" fill="#fff"/>
+  </svg>`,
+  render: (function render(data, el, esc, { badge }) {
+    if (!data) { el.innerHTML = ''; badge.textContent = ''; return; }
+    badge.textContent = data.tnt + ' blocks';
+    el.innerHTML =
+      '<p style="font-size:40px;font-weight:900;text-align:center;padding:12px 0;' +
+      'font-family:var(--mono);color:var(--accent)">' + esc(String(data.tnt)) + '</p>' +
+      '<p style="text-align:center;color:var(--muted);font-size:11px">blocks left to place</p>';
+  }).toString(),
+});
+
+
 
 function setTnt(n) {
   tntCount = Math.max(0, Math.round(n));
   log.info(`[tnt-tracker] TNT count → ${tntCount}`);
   updateSection('tnt-tracker', { tnt: tntCount });
+  dashboard.updateWidget('tnt-tracker', { tnt: tntCount });
 }
 
 function addTnt(n) {

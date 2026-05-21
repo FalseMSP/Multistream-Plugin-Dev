@@ -27,7 +27,8 @@
  *   Twitch followers: 1503266381989281813  →  "👥 Followers: 5,678"
  */
 
-const log = require('../../logger');
+const log       = require('../../logger');
+const dashboard = require('../../dashboard');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -64,7 +65,55 @@ const _state = {
   },
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Dashboard widget ──────────────────────────────────────────────────────────
+
+dashboard.registerWidget('sub-counter', {
+  title: 'Sub Counter',
+  order: 50,
+  icon: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round">
+           <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+           <circle cx="9" cy="7" r="4"/>
+           <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+           <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+         </svg>`,
+  render: (function render(data, el, esc, { badge }) {
+    if (!data) {
+      el.innerHTML = '<p style="color:var(--muted);font-size:12px">Waiting for data…</p>';
+      badge.textContent = '';
+      return;
+    }
+    var yt = data.yt  != null ? Number(data.yt).toLocaleString('en-US')  : '—';
+    var tw = data.tw  != null ? Number(data.tw).toLocaleString('en-US')  : '—';
+    badge.textContent = yt + ' / ' + tw;
+    el.innerHTML =
+      '<div style="display:flex;flex-direction:column;gap:8px;padding:4px 0">' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;' +
+            'padding:6px 0;border-bottom:1px solid var(--border)">' +
+          '<span style="color:var(--muted);font-size:12px">📊 YouTube Subs</span>' +
+          '<span style="font-family:var(--mono);font-size:22px;font-weight:900;color:var(--accent)">' +
+            esc(yt) +
+          '</span>' +
+        '</div>' +
+        '<div style="display:flex;justify-content:space-between;align-items:baseline;padding:6px 0">' +
+          '<span style="color:var(--muted);font-size:12px">👥 Twitch Followers</span>' +
+          '<span style="font-family:var(--mono);font-size:22px;font-weight:900;color:var(--accent)">' +
+            esc(tw) +
+          '</span>' +
+        '</div>' +
+      '</div>';
+  }).toString(),
+});
+
+function _notifyDashboard() {
+  dashboard.updateWidget('sub-counter', {
+    yt: _state[VOICE_CHANNEL_ID].count,
+    tw: _state[FOLLOWER_CHANNEL_ID].count,
+  });
+}
+
+
 
 /**
  * Rename a voice channel immediately, unless inside the rate-limit window —
@@ -286,6 +335,7 @@ function init(context) {
             `— count now ${s.count.toLocaleString()}`
           );
           _scheduleRename(VOICE_CHANNEL_ID, s.count);
+          _notifyDashboard();
         }
         return;
       }
@@ -300,6 +350,7 @@ function init(context) {
             `— count now ${s.count.toLocaleString()}`
           );
           _scheduleRename(FOLLOWER_CHANNEL_ID, s.count);
+          _notifyDashboard();
         }
         return;
       }
@@ -313,6 +364,7 @@ function init(context) {
       if (count == null) return;
       _state[VOICE_CHANNEL_ID].count = count;
       log.info(`[sub-counter] Initial YouTube subscriber count: ${count.toLocaleString()}`);
+      _notifyDashboard();
       _applyRename(VOICE_CHANNEL_ID, count).catch(err =>
         log.error('[sub-counter] Initial YT rename error:', err.message));
     });
@@ -322,6 +374,7 @@ function init(context) {
       if (count == null) return;
       _state[FOLLOWER_CHANNEL_ID].count = count;
       log.info(`[sub-counter] Initial Twitch follower count: ${count.toLocaleString()}`);
+      _notifyDashboard();
       _applyRename(FOLLOWER_CHANNEL_ID, count).catch(err =>
         log.error('[sub-counter] Initial Twitch rename error:', err.message));
     });
