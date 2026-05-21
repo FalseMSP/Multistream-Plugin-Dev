@@ -172,7 +172,21 @@ dashboard.registerWidget('gd-queue', {
           .then(function (r) { return r.json(); })
           .then(function (entry) {
             if (entry && entry.levelId) {
-              navigator.clipboard.writeText(entry.levelId).catch(function () {});
+              // Works in both secure (clipboard API) and plain-HTTP (execCommand) contexts
+              try {
+                if (navigator.clipboard && window.isSecureContext) {
+                  navigator.clipboard.writeText(entry.levelId).catch(function () {});
+                } else {
+                  var ta = document.createElement('textarea');
+                  ta.value = entry.levelId;
+                  ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+                  document.body.appendChild(ta);
+                  ta.focus();
+                  ta.select();
+                  document.execCommand('copy');
+                  document.body.removeChild(ta);
+                }
+              } catch (_) {}
               btn.textContent = '✅ Copied ' + entry.levelId + '!';
             } else {
               btn.textContent = '📭 Queue empty';
