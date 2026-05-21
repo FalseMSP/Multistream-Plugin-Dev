@@ -288,7 +288,7 @@ async function processMessage(msg) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
       if (send) send('The level queue is currently closed.')
-        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+        ?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
       return { message: null };
     }
 
@@ -302,7 +302,7 @@ async function processMessage(msg) {
     }
 
     const send = _chatReply[msg.platform];
-    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+    if (send) send(reply)?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
 
     return { message: null };
   }
@@ -312,7 +312,7 @@ async function processMessage(msg) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
       if (send) send(`${msg.username} the level queue is currently closed.`)
-        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+        ?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
       return { message: null }; // still suppress from #stream-chat
     }
 
@@ -327,7 +327,7 @@ async function processMessage(msg) {
       : `${msg.username} added level ${levelId}${notesHint} to the queue! Position: #${_queue.length}`;
 
     const send = _chatReply[msg.platform];
-    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+    if (send) send(reply)?.catch(e => log.error('[gd-queue] chat reply error:', e.message))
 
     return { message: null };
   }
@@ -337,7 +337,7 @@ async function processMessage(msg) {
     if (!_enabled) {
       const send = _chatReply[msg.platform];
       if (send) send('The level queue is currently closed.')
-        .catch(e => log.error('[gd-queue] chat reply error:', e.message));
+        ?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
       return { message: null };
     }
 
@@ -347,7 +347,7 @@ async function processMessage(msg) {
       : `There ${len === 1 ? 'is' : 'are'} ${len} level${len === 1 ? '' : 's'} in the queue.`;
 
     const send = _chatReply[msg.platform];
-    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+    if (send) send(reply)?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
 
     return { message: null };
   }
@@ -365,7 +365,7 @@ async function processMessage(msg) {
       const entry = _queue[idx];
       reply = `${msg.username} you are #${idx + 1} in the queue (level ${entry.levelId}${entry.notes ? ` — ${entry.notes}` : ''}).`;
     }
-    if (send) send(reply).catch(e => log.error('[gd-queue] chat reply error:', e.message));
+    if (send) send(reply)?.catch(e => log.error('[gd-queue] chat reply error:', e.message));
     return { message: null };
   }
 
@@ -498,6 +498,7 @@ async function handleInteraction(interaction) {
 function onChatReady(chatReply) {
   _chatReply = chatReply;
   log.info('[gd-queue] Chat reply handlers registered.');
+  _notify();
 }
 
 // ── Export ────────────────────────────────────────────────────────────────

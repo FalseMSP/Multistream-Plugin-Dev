@@ -252,6 +252,77 @@ function init(context) {
       }
     });
   }
+
+  // ── api.sendDonation intercept ────────────────────────────────────────────
+  // discord.js calls api.sendDonation() for follow/sub/resub/subgift/bits/like/
+  // subscribe events. The queue.onDonation path may never fire for these, so
+  // we wrap the api function to observe the same payloads discord.js receives.
+
+  if (context?.sendDonation) {
+    const _origSendDonation = context.sendDonation.bind(context);
+    context.sendDonation = function (donation) {
+      const { type, platform, username, quantity, months, message,
+              amount, currency, tier, recipient } = donation ?? {};
+
+      if (platform === 'twitch' || platform === 'youtube') {
+        switch (type) {
+          case 'follow':
+            _push({ type, platform, username, ts: _ts(),
+              label: 'followed on Twitch', detail: null });
+            break;
+          case 'sub':
+            _push({ type, platform, username, ts: _ts(),
+              label: 'subscribed on Twitch', detail: message || null });
+            break;
+          case 'resub': {
+            const mo = months ? `${months} months` : null;
+            _push({ type, platform, username, ts: _ts(),
+              label: `resubscribed on Twitch${mo ? ` (${mo})` : ''}`,
+              detail: message || null });
+            break;
+          }
+          case 'subgift': {
+            const qty = quantity ?? 1;
+            _push({ type, platform, username, ts: _ts(),
+              label: `gifted ${qty} sub${qty !== 1 ? 's' : ''} on Twitch`,
+              detail: null });
+            break;
+          }
+          case 'bits':
+            _push({ type, platform, username, ts: _ts(),
+              label: `cheered ${amount ?? '?'} bits`, detail: message || null });
+            break;
+          case 'like':
+            _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
+              label: 'liked on YouTube', detail: null });
+            break;
+          case 'subscribe':
+            _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
+              label: 'subscribed on YouTube', detail: null });
+            break;
+          default:
+            log.debug('[stream-events] sendDonation intercept — unhandled type:', type);
+        }
+      }
+
+      return _origSendDonation(donation);
+    };
+  }
+
+  // ── api.sendRedeem intercept ──────────────────────────────────────────────
+  // discord.js calls api.sendRedeem() for channel point redemptions.
+  // Shape: { username, title, cost, input, timestamp }
+
+  if (context?.sendRedeem) {
+    const _origSendRedeem = context.sendRedeem.bind(context);
+    context.sendRedeem = function (redeem) {
+      const { username, title, input } = redeem ?? {};
+      _push({ type: 'redeem', platform: 'twitch', username, ts: _ts(),
+        label: `redeemed: ${title ?? 'channel points'}`,
+        detail: input || null });
+      return _origSendRedeem(redeem);
+    };
+  }
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
