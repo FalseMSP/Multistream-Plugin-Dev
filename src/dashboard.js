@@ -408,6 +408,59 @@ function _buildDashboardPage() {
   .widget-header:active { cursor: grabbing; }
   .widget-card.dragging { opacity: 0.5; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
   .widget-card.drag-over { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .widget-card.minimized .widget-body { display: none; }
+  .widget-minimize {
+    margin-left: 6px; background: none; border: none; color: var(--muted);
+    cursor: pointer; padding: 2px 5px; border-radius: 3px; font-size: 14px;
+    line-height: 1; transition: color 0.15s, background 0.15s; display: flex; align-items: center;
+  }
+  .widget-minimize:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+  /* ── Widgets menu in topbar ── */
+  .widgets-menu-wrap { position: relative; }
+  .widgets-menu-btn {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); background: none;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 10px; cursor: pointer; font-family: inherit;
+    transition: color 0.15s, border-color 0.15s;
+  }
+  .widgets-menu-btn:hover { color: var(--text); border-color: var(--muted); }
+  .widgets-menu-btn .wm-count {
+    background: var(--accent); color: #fff; font-size: 9px; font-weight: 700;
+    padding: 1px 5px; border-radius: 3px; font-family: var(--mono);
+    display: none;
+  }
+  .widgets-menu-btn .wm-count.has-items { display: inline-block; }
+  .widgets-dropdown {
+    display: none; position: absolute; top: calc(100% + 6px); right: 0;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 6px; min-width: 220px; z-index: 200;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); overflow: hidden;
+  }
+  .widgets-dropdown.open { display: block; }
+  .widgets-dropdown-header {
+    padding: 8px 14px; font-size: 10px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted);
+    border-bottom: 1px solid var(--border);
+  }
+  .widgets-dropdown-empty {
+    padding: 14px; font-size: 12px; color: var(--muted); text-align: center; font-family: var(--mono);
+  }
+  .widgets-dropdown-item {
+    display: flex; align-items: center; gap: 10px; padding: 9px 14px;
+    border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer;
+    transition: background 0.12s;
+  }
+  .widgets-dropdown-item:last-child { border-bottom: none; }
+  .widgets-dropdown-item:hover { background: var(--surface2); }
+  .widgets-dropdown-item-icon { width: 16px; height: 16px; color: var(--accent); flex-shrink: 0; }
+  .widgets-dropdown-item-title { font-size: 12px; font-weight: 600; flex: 1; }
+  .widgets-dropdown-item-restore {
+    font-size: 10px; font-family: var(--mono); color: var(--accent);
+    background: var(--accent-lo); border: 1px solid rgba(229,57,53,0.3);
+    border-radius: 3px; padding: 2px 7px; cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  .widgets-dropdown-item-restore:hover { background: rgba(229,57,53,0.2); }
   /* ── Log console ── */
   .log-console {
     height: 180px; flex-shrink: 0;
@@ -452,6 +505,17 @@ function _buildDashboardPage() {
     </div>
     <span class="topbar-badge">LIVE</span>
     <div class="topbar-spacer"></div>
+    <div class="widgets-menu-wrap" id="widgets-menu-wrap">
+      <button class="widgets-menu-btn" id="widgets-menu-btn" title="Minimized widgets">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        Widgets
+        <span class="wm-count" id="wm-count">0</span>
+      </button>
+      <div class="widgets-dropdown" id="widgets-dropdown">
+        <div class="widgets-dropdown-header">Minimized Widgets</div>
+        <div id="widgets-dropdown-list"><div class="widgets-dropdown-empty">No minimized widgets</div></div>
+      </div>
+    </div>
     <div class="topbar-status">
       <span class="status-dot" id="status-dot"></span>
       <span id="status-text">connected</span>
@@ -559,6 +623,9 @@ function _buildDashboardPage() {
         '<span class="widget-icon">'  + w.icon          + '</span>' +
         '<span class="widget-title">' + esc(w.title)    + '</span>' +
         '<span class="widget-badge" id="wbadge-' + w.id + '"></span>' +
+        '<button class="widget-minimize" data-widget-id="' + w.id + '" title="Minimize widget">' +
+          '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
+        '</button>' +
       '</div>' +
       '<div class="widget-body" id="wbody-' + w.id + '"></div>';
     grid.appendChild(card);
@@ -845,6 +912,92 @@ function _buildDashboardPage() {
     const d = initialData[sectionId];
     if (d && Array.isArray(d.messages)) pushChatMessages(platform, d.messages);
   }
+  // ── Minimize / restore widgets ───────────────────────────────────────────
+
+  const minimizedSet = new Set(
+    JSON.parse(localStorage.getItem('dash-minimized') || '[]')
+  );
+
+  function saveMinimized() {
+    localStorage.setItem('dash-minimized', JSON.stringify([...minimizedSet]));
+  }
+
+  const wmCount      = document.getElementById('wm-count');
+  const wmDropdown   = document.getElementById('widgets-dropdown');
+  const wmList       = document.getElementById('widgets-dropdown-list');
+  const wmBtn        = document.getElementById('widgets-menu-btn');
+  const wmWrap       = document.getElementById('widgets-menu-wrap');
+
+  function updateWidgetsMenu() {
+    const minimized = WIDGETS.filter(w => minimizedSet.has(w.id));
+    const count = minimized.length;
+    wmCount.textContent = count;
+    wmCount.classList.toggle('has-items', count > 0);
+
+    if (count === 0) {
+      wmList.innerHTML = '<div class="widgets-dropdown-empty">No minimized widgets</div>';
+    } else {
+      wmList.innerHTML = '';
+      for (const w of minimized) {
+        const item = document.createElement('div');
+        item.className = 'widgets-dropdown-item';
+        item.innerHTML =
+          '<span class="widgets-dropdown-item-icon">' + w.icon + '</span>' +
+          '<span class="widgets-dropdown-item-title">' + esc(w.title) + '</span>' +
+          '<button class="widgets-dropdown-item-restore" data-restore-id="' + w.id + '">Restore</button>';
+        wmList.appendChild(item);
+      }
+    }
+  }
+
+  function minimizeWidget(id) {
+    minimizedSet.add(id);
+    saveMinimized();
+    const card = document.getElementById('wcard-' + id);
+    if (card) card.classList.add('minimized');
+    updateWidgetsMenu();
+  }
+
+  function restoreWidget(id) {
+    minimizedSet.delete(id);
+    saveMinimized();
+    const card = document.getElementById('wcard-' + id);
+    if (card) card.classList.remove('minimized');
+    updateWidgetsMenu();
+  }
+
+  // Apply persisted minimized state on load
+  for (const id of minimizedSet) {
+    const card = document.getElementById('wcard-' + id);
+    if (card) card.classList.add('minimized');
+  }
+  updateWidgetsMenu();
+
+  // Delegate minimize button clicks on grid
+  grid.addEventListener('click', (e) => {
+    const btn = e.target.closest('.widget-minimize');
+    if (!btn) return;
+    e.stopPropagation();
+    minimizeWidget(btn.dataset.widgetId);
+  });
+
+  // Delegate restore button clicks in dropdown
+  wmList.addEventListener('click', (e) => {
+    const btn = e.target.closest('.widgets-dropdown-item-restore');
+    if (!btn) return;
+    restoreWidget(btn.dataset.restoreId);
+    if (!minimizedSet.size) wmDropdown.classList.remove('open');
+  });
+
+  // Toggle dropdown
+  wmBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    wmDropdown.classList.toggle('open');
+  });
+  document.addEventListener('click', (e) => {
+    if (!wmWrap.contains(e.target)) wmDropdown.classList.remove('open');
+  });
+
 })();
 </script>
 </body>
