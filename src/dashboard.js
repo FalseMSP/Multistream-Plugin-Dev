@@ -142,6 +142,54 @@ function _broadcast(payload) {
   }
 }
 
+// ── Moderation callbacks ──────────────────────────────────────────────────
+
+/** Handlers registered by plugins to perform actual mod actions */
+const _modHandlers = [];
+
+/**
+ * Register a handler for moderation actions dispatched from the dashboard.
+ * @param {{ ban: Function, timeout: Function }} handlers
+ */
+function onModerate(handlers) {
+  _modHandlers.push(handlers);
+}
+
+async function _dispatchModerate(username, platform, action, duration) {
+  for (const h of _modHandlers) {
+    try {
+      if (action === 'ban' && h.ban) {
+        await h.ban(platform, username, 'Banned from dashboard');
+      } else if (action === 'timeout' && h.timeout) {
+        await h.timeout(platform, username, duration, 'Timed out from dashboard');
+      }
+    } catch (err) {
+      log.error(`[dashboard] Moderate action "${action}" on ${username} failed:`, err.message);
+      _broadcastLog('error', `Mod action "${action}" on ${username} (${platform}) failed: ${err.message}`);
+    }
+  }
+}
+
+// ── Log broadcasting ───────────────────────────────────────────────────────
+
+const LOG_BUFFER_SIZE = 200;
+const _logBuffer = [];
+
+function _broadcastLog(level, message) {
+  const entry = { level, message, ts: Date.now() };
+  _logBuffer.push(entry);
+  if (_logBuffer.length > LOG_BUFFER_SIZE) _logBuffer.shift();
+  _broadcast({ type: 'log', entry });
+}
+
+// Intercept the logger so dashboard captures output
+const _origLog = { info: log.info?.bind(log), warn: log.warn?.bind(log), error: log.error?.bind(log) };
+if (log.info) {
+  log.info  = (...a) => { _origLog.info(...a);  _broadcastLog('info',  a.join(' ')); };
+  log.warn  = (...a) => { _origLog.warn(...a);  _broadcastLog('warn',  a.join(' ')); };
+  log.error = (...a) => { _origLog.error(...a); _broadcastLog('error', a.join(' ')); };
+}
+
 // ── Read POST body ─────────────────────────────────────────────────────────
 
 function _readBody(req) {
@@ -270,7 +318,8 @@ function _buildDashboardPage() {
   /* ── Layout shell ── */
   .dashboard-layout { flex: 1; display: flex; overflow: hidden; min-height: 0; }
   /* ── Left: widget grid ── */
-  .grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; padding: 20px; align-content: start; overflow-y: auto; }
+  .grid { flex: 1; position: relative; overflow-y: auto; min-height: 0; }
+  .grid-inner { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; padding: 20px; align-content: start; }
   /* ── Right: chat column ── */
   .chat-column {
     width: 380px;
@@ -353,6 +402,40 @@ function _buildDashboardPage() {
   .empty { grid-column: 1/-1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; color: var(--muted); gap: 12px; text-align: center; }
   .empty svg { opacity: 0.3; }
   .empty p { font-size: 14px; }
+  /* ── Drag handle ── */
+  .widget-card { cursor: default; user-select: none; }
+  .widget-header { cursor: grab; }
+  .widget-header:active { cursor: grabbing; }
+  .widget-card.dragging { opacity: 0.5; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
+  .widget-card.drag-over { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  /* ── Log console ── */
+  .log-console {
+    height: 180px; flex-shrink: 0;
+    border-top: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    background: #0a0a0c;
+  }
+  .log-console-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-bottom: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0;
+  }
+  .log-console-title { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .log-console-clear { margin-left: auto; font-size: 10px; font-family: var(--mono); color: var(--muted); background: none; border: 1px solid var(--border); border-radius: 3px; padding: 2px 7px; cursor: pointer; transition: all 0.15s; }
+  .log-console-clear:hover { color: var(--text); border-color: var(--muted); }
+  .log-console-resize { height: 4px; background: var(--border); cursor: ns-resize; flex-shrink: 0; transition: background 0.15s; }
+  .log-console-resize:hover { background: var(--accent); }
+  .log-feed { flex: 1; overflow-y: auto; padding: 6px 12px; font-family: var(--mono); font-size: 11px; line-height: 1.6; }
+  .log-feed::-webkit-scrollbar { width: 3px; }
+  .log-feed::-webkit-scrollbar-thumb { background: var(--border); }
+  .log-entry { display: flex; gap: 8px; white-space: pre-wrap; word-break: break-all; }
+  .log-entry .log-ts { color: #3a3a4a; flex-shrink: 0; }
+  .log-entry.info  .log-msg { color: #a0a0b0; }
+  .log-entry.warn  .log-msg { color: #f59e0b; }
+  .log-entry.error .log-msg { color: #f87171; }
+  .log-entry.info  .log-lvl { color: #4a4a6a; }
+  .log-entry.warn  .log-lvl { color: #f59e0b; }
+  .log-entry.error .log-lvl { color: #f87171; }
   /* ── Reconnect bar ── */
   .reconnect-bar { display: none; padding: 8px 20px; background: rgba(229,57,53,0.1); border-top: 1px solid rgba(229,57,53,0.25); font-family: var(--mono); font-size: 11px; color: var(--accent); animation: blink 1s step-start infinite; }
   @keyframes blink { 50%{opacity:0} }
@@ -377,13 +460,15 @@ function _buildDashboardPage() {
   </header>
 
   <div class="dashboard-layout">
-    <main class="grid" id="widget-grid">
-      ${_widgets.size === 0 ? `
-      <div class="empty">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-        <p>No widgets registered yet.<br>Call <code>dashboard.registerWidget()</code> to add one.</p>
-      </div>` : ''}
-    </main>
+    <div class="grid" id="widget-grid-wrap">
+      <main class="grid-inner" id="widget-grid">
+        ${_widgets.size === 0 ? `
+        <div class="empty">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+          <p>No widgets registered yet.<br>Call <code>dashboard.registerWidget()</code> to add one.</p>
+        </div>` : ''}
+      </main>
+    </div>
 
     <aside class="chat-column">
       <div class="chat-column-header">
@@ -407,6 +492,15 @@ function _buildDashboardPage() {
     </aside>
   </div>
 
+  <div class="log-console" id="log-console">
+    <div class="log-console-resize" id="log-resize"></div>
+    <div class="log-console-header">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--muted)"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span class="log-console-title">Console</span>
+      <button class="log-console-clear" id="log-clear">Clear</button>
+    </div>
+    <div class="log-feed" id="log-feed"></div>
+  </div>
   <div class="reconnect-bar" id="reconnect-bar">⚠ Lost connection — reconnecting…</div>
 </div>
 
@@ -459,6 +553,7 @@ function _buildDashboardPage() {
     const card  = document.createElement('div');
     card.className = 'widget-card';
     card.id        = 'wcard-' + w.id;
+    card.draggable = true;
     card.innerHTML =
       '<div class="widget-header">' +
         '<span class="widget-icon">'  + w.icon          + '</span>' +
@@ -470,6 +565,41 @@ function _buildDashboardPage() {
     bodies[w.id] = card.querySelector('.widget-body');
     badges[w.id] = card.querySelector('.widget-badge');
   }
+
+  // ── Drag-and-drop reordering ─────────────────────────────────────────────
+  let dragSrc = null;
+  grid.addEventListener('dragstart', (e) => {
+    dragSrc = e.target.closest('.widget-card');
+    if (!dragSrc) return;
+    dragSrc.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', dragSrc.id);
+  });
+  grid.addEventListener('dragend', (e) => {
+    document.querySelectorAll('.widget-card').forEach(c => c.classList.remove('dragging', 'drag-over'));
+    dragSrc = null;
+  });
+  grid.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    const target = e.target.closest('.widget-card');
+    if (!target || target === dragSrc) return;
+    document.querySelectorAll('.widget-card').forEach(c => c.classList.remove('drag-over'));
+    target.classList.add('drag-over');
+  });
+  grid.addEventListener('dragleave', (e) => {
+    const target = e.target.closest('.widget-card');
+    if (target) target.classList.remove('drag-over');
+  });
+  grid.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const target = e.target.closest('.widget-card');
+    if (!target || !dragSrc || target === dragSrc) return;
+    target.classList.remove('drag-over');
+    // Insert dragSrc before or after target based on pointer position
+    const rect = target.getBoundingClientRect();
+    const after = e.clientY > rect.top + rect.height / 2;
+    grid.insertBefore(dragSrc, after ? target.nextSibling : target);
+  });
 
   function invoke(id, data) {
     if (!renderers[id] || !bodies[id]) return;
@@ -590,6 +720,51 @@ function _buildDashboardPage() {
     'chat-overlay-combined': 'combined',
   };
 
+  // ── Log console ──────────────────────────────────────────────────────────
+  const logFeed    = document.getElementById('log-feed');
+  const logClear   = document.getElementById('log-clear');
+  const logConsole = document.getElementById('log-console');
+  const logResize  = document.getElementById('log-resize');
+
+  function addLogEntry(entry) {
+    const atBottom = logFeed.scrollHeight - logFeed.scrollTop - logFeed.clientHeight < 40;
+    const row = document.createElement('div');
+    row.className = 'log-entry ' + (entry.level || 'info');
+    const ts = new Date(entry.ts);
+    const pad = n => String(n).padStart(2, '0');
+    const timeStr = pad(ts.getHours()) + ':' + pad(ts.getMinutes()) + ':' + pad(ts.getSeconds());
+    row.innerHTML =
+      '<span class="log-ts">' + timeStr + '</span>' +
+      '<span class="log-lvl">[' + (entry.level || 'info').toUpperCase().padEnd(5) + ']</span>' +
+      '<span class="log-msg">' + esc(entry.message) + '</span>';
+    logFeed.appendChild(row);
+    // Cap at 500 entries
+    while (logFeed.children.length > 500) logFeed.removeChild(logFeed.firstChild);
+    if (atBottom) logFeed.scrollTop = logFeed.scrollHeight;
+  }
+
+  logClear.addEventListener('click', () => { logFeed.innerHTML = ''; });
+
+  // Resizable console (drag the top border)
+  let resizing = false, resizeStartY = 0, resizeStartH = 0;
+  logResize.addEventListener('mousedown', (e) => {
+    resizing     = true;
+    resizeStartY = e.clientY;
+    resizeStartH = logConsole.offsetHeight;
+    document.body.style.cursor = 'ns-resize';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!resizing) return;
+    const delta = resizeStartY - e.clientY;
+    logConsole.style.height = Math.max(80, Math.min(600, resizeStartH + delta)) + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!resizing) return;
+    resizing = false;
+    document.body.style.cursor = '';
+  });
+
   // ── Moderation modal ─────────────────────────────────────────────────────
 
   const modOverlay  = document.getElementById('mod-overlay');
@@ -652,6 +827,8 @@ function _buildDashboardPage() {
           if (platform && msg.data && Array.isArray(msg.data.messages)) {
             pushChatMessages(platform, msg.data.messages);
           }
+        } else if (msg.type === 'log' && msg.entry) {
+          addLogEntry(msg.entry);
         }
       } catch {}
     };
@@ -744,6 +921,10 @@ async function handleRequest(req, res) {
     for (const [id, widget] of _widgets) {
       res.write(`data: ${JSON.stringify({ type: 'widget', id, data: widget.data })}\n\n`);
     }
+    // Flush buffered log entries
+    for (const entry of _logBuffer) {
+      res.write(`data: ${JSON.stringify({ type: 'log', entry })}\n\n`);
+    }
     _clients.add(res);
     req.on('close', () => _clients.delete(res));
     return true;
@@ -767,6 +948,9 @@ async function handleRequest(req, res) {
     if (username && platform && action) {
       log.info(`[dashboard] Moderation: ${action} ${username} on ${platform}${duration ? ' for ' + duration + 's' : ''}`);
       _broadcast({ type: 'moderate', username, platform, action, duration: duration ?? 0 });
+      _dispatchModerate(username, platform, action, duration ?? 0).catch(err => {
+        log.error('[dashboard] _dispatchModerate threw:', err.message);
+      });
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
@@ -809,4 +993,5 @@ module.exports = {
   updateWidget,
   handleRequest,
   mountOnOverlayServer,
+  onModerate,
 };

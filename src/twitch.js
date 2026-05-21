@@ -471,12 +471,27 @@ function handleEventSubNotification(type, event, queue) {
 
 async function twitchBan(platform, username, reason) {
   const broadcasterId = await getBroadcasterId();
+  // Resolve target user ID
   const userData = await helixRequest('GET', `/users?login=${username}`);
   const userId   = userData?.data?.[0]?.id;
   if (!userId) throw new Error(`User not found: ${username}`);
-  await helixRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
+  // Ban endpoint requires broadcaster/moderator user OAuth token, not app token
+  await helixUserRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
     data: { user_id: userId, reason: reason ?? '' },
   });
+  log.info(`[Twitch] Banned: ${username}`);
+}
+
+async function twitchTimeout(platform, username, duration, reason) {
+  const broadcasterId = await getBroadcasterId();
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  // Timeout is the same ban endpoint but with duration set
+  await helixUserRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
+    data: { user_id: userId, duration: Number(duration), reason: reason ?? '' },
+  });
+  log.info(`[Twitch] Timed out: ${username} for ${duration}s`);
 }
 
 async function twitchVip(platform, username) {
@@ -783,8 +798,9 @@ module.exports = {
   helixUserRequest,
   getBroadcasterId,
   modHandlers: {
-    ban:   twitchBan,
-    vip:   twitchVip,
-    unvip: twitchUnvip,
+    ban:     twitchBan,
+    timeout: twitchTimeout,
+    vip:     twitchVip,
+    unvip:   twitchUnvip,
   },
 };

@@ -19,6 +19,7 @@
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
+const twitch    = require('../twitch/index');   // adjust path if needed
 const queue = require('../../queue');
 const log   = require('../../logger');
 
@@ -445,6 +446,12 @@ function init(_context) {
   if (!queue?.onMessage) {
     log.warn('[chat-overlay] queue.onMessage not available — chat messages will not appear.');
     return;
+  }
+
+  // Wire dashboard moderation actions to Twitch mod handlers
+  if (twitch?.modHandlers) {
+    dashboard.onModerate(twitch.modHandlers);
+    log.info('[chat-overlay] Twitch mod handlers registered with dashboard');
   }
 
   queue.onMessage(msg => {
