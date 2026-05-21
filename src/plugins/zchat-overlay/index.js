@@ -4,17 +4,17 @@
  * chat-overlay plugin
  *
  * Serves three transparent OBS browser-source overlays:
- *   http://localhost:<OVERLAY_PORT>/yt_chat      — YouTube chat
- *   http://localhost:<OVERLAY_PORT>/twitch_chat  — Twitch chat
- *   http://localhost:<OVERLAY_PORT>/combined     — Both platforms interleaved
+ * http://localhost:<OVERLAY_PORT>/yt_chat      — YouTube chat
+ * http://localhost:<OVERLAY_PORT>/twitch_chat  — Twitch chat
+ * http://localhost:<OVERLAY_PORT>/combined     — Both platforms interleaved
  *
  * Messages scroll upward, newest at the bottom.
  * Each platform has its own accent colour; combined shows both with per-platform colouring.
  *
  * Env vars (all optional):
- *   CHAT_OVERLAY_MAX_MESSAGES   — max messages kept on screen (default: 30)
- *   CHAT_OVERLAY_FONT_SIZE      — base font size in px (default: 16)
- *   CHAT_OVERLAY_WIDTH          — widget width in px   (default: 420)
+ * CHAT_OVERLAY_MAX_MESSAGES   — max messages kept on screen (default: 30)
+ * CHAT_OVERLAY_FONT_SIZE      — base font size in px (default: 16)
+ * CHAT_OVERLAY_WIDTH          — widget width in px   (default: 420)
  */
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
@@ -54,7 +54,6 @@ let msgId = 0;
  * @returns {{ start:number, end:number, url:string }[]}
  */
 function parseTwitchEmotesTag(emotesTag) {
-  // FIX: Ensure emotesTag is a valid string before splitting
   if (!emotesTag || typeof emotesTag !== 'string') return [];
   
   const result = [];
@@ -73,16 +72,9 @@ function parseTwitchEmotesTag(emotesTag) {
 /**
  * Build a Segment[] from raw message text + Twitch emote ranges + YouTube emoji objects
  * + optional third-party emote word→url map (BTTV/FFZ/7TV).
- *
- * @param {string}  message           Raw UTF-16 message text
- * @param {string}  [emotesTag]       Twitch IRC emotes tag value
- * @param {Array<{altText:string, url:string, startIndex:number, endIndex:number}>} [ytEmotes]
- * @param {Record<string,string>} [thirdPartyEmotes]   word → CDN url
- * @returns {Segment[]}
  */
 function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
-  // Collect all char-level replacements from Twitch native + YouTube emotes
-  const replacements = []; // { start, end (exclusive), url, alt }
+  const replacements = [];
 
   for (const { start, end, url } of parseTwitchEmotesTag(emotesTag)) {
     replacements.push({ start, end: end + 1, url, alt: message.slice(start, end + 1) });
@@ -96,7 +88,6 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
     }
   }
 
-  // Sort and deduplicate (drop overlaps)
   replacements.sort((a, b) => a.start - b.start);
   const deduped = [];
   let cursor = 0;
@@ -104,7 +95,6 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
     if (r.start >= cursor) { deduped.push(r); cursor = r.end; }
   }
 
-  // Build initial segments
   const segments = /** @type {Segment[]} */ ([]);
   let pos = 0;
   for (const { start, end, url, alt } of deduped) {
@@ -114,7 +104,6 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
   }
   if (pos < message.length) segments.push({ type: 'text', text: message.slice(pos) });
 
-  // Third-party emote pass: split text segments on known emote words
   if (thirdPartyEmotes && Object.keys(thirdPartyEmotes).length) {
     const out = /** @type {Segment[]} */ ([]);
     for (const seg of segments) {
@@ -139,15 +128,6 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
   return segments.length ? segments : [{ type: 'text', text: message }];
 }
 
-/**
- * @param {'youtube'|'twitch'} platform
- * @param {string} username
- * @param {string} message
- * @param {string} [color]
- * @param {string} [emotesTag]          Twitch IRC emotes tag
- * @param {Array}  [ytEmotes]           YouTube emoji array
- * @param {Record<string,string>} [thirdPartyEmotes]
- */
 function pushMessage(platform, username, message, color, emotesTag, ytEmotes, thirdPartyEmotes) {
   const segments = buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes);
   const entry = { id: ++msgId, platform, username, message, color: color ?? '', segments };
@@ -170,16 +150,8 @@ for (const platform of ['youtube', 'twitch']) {
     title: isYT ? 'YouTube Chat' : 'Twitch Chat',
     order: isYT ? 10 : 11,
     icon: isYT
-      ? `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
-           <rect width="22" height="22" rx="5" fill="#FF0000"/>
-           <polygon points="9,7 16,11 9,15" fill="#fff"/>
-         </svg>`
-      : `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
-           <rect width="22" height="22" rx="5" fill="#9146FF"/>
-           <rect x="6" y="5" width="10" height="8" rx="1" fill="#fff"/>
-           <rect x="8" y="15" width="3" height="2" fill="#fff"/>
-           <rect x="11" y="15" width="3" height="2" fill="#fff"/>
-         </svg>`,
+      ? `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><rect width="22" height="22" rx="5" fill="#FF0000"/><polygon points="9,7 16,11 9,15" fill="#fff"/></svg>`
+      : `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><rect width="22" height="22" rx="5" fill="#9146FF"/><rect x="6" y="5" width="10" height="8" rx="1" fill="#fff"/><rect x="8" y="15" width="3" height="2" fill="#fff"/><rect x="11" y="15" width="3" height="2" fill="#fff"/></svg>`,
     render: (function render(data, el, esc, { badge }) {
       const count = data?.messages?.length ?? 0;
       badge.textContent = count + ' msgs';
@@ -196,13 +168,7 @@ for (const platform of ['youtube', 'twitch']) {
 registerSection('chat-overlay-combined', {
   title: 'Combined Chat',
   order: 12,
-  icon: `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
-    <rect width="22" height="22" rx="5" fill="#333"/>
-    <rect x="3" y="3" width="7" height="7" rx="1" fill="#FF0000"/>
-    <rect x="12" y="3" width="7" height="7" rx="1" fill="#9146FF"/>
-    <rect x="3" y="12" width="16" height="2" rx="1" fill="#fff" opacity="0.5"/>
-    <rect x="3" y="16" width="10" height="2" rx="1" fill="#fff" opacity="0.3"/>
-  </svg>`,
+  icon: `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><rect width="22" height="22" rx="5" fill="#333"/><rect x="3" y="3" width="7" height="7" rx="1" fill="#FF0000"/><rect x="12" y="3" width="7" height="7" rx="1" fill="#9146FF"/><rect x="3" y="12" width="16" height="2" rx="1" fill="#fff" opacity="0.5"/><rect x="3" y="16" width="10" height="2" rx="1" fill="#fff" opacity="0.3"/></svg>`,
   render: (function render(data, el, esc, { badge }) {
     const count = data?.messages?.length ?? 0;
     badge.textContent = count + ' msgs';
@@ -217,14 +183,9 @@ updateSection('chat-overlay-combined', { messages: [] });
 
 // ─── HTML builder ─────────────────────────────────────────────────────────────
 
-/**
- * Build the overlay page HTML.
- * @param {'youtube'|'twitch'|'combined'} mode
- */
 function buildPage(mode) {
   const isCombined = mode === 'combined';
   const title      = isCombined ? 'Combined Chat Overlay' : (mode === 'youtube' ? 'YouTube' : 'Twitch') + ' Chat Overlay';
-  // For single-platform pages the accent is fixed; for combined it's overridden per-message in JS.
   const accentHex  = isCombined ? '#ffffff' : ACCENT[mode];
   const sseId      = isCombined ? 'chat-overlay-combined' : `chat-overlay-${mode}`;
 
@@ -241,6 +202,7 @@ function buildPage(mode) {
   html, body {
     background: transparent;
     width: ${WIDTH}px;
+    height: 100vh; /* Force full height so column alignment works at the bottom */
     overflow: hidden;
     font-family: 'Inter', sans-serif;
     font-size: ${FONT_SIZE}px;
@@ -249,10 +211,11 @@ function buildPage(mode) {
   #feed {
     display: flex;
     flex-direction: column;
-    justify-content: flex-end;
+    justify-content: flex-end; /* Keeps messages glued to the bottom */
     gap: 5px;
     padding: 8px;
     width: 100%;
+    height: 100%;
   }
 
   .msg {
@@ -263,6 +226,13 @@ function buildPage(mode) {
     max-width: 100%;
     white-space: nowrap;
     overflow: hidden;
+    transition: opacity 0.5s ease, transform 0.5s ease; /* Smooth transition when fading out */
+  }
+
+  /* When this class is added, the element transitions out smoothly */
+  .msg.fade-out {
+    opacity: 0;
+    transform: translateY(-4px);
   }
 
   @keyframes fadeSlideIn {
@@ -315,6 +285,7 @@ function buildPage(mode) {
   var SSE_ID    = '${sseId}';
   var COMBINED  = ${isCombined};
   var ACCENTS   = { youtube: '#FF0000', twitch: '#9146FF' };
+  var TIMEOUT_MS = 20000; // 20 seconds before disappearing
 
   function appendMessage(msg) {
     var row = document.createElement('div');
@@ -323,7 +294,6 @@ function buildPage(mode) {
 
     var nameEl = document.createElement('span');
     nameEl.className = 'username';
-    // Per-user Twitch colour takes priority; fall back to platform accent for combined
     var nameColor = msg.color || (COMBINED ? (ACCENTS[msg.platform] || '#ffffff') : null);
     if (nameColor) {
       nameEl.style.color = nameColor;
@@ -338,7 +308,6 @@ function buildPage(mode) {
     var textEl = document.createElement('span');
     textEl.className = 'text';
 
-    // Render pre-parsed segments (text nodes + emote <img>s) when available
     var segments = msg.segments;
     if (Array.isArray(segments) && segments.length) {
       for (var i = 0; i < segments.length; i++) {
@@ -362,6 +331,17 @@ function buildPage(mode) {
     row.appendChild(sep);
     row.appendChild(textEl);
     feed.appendChild(row);
+
+    // Set expiration timer to fade out and remove the row
+    setTimeout(function() {
+      row.classList.add('fade-out');
+      // Wait for the opacity CSS transition to finish before dropping DOM node
+      setTimeout(function() {
+        if (row.parentNode === feed) {
+          feed.removeChild(row);
+        }
+      }, 500);
+    }, TIMEOUT_MS);
 
     while (feed.children.length > MAX) {
       feed.removeChild(feed.firstChild);
@@ -419,7 +399,6 @@ function init(_context) {
   }
 
   queue.onMessage(msg => {
-    // Ensure msg exists to avoid destructuring errors
     if (!msg) return; 
 
     const { platform, username, message, color, emotes, ytEmotes, thirdPartyEmotes } = msg;
@@ -431,7 +410,6 @@ function init(_context) {
     }
     
     if (platform === 'twitch') {
-      // Ensure emotes is passed as a string or undefined to the pushMessage helper
       const twitchEmotes = typeof emotes === 'string' ? emotes : undefined;
       pushMessage('twitch', username, message, color, twitchEmotes, undefined, thirdPartyEmotes);
     }
