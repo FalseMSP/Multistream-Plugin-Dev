@@ -19,7 +19,7 @@
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
-const twitch    = require('../twitch/index');   // adjust path if needed
+const twitch    = require('../../twitch'); 
 const queue = require('../../queue');
 const log   = require('../../logger');
 
