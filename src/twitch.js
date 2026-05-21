@@ -28,42 +28,40 @@ async function _fetchThirdPartyEmotes(channelLogin) {
   const { default: fetch } = await import('node-fetch');
   const map = {};
 
-  // BTTV global
+  // Strip any leading '#' that tmi.js channel names may have
+  const login = channelLogin ? channelLogin.replace(/^#/, '').toLowerCase() : null;
+
+  // ── BTTV global ──────────────────────────────────────────────────────────
   try {
     const r = await fetch('https://api.betterttv.net/3/cached/emotes/global');
-    const d = await r.json();
-    if (Array.isArray(d)) {
-      for (const e of d) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+    if (r.ok) {
+      const d = await r.json();
+      if (Array.isArray(d)) {
+        for (const e of d) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+      }
     }
   } catch (err) { log.warn('[Twitch] BTTV global fetch failed:', err.message); }
 
-  // BTTV channel
-  if (channelLogin) {
+  // ── BTTV channel ─────────────────────────────────────────────────────────
+  if (login) {
     try {
-      const userId = await _resolveUserId(channelLogin);
-      const r = await fetch(`https://api.betterttv.net/3/cached/users/twitch/${userId}`);
-      const d = await r.json();
-      const emotes = [...(d.channelEmotes ?? []), ...(d.sharedEmotes ?? [])];
-      for (const e of emotes) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+      const userId = await _resolveUserId(login);
+      if (userId) {
+        const r = await fetch(`https://api.betterttv.net/3/cached/users/twitch/${userId}`);
+        if (r.ok) {
+          const d = await r.json();
+          const emotes = [...(d.channelEmotes ?? []), ...(d.sharedEmotes ?? [])];
+          for (const e of emotes) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+          log.info(`[Twitch] BTTV channel: loaded ${emotes.length} emotes for ${login}`);
+        }
+      }
     } catch (err) { log.warn('[Twitch] BTTV channel fetch failed:', err.message); }
   }
 
-  // FFZ global
+  // ── FFZ global ───────────────────────────────────────────────────────────
   try {
     const r = await fetch('https://api.frankerfacez.com/v1/set/global');
-    const d = await r.json();
-    for (const set of Object.values(d.sets ?? {})) {
-      for (const e of (set.emoticons ?? [])) {
-        const url = e.urls?.['2'] ?? e.urls?.['1'];
-        if (url) map[e.name] = url.startsWith('//') ? 'https:' + url : url;
-      }
-    }
-  } catch (err) { log.warn('[Twitch] FFZ global fetch failed:', err.message); }
-
-  // FFZ channel
-  if (channelLogin) {
-    try {
-      const r = await fetch(`https://api.frankerfacez.com/v1/room/${channelLogin}`);
+    if (r.ok) {
       const d = await r.json();
       for (const set of Object.values(d.sets ?? {})) {
         for (const e of (set.emoticons ?? [])) {
@@ -71,43 +69,84 @@ async function _fetchThirdPartyEmotes(channelLogin) {
           if (url) map[e.name] = url.startsWith('//') ? 'https:' + url : url;
         }
       }
+    }
+  } catch (err) { log.warn('[Twitch] FFZ global fetch failed:', err.message); }
+
+  // ── FFZ channel ──────────────────────────────────────────────────────────
+  if (login) {
+    try {
+      const r = await fetch(`https://api.frankerfacez.com/v1/room/${login}`);
+      if (r.ok) {
+        const d = await r.json();
+        let count = 0;
+        for (const set of Object.values(d.sets ?? {})) {
+          for (const e of (set.emoticons ?? [])) {
+            const url = e.urls?.['2'] ?? e.urls?.['1'];
+            if (url) { map[e.name] = url.startsWith('//') ? 'https:' + url : url; count++; }
+          }
+        }
+        log.info(`[Twitch] FFZ channel: loaded ${count} emotes for ${login}`);
+      }
     } catch (err) { log.warn('[Twitch] FFZ channel fetch failed:', err.message); }
   }
 
-  // 7TV global
+  // ── 7TV global ───────────────────────────────────────────────────────────
   try {
     const r = await fetch('https://7tv.io/v3/emote-sets/global');
-    const d = await r.json();
-    for (const e of (d.emotes ?? [])) {
-      const file = e.data?.host?.files?.find(f => f.name === '2x.webp') ?? e.data?.host?.files?.[0];
-      if (file) map[e.name] = `https:${e.data.host.url}/${file.name}`;
+    if (r.ok) {
+      const d = await r.json();
+      for (const e of (d.emotes ?? [])) {
+        const host = e.data?.host;
+        if (!host) continue;
+        const file = host.files?.find(f => f.name === '2x.webp') ?? host.files?.find(f => f.name === '2x.avif') ?? host.files?.[0];
+        if (file) map[e.name] = `https:${host.url}/${file.name}`;
+      }
     }
   } catch (err) { log.warn('[Twitch] 7TV global fetch failed:', err.message); }
 
-  // 7TV channel
-  if (channelLogin) {
+  // ── 7TV channel ──────────────────────────────────────────────────────────
+  // The v3 endpoint is GET /v3/users/twitch/:twitch_user_id
+  // Response: { emote_set: { emotes: [{ name, data: { host: { url, files } } }] } }
+  if (login) {
     try {
-      const userId = await _resolveUserId(channelLogin);
-      const r = await fetch(`https://7tv.io/v3/users/twitch/${userId}`);
-      const d = await r.json();
-      for (const e of (d.emote_set?.emotes ?? [])) {
-        const file = e.data?.host?.files?.find(f => f.name === '2x.webp') ?? e.data?.host?.files?.[0];
-        if (file) map[e.name] = `https:${e.data.host.url}/${file.name}`;
+      const userId = await _resolveUserId(login);
+      if (userId) {
+        const r = await fetch(`https://7tv.io/v3/users/twitch/${userId}`);
+        if (r.ok) {
+          const d = await r.json();
+          const emotes = d.emote_set?.emotes ?? [];
+          let count = 0;
+          for (const e of emotes) {
+            const host = e.data?.host;
+            if (!host) continue;
+            const file = host.files?.find(f => f.name === '2x.webp') ?? host.files?.find(f => f.name === '2x.avif') ?? host.files?.[0];
+            if (file) { map[e.name] = `https:${host.url}/${file.name}`; count++; }
+          }
+          log.info(`[Twitch] 7TV channel: loaded ${count} emotes for ${login}`);
+        } else {
+          log.warn(`[Twitch] 7TV channel fetch returned ${r.status} for ${login}`);
+        }
       }
     } catch (err) { log.warn('[Twitch] 7TV channel fetch failed:', err.message); }
   }
 
   const count = Object.keys(map).length;
-  log.info(`[Twitch] Third-party emotes loaded: ${count} (BTTV + FFZ + 7TV)`);
+  log.info(`[Twitch] Third-party emotes loaded: ${count} total (BTTV + FFZ + 7TV)`);
   _thirdPartyEmotes = map;
 }
 
-/** Cache the broadcaster's numeric user ID so emote fetches don't re-hit the API */
+/** Cache the broadcaster's numeric user ID so emote fetches don't re-hit the Helix API */
 let _broadcasterUserId = null;
 async function _resolveUserId(login) {
   if (_broadcasterUserId) return _broadcasterUserId;
-  const data = await helixRequest('GET', `/users?login=${login}`);
-  _broadcasterUserId = data?.data?.[0]?.id ?? null;
+  try {
+    const data = await helixRequest('GET', `/users?login=${login}`);
+    _broadcasterUserId = data?.data?.[0]?.id ?? null;
+    if (_broadcasterUserId) log.info(`[Twitch] Resolved user ID for ${login}: ${_broadcasterUserId}`);
+    else log.warn(`[Twitch] Could not resolve user ID for login: ${login}`);
+  } catch (err) {
+    log.warn(`[Twitch] _resolveUserId failed for ${login}:`, err.message);
+  }
   return _broadcasterUserId;
 }
 
