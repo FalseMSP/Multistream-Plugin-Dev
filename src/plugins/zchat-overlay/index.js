@@ -224,11 +224,10 @@ function buildPage(mode) {
 
   .msg {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 5px;
-    animation: fadeSlideIn 0.25s ease forwards;
+    animation: fadeSlideIn 0.25s ease;
     max-width: 100%;
-    white-space: nowrap;
     overflow: hidden;
     transition:
       opacity 0.8s ease,
@@ -263,12 +262,12 @@ function buildPage(mode) {
     color: #f0f0f0;
     font-size: 1em;
     text-shadow: 0 1px 3px rgba(0,0,0,0.9);
-    overflow: hidden;
-    text-overflow: ellipsis;
     display: inline-flex;
     align-items: center;
     gap: 2px;
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
+    word-break: break-word;
+    min-width: 0;
   }
 
   .emote {
@@ -305,6 +304,12 @@ function buildPage(mode) {
     var row = document.createElement('div');
     row.className = 'msg';
     row.dataset.id = msg.id;
+
+    // Once the entrance animation completes, remove it so the transition
+    // can properly animate opacity/transform on fade-out
+    row.addEventListener('animationend', function () {
+      row.style.animation = 'none';
+    }, { once: true });
 
     var nameEl = document.createElement('span');
     nameEl.className = 'username';
