@@ -54,7 +54,9 @@ let msgId = 0;
  * @returns {{ start:number, end:number, url:string }[]}
  */
 function parseTwitchEmotesTag(emotesTag) {
-  if (!emotesTag) return [];
+  // FIX: Ensure emotesTag is a valid string before splitting
+  if (!emotesTag || typeof emotesTag !== 'string') return [];
+  
   const result = [];
   for (const part of emotesTag.split('/')) {
     const [id, positions] = part.split(':');
@@ -417,17 +419,21 @@ function init(_context) {
   }
 
   queue.onMessage(msg => {
-    const { platform, username, message, color, emotes, ytEmotes, thirdPartyEmotes } = msg ?? {};
+    // Ensure msg exists to avoid destructuring errors
+    if (!msg) return; 
+
+    const { platform, username, message, color, emotes, ytEmotes, thirdPartyEmotes } = msg;
     if (!message || !username) return;
 
     if (platform === 'youtube') {
-      // `ytEmotes` is an array of YouTube emoji objects; `emotes` is the fallback field name
       pushMessage('youtube', username, message, color, undefined, ytEmotes ?? emotes, thirdPartyEmotes);
       return;
     }
+    
     if (platform === 'twitch') {
-      // `emotes` is the raw Twitch IRC emotes tag string; `thirdPartyEmotes` is a BTTV/FFZ/7TV word→url map
-      pushMessage('twitch', username, message, color, emotes, undefined, thirdPartyEmotes);
+      // Ensure emotes is passed as a string or undefined to the pushMessage helper
+      const twitchEmotes = typeof emotes === 'string' ? emotes : undefined;
+      pushMessage('twitch', username, message, color, twitchEmotes, undefined, thirdPartyEmotes);
     }
   });
 }
