@@ -378,7 +378,13 @@ async function startTwitch(queue) {
       return;
     }
     log.debug(`[Twitch] Chat [${channel}] ${username}: ${message}`);
-    queue.pushMessage({ platform: 'twitch', username, message });
+    queue.pushMessage({
+      platform: 'twitch',
+      username,
+      message,
+      color:  tags['color'] ?? '',
+      emotes: tags['emotes'] ?? '',   // e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
+    });
   });
 
   // ── Twitch watch-streak share (USERNOTICE msg-id=viewermilestone) ────────
