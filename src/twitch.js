@@ -545,7 +545,7 @@ async function startTwitch(queue) {
       username,
       message,
       color:           tags['color'] ?? '',
-      emotes:          tags['emotes'] ?? '',   // e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
+      emotes:          tags['emotes-raw'] ?? '',   // raw string e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
       thirdPartyEmotes: _thirdPartyEmotes,
     });
   });

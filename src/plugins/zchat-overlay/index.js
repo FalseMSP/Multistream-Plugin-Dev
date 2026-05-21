@@ -443,8 +443,7 @@ function init(_context) {
     }
     
     if (platform === 'twitch') {
-      const twitchEmotes = typeof emotes === 'string' ? emotes : undefined;
-      pushMessage('twitch', username, message, color, twitchEmotes, undefined, thirdPartyEmotes);
+      pushMessage('twitch', username, message, color, emotes || undefined, undefined, thirdPartyEmotes);
     }
   });
 }
