@@ -5,30 +5,21 @@
  * ──────────────
  * Chat reading strategy (in priority order):
  *
- *  1. masterchat fetchChatPage loop  ← PRIMARY (lowest latency, ~1-3 s)
- *     Mimics YouTube's own browser player by calling the internal
- *     /youtubei/v1/live_chat/get_live_chat endpoint directly.
- *     Runs a pipelined dual-lane fetch: while one response is being
- *     dispatched the next fetch is already in-flight, so processing
- *     time adds zero latency to the cycle.
- *     Two lanes run with a half-interval phase offset and deduplicate
- *     by message ID, halving average message wait time.
+ * 1. masterchat fetchChatPage loop  ← PRIMARY (lowest latency, ~1-3 s)
+ * Mimics YouTube's own browser player by calling the internal
+ * /youtubei/v1/live_chat/get_live_chat endpoint directly.
+ * Runs a pipelined dual-lane fetch: while one response is being
+ * dispatched the next fetch is already in-flight, so processing
+ * time adds zero latency to the cycle.
+ * Two lanes run with a half-interval phase offset and deduplicate
+ * by message ID, halving average message wait time.
  *
- *  2. YouTube Data API v3  ← MOD ACTIONS ONLY (ban/timeout/vip/unvip)
- *     liveChatMessages.list is never used for reading chat any more.
- *     It is only used as a slow-path fallback for _resolveChannelId
- *     when a user has not yet spoken (participant cache miss).
- *     Quota tracker retained; if quota is exhausted the channel-ID
- *     scan falls back gracefully with a clear error.
- *
- * Latency stack vs Streamlabs:
- *  • masterchat hits the same internal YT endpoint the web player uses
- *  • Pipelined dual-lane fetch cuts average latency ~50% vs single-lane
- *  • No pollingIntervalMillis floor — masterchat honours YT's continuation
- *    timeoutMs which is typically 0-2 s on active streams
- *  • Participant cache (displayName→channelId) populated from every message;
- *    ban/timeout/vip resolve in O(1) with zero API calls
- *  • node-fetch hoisted, OAuth + youtube client cached, liveChatId cached
+ * 2. YouTube Data API v3  ← MOD ACTIONS ONLY (ban/timeout/vip/unvip)
+ * liveChatMessages.list is never used for reading chat any more.
+ * It is only used as a slow-path fallback for _resolveChannelId
+ * when a user has not yet spoken (participant cache miss).
+ * Quota tracker retained; if quota is exhausted the channel-ID
+ * scan falls back gracefully with a clear error.
  */
 
 const log = require('./logger');
@@ -50,7 +41,7 @@ _getFetch().catch(() => {});
 
 // ── Quota tracker (Data API only — not used for chat reading) ─────────────
 
-const QUOTA_PER_SCAN_CALL = 5;   // liveChatMessages.list for channel-ID scans
+const QUOTA_PER_SCAN_CALL = 5;   
 const QUOTA_DAILY_LIMIT   = parseInt(process.env.YT_QUOTA_LIMIT ?? '100000', 10);
 
 function _nextMidnightPacific() {
@@ -85,51 +76,46 @@ function _hasQuota() {
 }
 
 // ── Active sessions ───────────────────────────────────────────────────────
-// Each entry: { type: 'masterchat', mc, liveChatId }
+// Holds per-session state for participant caches, dedup, and timers
 
 const _activeSessions = new Map();
 const MAX_RETRY_DELAY = 5 * 60 * 1000;
 
-// ── Participant cache ─────────────────────────────────────────────────────
-// displayName.toLowerCase() → channelId
-// Populated from every chat message. Makes mod actions O(1)/zero-network
-// for any user who has spoken during the session.
-
-const _participantCache = new Map();
-
-function _cacheParticipant(displayName, channelId) {
-  if (displayName && channelId) _participantCache.set(displayName.toLowerCase(), channelId);
+function _createSession(videoId) {
+  return {
+    type: 'masterchat',
+    mc: null,
+    liveChatId: null,
+    stopSignal: { stopped: false },
+    participantCache: new Map(),
+    dedup: {
+      seenIds: new Set(),
+      seenRing: []
+    },
+    likePollerTimer: null,
+    lastKnownLikeCount: null
+  };
 }
 
-function _evictParticipantCache() {
-  _participantCache.clear();
-  log.info('[YouTube] Participant cache evicted.');
-}
+// ── Per-Session Helpers ───────────────────────────────────────────────────
 
-// ── Message deduplication ─────────────────────────────────────────────────
-// The dual-lane poller runs two overlapping fetches. Each lane uses its own
-// continuation token so they follow independent paths through YouTube's chat
-// pagination, but they will occasionally return the same message. We dedup
-// by message ID using a bounded ring buffer so memory doesn't grow unbounded
-// during long streams.
+function _cacheParticipant(session, displayName, channelId) {
+  if (displayName && channelId) {
+    session.participantCache.set(displayName.toLowerCase(), channelId);
+  }
+}
 
 const DEDUP_RING_SIZE = 2000;
-const _seenIds        = new Set();
-const _seenRing       = [];          // insertion-order ring for eviction
 
-function _isDuplicate(id) {
-  if (_seenIds.has(id)) return true;
-  _seenIds.add(id);
-  _seenRing.push(id);
-  if (_seenRing.length > DEDUP_RING_SIZE) {
-    _seenIds.delete(_seenRing.shift());
+function _isDuplicate(session, id) {
+  const { seenIds, seenRing } = session.dedup;
+  if (seenIds.has(id)) return true;
+  seenIds.add(id);
+  seenRing.push(id);
+  if (seenRing.length > DEDUP_RING_SIZE) {
+    seenIds.delete(seenRing.shift());
   }
   return false;
-}
-
-function _resetDedup() {
-  _seenIds.clear();
-  _seenRing.length = 0;
 }
 
 // ── OAuth / googleapis cache ──────────────────────────────────────────────
@@ -172,8 +158,6 @@ function _getYoutubeClient() {
 }
 
 // ── Data API: live chat ID lookup (1 quota unit) ──────────────────────────
-// Only used at session start (to get liveChatId for mod actions) and as
-// fallback in _resolveActiveLiveChatId when no session is running.
 
 async function _getLiveChatId(videoId) {
   const fetch = await _getFetch();
@@ -186,62 +170,34 @@ async function _getLiveChatId(videoId) {
 }
 
 // ── Pipelined dual-lane masterchat reader ─────────────────────────────────
-//
-// Architecture:
-//
-//   Lane A: ──fetch──▶ dispatch ──fetch──▶ dispatch ──▶ …
-//   Lane B: ────────fetch──▶ dispatch ──fetch──▶ dispatch ──▶ …
-//           ←──── phaseOffsetMs ────▶
-//
-// Each lane independently calls mc.fetchChatPage() and immediately fires
-// the NEXT fetch before dispatching the current batch. This means network
-// round-trip time overlaps with JS dispatch time — processing cost is hidden.
-//
-// Both lanes share the same masterchat instance (safe: fetchChatPage is
-// stateless w.r.t. the mc object; continuation tokens are returned per-call
-// and threaded explicitly). Messages are deduplicated by ID.
-//
-// timeoutMs from YouTube's response is the server's requested delay before
-// the next poll. We honour it but clamp to [MIN_FETCH_MS, MAX_FETCH_MS].
-// On active streams YT typically returns timeoutMs = 0, giving ~RTT latency.
 
-const MIN_FETCH_MS     = 500;    // never hammer faster than this
-const MAX_FETCH_MS     = 4_000;  // ignore YouTube's 10-15 s suggestion; cap at 4 s
-const PHASE_OFFSET_MS  = 2_000;  // lane B starts 2 s after lane A (half of MAX_FETCH_MS)
+const MIN_FETCH_MS     = 500;
+const MAX_FETCH_MS     = 4_000;
+const PHASE_OFFSET_MS  = 2_000;
 
-async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
-  // fetch() returns { actions, continuation } where continuation has
-  // { token, timeoutMs }. We thread token explicitly so both lanes advance
-  // independently. timeoutMs is honoured but capped at MAX_FETCH_MS.
-  let continuation = undefined;  // undefined = let masterchat use its default
+async function _runFetchLane(laneId, session, queue, isFirstLane) {
+  let continuation = undefined;
+  if (!isFirstLane) await new Promise(r => setTimeout(r, PHASE_OFFSET_MS));
 
-  // Stagger lane B so it's out of phase with lane A
-  if (!isFirstLane) {
-    await new Promise(r => setTimeout(r, PHASE_OFFSET_MS));
-  }
-
-  // On the very first fetch we skip dispatch to avoid replaying history.
-  // We still need the continuation token though, so we always fetch once.
   let skipDispatch = true;
   let _fetchWarnCount = 0;
 
-  while (!stopSignal.stopped) {
+  while (!session.stopSignal.stopped) {
     let result;
     const fetchStart = Date.now();
 
     try {
-      result = await mc.fetch(continuation?.token);
+      result = await session.mc.fetch(continuation?.token);
     } catch (err) {
-      if (stopSignal.stopped) return;
+      if (session.stopSignal.stopped) return;
 
-      // Terminal errors — stream is over, no point retrying
       if (
         /chat is disabled for this live stream/i.test(err.message) ||
         /this live event has ended/i.test(err.message) ||
         /no longer live/i.test(err.message)
       ) {
         log.info(`[YouTube] Lane ${laneId}: stream ended (${err.message}) — stopping lane`);
-        stopSignal.stopped = true;
+        session.stopSignal.stopped = true;
         return;
       }
 
@@ -252,50 +208,31 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
       continue;
     }
 
-    if (stopSignal.stopped) return;
+    if (session.stopSignal.stopped) return;
 
-    // Extract continuation for the NEXT call before doing anything else,
-    // then schedule the wait — dispatch runs concurrently with the timer.
     const nextContinuation = result?.continuation;
-    // Honour YouTube's timeoutMs so we don't poll too fast and get rate-limited,
-    // but cap it at MAX_FETCH_MS — YouTube can return 10-15 s even on active streams.
     const timeoutMs = Math.max(
       MIN_FETCH_MS,
       Math.min(nextContinuation?.timeoutMs ?? MAX_FETCH_MS, MAX_FETCH_MS),
     );
 
-    // Update for next iteration
     continuation = nextContinuation;
 
     if (!skipDispatch) {
       for (const action of result?.actions ?? []) {
-        // masterchat returns pre-parsed typed action objects.
-
-        // ── Named subscribe / member events ──────────────────────────────
-        // Actual type strings from masterchat source (verified):
-        //   addMembershipItemAction          — new channel member
-        //   addMembershipMilestoneItemAction — membership milestone chat
-        //   membershipGiftPurchaseAction     — gifted memberships (action.amount = seat count)
-        // We skip membershipGiftRedemptionAction (individual recipient) because
-        // the purchase action already accounts for the full seat count.
         if (
           action.type === 'addMembershipItemAction' ||
           action.type === 'addMembershipMilestoneItemAction' ||
           action.type === 'membershipGiftPurchaseAction'
         ) {
           const id = action.id;
-          if (id && _isDuplicate(id)) continue;
+          if (id && _isDuplicate(session, id)) continue;
 
           const displayName = action.authorName ?? null;
           const channelId   = action.authorChannelId ?? null;
-          if (displayName && channelId) _cacheParticipant(displayName, channelId);
+          _cacheParticipant(session, displayName, channelId);
 
-          // Gift purchases carry the seat count in action.amount
-          const giftCount =
-            action.type === 'membershipGiftPurchaseAction'
-              ? (action.amount ?? 1)
-              : 1;
-
+          const giftCount = action.type === 'membershipGiftPurchaseAction' ? (action.amount ?? 1) : 1;
           _namedSubThisCycle += giftCount;
 
           log.info(
@@ -304,18 +241,12 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
             (giftCount > 1 ? ` x${giftCount}` : '')
           );
 
-          // Emit one event per seat. username is null when name unavailable.
           for (let i = 0; i < giftCount; i++) {
-            queue.pushMessage({
-              platform: 'youtube',
-              type:     'subscribe',
-              username: displayName ?? null,
-            });
+            queue.pushMessage({ platform: 'youtube', type: 'subscribe', username: displayName ?? null });
           }
           continue;
         }
 
-        // ── Regular chat messages ─────────────────────────────────────────
         if (action.type !== 'addChatItemAction') continue;
 
         const id          = action.id;
@@ -323,29 +254,25 @@ async function _runFetchLane(laneId, mc, queue, isFirstLane, stopSignal) {
         const channelId   = action.authorChannelId ?? null;
         const message     = _stringifyRuns(action.message);
 
-        _cacheParticipant(displayName, channelId);
+        _cacheParticipant(session, displayName, channelId);
 
-        if (!id || _isDuplicate(id) || !message) continue;
+        if (!id || _isDuplicate(session, id) || !message) continue;
         queue.pushMessage({ platform: 'youtube', username: displayName, message });
       }
     } else {
-      // Still cache authors from the historical first page
       for (const action of result?.actions ?? []) {
         if (action.type !== 'addChatItemAction') continue;
-        _cacheParticipant(action.authorName, action.authorChannelId);
+        _cacheParticipant(session, action.authorName, action.authorChannelId);
       }
       skipDispatch = false;
     }
 
-    // Honour YouTube's requested delay before the next fetch
     const elapsed = Date.now() - fetchStart;
     const wait    = Math.max(0, timeoutMs - elapsed);
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
   }
 }
 
-// Minimal run-array → plain string converter.
-// masterchat's full stringify handles emoji/superchats; we only need text.
 function _stringifyRuns(runs) {
   if (!runs) return '';
   return runs
@@ -379,11 +306,6 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     return;
   }
 
-  // Resolve liveChatId now while we have mc; store on the session so mod
-  // actions never need to re-fetch or re-scrape.
-  // mc.liveChatId can be null on fresh streams if YT's page payload didn't
-  // include it in the scraped continuation data (a timing/variant issue, not
-  // a permissions problem). Fall back to the Data API when that happens.
   let liveChatId = mc.liveChatId ?? null;
   if (!liveChatId && YT_API_KEY) {
     try {
@@ -393,35 +315,28 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
       log.warn(`[YouTube] Could not resolve liveChatId via Data API: ${err.message}`);
     }
   }
-  if (!liveChatId) {
-    log.warn(`[YouTube] liveChatId still null for ${videoId} — mod actions and say() will resolve lazily on first use`);
-  }
 
-  const stopSignal = { stopped: false };
+  const session = _activeSessions.get(videoId);
+  session.mc = mc;
+  session.liveChatId = liveChatId;
 
-  _activeSessions.set(videoId, { type: 'masterchat', mc, liveChatId, stopSignal });
-  _sayLiveChatId = null; // force say() to re-resolve for the new stream
   log.info(`[YouTube] masterchat connected for video=${videoId} liveChatId=${liveChatId}`);
   log.info(`[YouTube] Starting dual-lane pipelined chat reader`);
-  _startLikePoller(videoId, queue);
+  _startLikePoller(videoId, session, queue);
 
-  // Run both lanes concurrently. Neither lane throws — errors are caught
-  // internally and retried. We watch for stream-end via mc events.
-  const laneA = _runFetchLane('A', mc, queue, true,  stopSignal);
-  const laneB = _runFetchLane('B', mc, queue, false, stopSignal);
+  const laneA = _runFetchLane('A', session, queue, true);
+  const laneB = _runFetchLane('B', session, queue, false);
 
-  // Handle stream end / errors via masterchat events (still reliable for
-  // signalling even though we no longer use mc.listen() for chat).
   mc.on('end', () => {
     log.info(`[YouTube] Stream ended for ${videoId}`);
-    stopSignal.stopped = true;
-    _activeSessions.delete(videoId);
-    _sayLiveChatId = null;
-    _evictParticipantCache();
-    _resetDedup();
-    _namedSubThisCycle = 0;
-    module.exports.stopLikePoller();
-    if (YT_VIDEO_ID) {
+    const activeSession = _activeSessions.get(videoId);
+    if (activeSession) {
+      activeSession.stopSignal.stopped = true;
+      if (activeSession.likePollerTimer) clearInterval(activeSession.likePollerTimer);
+      _activeSessions.delete(videoId);
+    }
+    
+    if (YT_VIDEO_ID === videoId) {
       log.info('[YouTube] Static override — retrying in 15 s…');
       setTimeout(() => _startSession(videoId, queue), 15_000);
     }
@@ -429,35 +344,35 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
 
   mc.on('error', (err) => {
     log.error(`[YouTube] masterchat error (${videoId}): ${err.message}`);
-    stopSignal.stopped = true;
-    _activeSessions.delete(videoId);
-    _sayLiveChatId = null;
-    _evictParticipantCache();
-    _resetDedup();
-    _namedSubThisCycle = 0;
-    module.exports.stopLikePoller();
+    const activeSession = _activeSessions.get(videoId);
+    if (activeSession) {
+      activeSession.stopSignal.stopped = true;
+      if (activeSession.likePollerTimer) clearInterval(activeSession.likePollerTimer);
+      _activeSessions.delete(videoId);
+    }
+
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
     setTimeout(() => _startMasterchatSession(videoId, queue, nextDelay), nextDelay);
   });
 
-  // Keep the async context alive so the lanes don't get GC'd.
-  // We intentionally don't await — fire-and-forget, errors handled above.
   Promise.all([laneA, laneB]).catch((err) => {
     log.error(`[YouTube] Unhandled lane error for ${videoId}: ${err.message}`);
   });
 }
 
 async function _startMasterchatSession(videoId, queue, retryDelay = 5_000) {
-  if (_activeSessions.has(videoId)) return;
-  _activeSessions.set(videoId, { type: 'masterchat', mc: null, liveChatId: null, stopSignal: null });
+  if (_activeSessions.has(videoId) && _activeSessions.get(videoId).mc) return;
+  if (!_activeSessions.has(videoId)) {
+    _activeSessions.set(videoId, _createSession(videoId));
+  }
   await _startMasterchat(videoId, queue, retryDelay);
 }
 
 // ── Unified session starter ───────────────────────────────────────────────
 
 async function _startSession(videoId, queue, retryDelay = 5_000) {
-  if (_activeSessions.has(videoId)) {
+  if (_activeSessions.has(videoId) && _activeSessions.get(videoId).mc) {
     log.info(`[YouTube] Session already active for ${videoId}`);
     return;
   }
@@ -510,47 +425,26 @@ async function _watchdog(queue) {
   }
 }
 
-// ── Live chat ID resolution ───────────────────────────────────────────────
-
-async function _resolveActiveLiveChatId() {
-  // Fast path — already stored on the active session.
-  // Also check mc.liveChatId lazily: masterchat may have populated it after
-  // init (e.g. once the first fetch response came back with the field).
-  for (const [, session] of _activeSessions) {
-    const id = session.liveChatId ?? session.mc?.liveChatId ?? null;
-    if (id) {
-      session.liveChatId = id; // cache so we don't re-check mc next time
-      return id;
-    }
-  }
-  // Slow path — no session yet or liveChatId not populated
-  const videoId = await _findLiveVideoId();
-  if (!videoId) throw new Error('No active YouTube live stream found');
-  if (!YT_API_KEY) throw new Error('YT_API_KEY required to resolve liveChatId');
-  const chatId = await _getLiveChatId(videoId);
-  if (!chatId) throw new Error(`No active live chat for video ${videoId}`);
-  return chatId;
-}
-
 // ── Participant resolution ────────────────────────────────────────────────
 
-async function _resolveChannelId(youtube, liveChatId, displayName) {
+async function _resolveChannelId(youtube, session, displayName) {
   const key    = displayName.toLowerCase();
-  const cached = _participantCache.get(key);
+  const cached = session.participantCache.get(key);
   if (cached) {
     log.debug(`[YouTube] Participant cache hit for "${displayName}"`);
     return cached;
   }
 
-  if (!_hasQuota()) {
-    throw new Error(`Cannot scan for "${displayName}" — API quota exhausted and no cache entry. User must chat first.`);
+  if (!_hasQuota() || !session.liveChatId) {
+    log.debug(`[YouTube] Cannot scan for "${displayName}" — API quota exhausted or liveChatId missing.`);
+    return null;
   }
 
   log.debug(`[YouTube] Participant cache miss for "${displayName}" — scanning live chat via Data API`);
   let pageToken;
   do {
     const res = await youtube.liveChatMessages.list({
-      liveChatId,
+      liveChatId: session.liveChatId,
       part: ['authorDetails'],
       maxResults: 200,
       ...(pageToken ? { pageToken } : {}),
@@ -559,7 +453,7 @@ async function _resolveChannelId(youtube, liveChatId, displayName) {
     for (const item of res.data.items ?? []) {
       const name = item.authorDetails?.displayName;
       const id   = item.authorDetails?.channelId;
-      _cacheParticipant(name, id);
+      _cacheParticipant(session, name, id);
       if (name?.toLowerCase() === key) return id;
     }
     pageToken = res.data.nextPageToken;
@@ -568,83 +462,115 @@ async function _resolveChannelId(youtube, liveChatId, displayName) {
   return null;
 }
 
-// ── Shared mod-action setup ───────────────────────────────────────────────
-
-async function _modSetup() {
-  const youtube    = _getYoutubeClient();
-  const liveChatId = await _resolveActiveLiveChatId();
-  return { youtube, liveChatId };
-}
-
 // ── Mod actions ───────────────────────────────────────────────────────────
 
 async function ytBan(_, username) {
-  const { youtube, liveChatId } = await _modSetup();
-  const channelId = await _resolveChannelId(youtube, liveChatId, username);
-  if (!channelId) throw new Error(`YouTube user "${username}" not found in live chat`);
-  await youtube.liveChatBans.insert({
-    part: ['snippet'],
-    requestBody: { snippet: { liveChatId, type: 'permanent', bannedUserDetails: { channelId } } },
-  });
-  log.info(`[YouTube] Banned ${username}`);
+  const youtube = _getYoutubeClient();
+  const sessions = Array.from(_activeSessions.values());
+  if (sessions.length === 0) throw new Error("No active YouTube sessions");
+
+  let acted = false;
+  for (const session of sessions) {
+    if (!session.liveChatId) continue;
+    const channelId = await _resolveChannelId(youtube, session, username);
+    if (channelId) {
+      await youtube.liveChatBans.insert({
+        part: ['snippet'],
+        requestBody: { snippet: { liveChatId: session.liveChatId, type: 'permanent', bannedUserDetails: { channelId } } },
+      });
+      log.info(`[YouTube] Banned ${username} in chat ${session.liveChatId}`);
+      acted = true;
+    }
+  }
+  if (!acted) throw new Error(`YouTube user "${username}" not found in any active live chat`);
 }
 
 async function ytTimeout(_, username, durationSeconds = 300) {
-  const { youtube, liveChatId } = await _modSetup();
-  const channelId = await _resolveChannelId(youtube, liveChatId, username);
-  if (!channelId) throw new Error(`YouTube user "${username}" not found in live chat`);
-  await youtube.liveChatBans.insert({
-    part: ['snippet'],
-    requestBody: {
-      snippet: {
-        liveChatId,
-        type: 'temporary',
-        banDurationSeconds: durationSeconds,
-        bannedUserDetails: { channelId },
-      },
-    },
-  });
-  log.info(`[YouTube] Timed out ${username} for ${durationSeconds}s`);
+  const youtube = _getYoutubeClient();
+  const sessions = Array.from(_activeSessions.values());
+  if (sessions.length === 0) throw new Error("No active YouTube sessions");
+
+  let acted = false;
+  for (const session of sessions) {
+    if (!session.liveChatId) continue;
+    const channelId = await _resolveChannelId(youtube, session, username);
+    if (channelId) {
+      await youtube.liveChatBans.insert({
+        part: ['snippet'],
+        requestBody: {
+          snippet: {
+            liveChatId: session.liveChatId,
+            type: 'temporary',
+            banDurationSeconds: durationSeconds,
+            bannedUserDetails: { channelId },
+          },
+        },
+      });
+      log.info(`[YouTube] Timed out ${username} for ${durationSeconds}s in chat ${session.liveChatId}`);
+      acted = true;
+    }
+  }
+  if (!acted) throw new Error(`YouTube user "${username}" not found in any active live chat`);
 }
 
 async function ytVip(_, username) {
-  const { youtube, liveChatId } = await _modSetup();
-  const channelId = await _resolveChannelId(youtube, liveChatId, username);
-  if (!channelId) throw new Error(`YouTube user "${username}" not found in live chat`);
-  await youtube.liveChatModerators.insert({
-    part: ['snippet'],
-    requestBody: { snippet: { liveChatId, moderatorDetails: { channelId } } },
-  });
-  log.info(`[YouTube] Promoted ${username} to moderator`);
+  const youtube = _getYoutubeClient();
+  const sessions = Array.from(_activeSessions.values());
+  if (sessions.length === 0) throw new Error("No active YouTube sessions");
+
+  let acted = false;
+  for (const session of sessions) {
+    if (!session.liveChatId) continue;
+    const channelId = await _resolveChannelId(youtube, session, username);
+    if (channelId) {
+      await youtube.liveChatModerators.insert({
+        part: ['snippet'],
+        requestBody: { snippet: { liveChatId: session.liveChatId, moderatorDetails: { channelId } } },
+      });
+      log.info(`[YouTube] Promoted ${username} to moderator in chat ${session.liveChatId}`);
+      acted = true;
+    }
+  }
+  if (!acted) throw new Error(`YouTube user "${username}" not found in any active live chat`);
 }
 
 async function ytUnvip(_, username) {
-  const { youtube, liveChatId } = await _modSetup();
-  const normalised = username.toLowerCase();
-  let pageToken;
-  let moderatorId = null;
-  do {
-    const res = await youtube.liveChatModerators.list({
-      liveChatId, part: ['snippet'], maxResults: 50,
-      ...(pageToken ? { pageToken } : {}),
-    });
-    for (const item of res.data.items ?? []) {
-      if (item.snippet?.moderatorDetails?.displayName?.toLowerCase() === normalised) {
-        moderatorId = item.id;
-        break;
-      }
-    }
-    pageToken = res.data.nextPageToken;
-  } while (pageToken && !moderatorId);
+  const youtube = _getYoutubeClient();
+  const sessions = Array.from(_activeSessions.values());
+  if (sessions.length === 0) throw new Error("No active YouTube sessions");
 
-  if (!moderatorId) throw new Error(`YouTube user "${username}" is not a moderator`);
-  await youtube.liveChatModerators.delete({ id: moderatorId });
-  log.info(`[YouTube] Removed moderator ${username}`);
+  const normalised = username.toLowerCase();
+  let acted = false;
+
+  for (const session of sessions) {
+    if (!session.liveChatId) continue;
+    let pageToken;
+    let moderatorId = null;
+    do {
+      const res = await youtube.liveChatModerators.list({
+        liveChatId: session.liveChatId, part: ['snippet'], maxResults: 50,
+        ...(pageToken ? { pageToken } : {}),
+      });
+      for (const item of res.data.items ?? []) {
+        if (item.snippet?.moderatorDetails?.displayName?.toLowerCase() === normalised) {
+          moderatorId = item.id;
+          break;
+        }
+      }
+      pageToken = res.data.nextPageToken;
+    } while (pageToken && !moderatorId);
+
+    if (moderatorId) {
+      await youtube.liveChatModerators.delete({ id: moderatorId });
+      log.info(`[YouTube] Removed moderator ${username} from chat ${session.liveChatId}`);
+      acted = true;
+    }
+  }
+  
+  if (!acted) throw new Error(`YouTube user "${username}" is not a moderator in any active live chat`);
 }
 
 // ── Chat reply ────────────────────────────────────────────────────────────
-
-let _sayLiveChatId = null;
 
 const SAY_CHUNK_SIZE = 200;
 
@@ -664,43 +590,38 @@ async function say(text) {
     log.warn('[YouTube] say() — OAuth not configured:', err.message);
     return;
   }
-  if (!_sayLiveChatId) {
-    try {
-      _sayLiveChatId = await _resolveActiveLiveChatId();
-    } catch (err) {
-      log.warn('[YouTube] say() — no active live chat:', err.message);
-      return;
-    }
+
+  const sessions = Array.from(_activeSessions.values());
+  if (sessions.length === 0) {
+    log.warn('[YouTube] say() — no active sessions');
+    return;
   }
+
   const chunks = _chunkText(text, SAY_CHUNK_SIZE);
-  for (const chunk of chunks) {
-    try {
-      await youtube.liveChatMessages.insert({
-        part: ['snippet'],
-        requestBody: {
-          snippet: {
-            liveChatId: _sayLiveChatId,
-            type: 'textMessageEvent',
-            textMessageDetails: { messageText: chunk },
+  
+  for (const session of sessions) {
+    if (!session.liveChatId) continue;
+    for (const chunk of chunks) {
+      try {
+        await youtube.liveChatMessages.insert({
+          part: ['snippet'],
+          requestBody: {
+            snippet: {
+              liveChatId: session.liveChatId,
+              type: 'textMessageEvent',
+              textMessageDetails: { messageText: chunk },
+            },
           },
-        },
-      });
-      log.debug('[YouTube] say():', chunk);
-    } catch (err) {
-      log.error('[YouTube] say() error:', err.message);
-      _sayLiveChatId = null;
-      return;
+        });
+        log.debug(`[YouTube] say() in ${session.liveChatId}:`, chunk);
+      } catch (err) {
+        log.error(`[YouTube] say() error for chat ${session.liveChatId}:`, err.message);
+      }
     }
   }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────
-
 // ── Subscriber count poller ───────────────────────────────────────────────
-// Polls channels.list?part=statistics (1 quota unit/call) every
-// SUB_POLL_INTERVAL seconds to detect count increases not covered by named
-// membership events. Named events from the action stream are tracked in
-// _namedSubThisCycle so anonymous events aren't double-counted.
 
 let _lastKnownSubCount = null;
 let _subPollerTimer    = null;
@@ -759,12 +680,6 @@ function _startSubscriberPoller(queue) {
 }
 
 // ── Like count poller ─────────────────────────────────────────────────────
-// Polls videos.list?part=statistics (1 quota unit/call) every POLL_INTERVAL
-// seconds. Emits one 'like' event per new like since the last poll.
-// Like counts can be hidden by the creator — returns null when hidden.
-
-let _lastKnownLikeCount = null;
-let _likePollerTimer    = null;
 
 async function _fetchLikeCount(videoId) {
   if (!YT_API_KEY || !videoId) return null;
@@ -778,40 +693,40 @@ async function _fetchLikeCount(videoId) {
   return raw != null ? parseInt(raw, 10) : null;
 }
 
-async function _pollLikeCount(videoId, queue) {
+async function _pollLikeCount(videoId, session, queue) {
   const count = await _fetchLikeCount(videoId).catch(err => {
     log.warn('[YouTube] Like poll error:', err.message);
     return null;
   });
   if (count == null) return;
 
-  if (_lastKnownLikeCount == null) {
-    _lastKnownLikeCount = count;
-    log.info(`[YouTube] Like count baseline: ${count.toLocaleString()}`);
+  if (session.lastKnownLikeCount == null) {
+    session.lastKnownLikeCount = count;
+    log.info(`[YouTube] Like count baseline for ${videoId}: ${count.toLocaleString()}`);
     return;
   }
 
-  const delta = count - _lastKnownLikeCount;
+  const delta = count - session.lastKnownLikeCount;
   if (delta <= 0) return;
 
-  log.info(`[YouTube] Like delta +${delta} — total: ${count.toLocaleString()}`);
+  log.info(`[YouTube] Like delta +${delta} for ${videoId} — total: ${count.toLocaleString()}`);
   for (let i = 0; i < delta; i++) {
     queue.pushMessage({ platform: 'youtube', type: 'like' });
   }
 
-  _lastKnownLikeCount = count;
+  session.lastKnownLikeCount = count;
 }
 
-function _startLikePoller(videoId, queue) {
-  if (_likePollerTimer) return;
+function _startLikePoller(videoId, session, queue) {
+  if (session.likePollerTimer) return;
   if (!YT_API_KEY) {
     log.warn('[YouTube] Like count poller disabled — YT_API_KEY required.');
     return;
   }
   log.info(`[YouTube] Like poller started for video=${videoId} (interval: ${POLL_INTERVAL / 1000}s)`);
-  _pollLikeCount(videoId, queue).catch(() => {});
-  _likePollerTimer = setInterval(() => {
-    _pollLikeCount(videoId, queue).catch(err => log.warn('[YouTube] Like poll error:', err.message));
+  _pollLikeCount(videoId, session, queue).catch(() => {});
+  session.likePollerTimer = setInterval(() => {
+    _pollLikeCount(videoId, session, queue).catch(err => log.warn('[YouTube] Like poll error:', err.message));
   }, POLL_INTERVAL);
 }
 
@@ -861,8 +776,13 @@ module.exports = {
     _namedSubThisCycle = 0;
   },
   stopLikePoller() {
-    if (_likePollerTimer) { clearInterval(_likePollerTimer); _likePollerTimer = null; }
-    _lastKnownLikeCount = null;
+    for (const session of _activeSessions.values()) {
+      if (session.likePollerTimer) {
+        clearInterval(session.likePollerTimer);
+        session.likePollerTimer = null;
+      }
+      session.lastKnownLikeCount = null;
+    }
   },
   modHandlers: {
     ban:     ytBan,

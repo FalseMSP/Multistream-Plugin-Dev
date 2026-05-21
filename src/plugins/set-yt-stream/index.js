@@ -1,21 +1,19 @@
 'use strict';
 
 /**
- * set-yt-stream plugin
+ * add-yt-stream plugin
  * ─────────────────────
- * Adds a /set-yt-stream Discord slash command that lets mods point the bot at
- * a specific YouTube video ID without restarting.
+ * Adds an /add-yt-stream Discord slash command that lets mods point the bot at
+ * an additional YouTube video ID without restarting.
  *
  * Accepts any of:
- *   https://www.youtube.com/watch?v=dQw4w9WgXcQ
- *   https://youtu.be/dQw4w9WgXcQ
- *   https://www.youtube.com/live/dQw4w9WgXcQ
- *   dQw4w9WgXcQ   (bare ID)
+ * https://www.youtube.com/watch?v=dQw4w9WgXcQ
+ * https://youtu.be/dQw4w9WgXcQ
+ * https://www.youtube.com/live/dQw4w9WgXcQ
+ * dQw4w9WgXcQ   (bare ID)
  *
  * On success it calls triggerVideo() from the YouTube module, which starts a
- * new masterchat session for that video ID (no-op if one is already running).
- *
- * Usage: drop in src/plugins/set-yt-stream/index.js
+ * new masterchat session for that video ID alongside any existing streams.
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
@@ -61,11 +59,11 @@ function _extractVideoId(input) {
 // ── Plugin ────────────────────────────────────────────────────────────────
 
 module.exports = {
-  id: 'set-yt-stream',
+  id: 'add-yt-stream',
 
   command: new SlashCommandBuilder()
-    .setName('set-yt-stream')
-    .setDescription('Point the bot at a specific YouTube stream URL or video ID')
+    .setName('add-yt-stream')
+    .setDescription('Add an additional YouTube stream to monitor')
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
     .addStringOption(o =>
       o
@@ -94,13 +92,13 @@ module.exports = {
     try {
       triggerVideo(videoId, queue);
     } catch (err) {
-      log.error('[set-yt-stream] triggerVideo error:', err.message);
+      log.error('[add-yt-stream] triggerVideo error:', err.message);
       return interaction.editReply(`⚠️ Failed to start session: ${err.message}`);
     }
 
-    log.info(`[set-yt-stream] ${interaction.user.tag} set YouTube stream to ${videoId}`);
+    log.info(`[add-yt-stream] ${interaction.user.tag} added YouTube stream ${videoId}`);
     return interaction.editReply(
-      `✅ YouTube stream set to \`${videoId}\`\n` +
+      `✅ Now monitoring YouTube stream \`${videoId}\`\n` +
       `<https://www.youtube.com/watch?v=${videoId}>\n` +
       `A new chat session will start momentarily (or is already running).`,
     );
