@@ -16,6 +16,101 @@ const CLIENT_ID   = process.env.TWITCH_CLIENT_ID          ?? '';
 const BOT_NICK    = process.env.TWITCH_BOT_NICK           ?? '';
 const CHANNELS    = (process.env.TWITCH_CHANNELS ?? '').split(',').map(s => s.trim()).filter(Boolean);
 const BROADCASTER = (process.env.TWITCH_BROADCASTER_LOGIN ?? CHANNELS[0] ?? '').trim();
+// ── Third-party emotes (BTTV / FFZ / 7TV) ────────────────────────────────
+//
+// Fetched once at startup (global + channel-specific) and refreshed every hour.
+// Stored as a flat { emoteName: imageUrl } map passed into every pushMessage().
+
+/** @type {Record<string, string>} */
+let _thirdPartyEmotes = {};
+
+async function _fetchThirdPartyEmotes(channelLogin) {
+  const { default: fetch } = await import('node-fetch');
+  const map = {};
+
+  // BTTV global
+  try {
+    const r = await fetch('https://api.betterttv.net/3/cached/emotes/global');
+    const d = await r.json();
+    if (Array.isArray(d)) {
+      for (const e of d) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+    }
+  } catch (err) { log.warn('[Twitch] BTTV global fetch failed:', err.message); }
+
+  // BTTV channel
+  if (channelLogin) {
+    try {
+      const userId = await _resolveUserId(channelLogin);
+      const r = await fetch(`https://api.betterttv.net/3/cached/users/twitch/${userId}`);
+      const d = await r.json();
+      const emotes = [...(d.channelEmotes ?? []), ...(d.sharedEmotes ?? [])];
+      for (const e of emotes) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+    } catch (err) { log.warn('[Twitch] BTTV channel fetch failed:', err.message); }
+  }
+
+  // FFZ global
+  try {
+    const r = await fetch('https://api.frankerfacez.com/v1/set/global');
+    const d = await r.json();
+    for (const set of Object.values(d.sets ?? {})) {
+      for (const e of (set.emoticons ?? [])) {
+        const url = e.urls?.['2'] ?? e.urls?.['1'];
+        if (url) map[e.name] = url.startsWith('//') ? 'https:' + url : url;
+      }
+    }
+  } catch (err) { log.warn('[Twitch] FFZ global fetch failed:', err.message); }
+
+  // FFZ channel
+  if (channelLogin) {
+    try {
+      const r = await fetch(`https://api.frankerfacez.com/v1/room/${channelLogin}`);
+      const d = await r.json();
+      for (const set of Object.values(d.sets ?? {})) {
+        for (const e of (set.emoticons ?? [])) {
+          const url = e.urls?.['2'] ?? e.urls?.['1'];
+          if (url) map[e.name] = url.startsWith('//') ? 'https:' + url : url;
+        }
+      }
+    } catch (err) { log.warn('[Twitch] FFZ channel fetch failed:', err.message); }
+  }
+
+  // 7TV global
+  try {
+    const r = await fetch('https://7tv.io/v3/emote-sets/global');
+    const d = await r.json();
+    for (const e of (d.emotes ?? [])) {
+      const file = e.data?.host?.files?.find(f => f.name === '2x.webp') ?? e.data?.host?.files?.[0];
+      if (file) map[e.name] = `https:${e.data.host.url}/${file.name}`;
+    }
+  } catch (err) { log.warn('[Twitch] 7TV global fetch failed:', err.message); }
+
+  // 7TV channel
+  if (channelLogin) {
+    try {
+      const userId = await _resolveUserId(channelLogin);
+      const r = await fetch(`https://7tv.io/v3/users/twitch/${userId}`);
+      const d = await r.json();
+      for (const e of (d.emote_set?.emotes ?? [])) {
+        const file = e.data?.host?.files?.find(f => f.name === '2x.webp') ?? e.data?.host?.files?.[0];
+        if (file) map[e.name] = `https:${e.data.host.url}/${file.name}`;
+      }
+    } catch (err) { log.warn('[Twitch] 7TV channel fetch failed:', err.message); }
+  }
+
+  const count = Object.keys(map).length;
+  log.info(`[Twitch] Third-party emotes loaded: ${count} (BTTV + FFZ + 7TV)`);
+  _thirdPartyEmotes = map;
+}
+
+/** Cache the broadcaster's numeric user ID so emote fetches don't re-hit the API */
+let _broadcasterUserId = null;
+async function _resolveUserId(login) {
+  if (_broadcasterUserId) return _broadcasterUserId;
+  const data = await helixRequest('GET', `/users?login=${login}`);
+  _broadcasterUserId = data?.data?.[0]?.id ?? null;
+  return _broadcasterUserId;
+}
+
 // ── Helix API helper ──────────────────────────────────────────────────────
 let _appToken       = null;
 let _appTokenExpiry = 0;
@@ -361,6 +456,12 @@ async function startTwitch(queue) {
     connection: { reconnect: true, secure: true },
   });
 
+  // Fetch BTTV/FFZ/7TV emotes now, then refresh every hour
+  _fetchThirdPartyEmotes(BROADCASTER).catch(err => log.warn('[Twitch] Third-party emote fetch error:', err.message));
+  setInterval(() => {
+    _fetchThirdPartyEmotes(BROADCASTER).catch(err => log.warn('[Twitch] Third-party emote refresh error:', err.message));
+  }, 60 * 60 * 1000);
+
   client.on('message', (channel, tags, message, self) => {
     if (self) return;
     const username = tags['display-name'] ?? tags.username ?? 'unknown';
@@ -382,8 +483,9 @@ async function startTwitch(queue) {
       platform: 'twitch',
       username,
       message,
-      color:  tags['color'] ?? '',
-      emotes: tags['emotes'] ?? '',   // e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
+      color:           tags['color'] ?? '',
+      emotes:          tags['emotes'] ?? '',   // e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
+      thirdPartyEmotes: _thirdPartyEmotes,
     });
   });
 

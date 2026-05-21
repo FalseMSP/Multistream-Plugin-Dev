@@ -104,6 +104,11 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
   }
   if (pos < message.length) segments.push({ type: 'text', text: message.slice(pos) });
 
+  // Seed with full message text if no platform emotes produced any segments —
+  // without this, the third-party loop below runs against an empty array and
+  // returns nothing, causing emote names to render as plain text.
+  if (!segments.length) segments.push({ type: 'text', text: message });
+
   if (thirdPartyEmotes && Object.keys(thirdPartyEmotes).length) {
     const out = /** @type {Segment[]} */ ([]);
     for (const seg of segments) {
@@ -114,6 +119,7 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
         if (/\s/.test(token)) { buf += token; continue; }
         const url = thirdPartyEmotes[token];
         if (url) {
+          // Flush buffered text (including preceding whitespace) before the emote
           if (buf) { out.push({ type: 'text', text: buf }); buf = ''; }
           out.push({ type: 'emote', url, alt: token });
         } else {
@@ -125,7 +131,7 @@ function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
     return out;
   }
 
-  return segments.length ? segments : [{ type: 'text', text: message }];
+  return segments;
 }
 
 function pushMessage(platform, username, message, color, emotesTag, ytEmotes, thirdPartyEmotes) {
