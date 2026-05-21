@@ -141,188 +141,104 @@ dashboard.registerWidget('stream-events', {
 // ── Plugin lifecycle ──────────────────────────────────────────────────────────
 
 function init(context) {
-  const queue = require('../../queue');
+  // context = { ...discord, queue }  (see src/plugins/index.js → initPlugins)
+  const queue = context.queue;
 
-  // ── Twitch donation/event bus (follow, sub, resub, subgift, redeem) ────────
-
-  if (!queue?.onDonation) {
-    log.warn('[stream-events] queue.onDonation not available — Twitch sub/follow/redeem events will not be captured.');
-  } else {
-    queue.onDonation(donation => {
-      const { type, platform, username, quantity, months, message } = donation ?? {};
-
-      if (platform === 'twitch') {
-        if (type === 'follow') {
-          _push({ type, platform, username, ts: _ts(),
-            label: 'followed on Twitch',
-            detail: null });
-          return;
-        }
-        if (type === 'sub') {
-          _push({ type, platform, username, ts: _ts(),
-            label: 'subscribed on Twitch',
-            detail: message || null });
-          return;
-        }
-        if (type === 'resub') {
-          const mo = months ? `${months} months` : null;
-          _push({ type, platform, username, ts: _ts(),
-            label: `resubscribed on Twitch${mo ? ` (${mo})` : ''}`,
-            detail: message || null });
-          return;
-        }
-        if (type === 'subgift') {
-          const qty = quantity ?? 1;
-          _push({ type, platform, username, ts: _ts(),
-            label: `gifted ${qty} sub${qty !== 1 ? 's' : ''} on Twitch`,
-            detail: null });
-          return;
-        }
-        if (type === 'redeem') {
-          _push({ type, platform, username, ts: _ts(),
-            label: `redeemed: ${donation.rewardTitle ?? 'channel points'}`,
-            detail: donation.userInput || null });
-          return;
-        }
-        log.debug('[stream-events] Unhandled Twitch donation type:', JSON.stringify(donation));
-      }
-    });
+  if (!queue) {
+    log.warn('[stream-events] queue not found in context — no events will be captured.');
+    return;
   }
 
-  // ── queue.onMessage — YouTube events (subscribe, video, like, superchat) ──
-  // Also catches Twitch redeems if your twitch.js emits them on onMessage.
+  // ── queue.onDonation — Twitch: follow, sub, resub, subgift, bits ──────────
 
-  if (!queue?.onMessage) {
-    log.warn('[stream-events] queue.onMessage not available — YouTube events will not be captured.');
-  } else {
-    queue.onMessage(msg => {
-      const { type, platform, username, message, amount, currency } = msg ?? {};
+  queue.onDonation(donation => {
+    const { type, platform, username, quantity, months, message,
+            amount, currency } = donation ?? {};
 
-      if (platform === 'youtube') {
-        if (type === 'subscribe') {
-          _push({ type, platform, username, ts: _ts(),
-            label: 'subscribed on YouTube',
-            detail: null });
-          return;
-        }
-        if (type === 'video') {
-          _push({ type, platform, username: username ?? 'YouTube', ts: _ts(),
-            label: 'new video / stream notification',
-            detail: msg.title || null });
-          return;
-        }
-        if (type === 'like') {
-          _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
-            label: 'liked on YouTube',
-            detail: null });
-          return;
-        }
-        if (type === 'superchat') {
-          const amountStr = (amount != null && currency)
-            ? `${currency}${amount}`
-            : amount != null ? String(amount) : null;
-          _push({ type, platform, username, ts: _ts(),
-            label: `super chat${amountStr ? ` (${amountStr})` : ''}`,
-            detail: message || null });
-          return;
-        }
-        log.debug('[stream-events] Unhandled YouTube message type:', JSON.stringify(msg));
+    if (platform === 'twitch') {
+      if (type === 'follow') {
+        _push({ type, platform, username, ts: _ts(),
+          label: 'followed on Twitch',
+          detail: null });
         return;
       }
-
-      // Twitch redeems forwarded via onMessage (some twitch.js setups do this)
-      if (platform === 'twitch' && type === 'redeem') {
+      if (type === 'sub') {
         _push({ type, platform, username, ts: _ts(),
-          label: `redeemed: ${msg.rewardTitle ?? 'channel points'}`,
-          detail: msg.userInput || null });
+          label: 'subscribed on Twitch',
+          detail: message || null });
+        return;
       }
-    });
-  }
-
-  // ── Discord context mod-action hook ───────────────────────────────────────
-  // Catches redeems forwarded through the Discord context if your setup uses it.
-
-  if (context?.discord?.onModAction) {
-    context.discord.onModAction(action => {
-      const { type, username, rewardTitle, userInput, platform } = action ?? {};
-      if (type === 'redeem') {
-        _push({ type, platform: platform ?? 'twitch', username, ts: _ts(),
-          label: `redeemed: ${rewardTitle ?? 'channel points'}`,
-          detail: userInput || null });
+      if (type === 'resub') {
+        const mo = months ? `${months} months` : null;
+        _push({ type, platform, username, ts: _ts(),
+          label: `resubscribed on Twitch${mo ? ` (${mo})` : ''}`,
+          detail: message || null });
+        return;
       }
-    });
-  }
-
-  // ── api.sendDonation intercept ────────────────────────────────────────────
-  // discord.js calls api.sendDonation() for follow/sub/resub/subgift/bits/like/
-  // subscribe events. The queue.onDonation path may never fire for these, so
-  // we wrap the api function to observe the same payloads discord.js receives.
-
-  if (context?.sendDonation) {
-    const _origSendDonation = context.sendDonation.bind(context);
-    context.sendDonation = function (donation) {
-      const { type, platform, username, quantity, months, message,
-              amount, currency, tier, recipient } = donation ?? {};
-
-      if (platform === 'twitch' || platform === 'youtube') {
-        switch (type) {
-          case 'follow':
-            _push({ type, platform, username, ts: _ts(),
-              label: 'followed on Twitch', detail: null });
-            break;
-          case 'sub':
-            _push({ type, platform, username, ts: _ts(),
-              label: 'subscribed on Twitch', detail: message || null });
-            break;
-          case 'resub': {
-            const mo = months ? `${months} months` : null;
-            _push({ type, platform, username, ts: _ts(),
-              label: `resubscribed on Twitch${mo ? ` (${mo})` : ''}`,
-              detail: message || null });
-            break;
-          }
-          case 'subgift': {
-            const qty = quantity ?? 1;
-            _push({ type, platform, username, ts: _ts(),
-              label: `gifted ${qty} sub${qty !== 1 ? 's' : ''} on Twitch`,
-              detail: null });
-            break;
-          }
-          case 'bits':
-            _push({ type, platform, username, ts: _ts(),
-              label: `cheered ${amount ?? '?'} bits`, detail: message || null });
-            break;
-          case 'like':
-            _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
-              label: 'liked on YouTube', detail: null });
-            break;
-          case 'subscribe':
-            _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
-              label: 'subscribed on YouTube', detail: null });
-            break;
-          default:
-            log.debug('[stream-events] sendDonation intercept — unhandled type:', type);
-        }
+      if (type === 'subgift') {
+        const qty = quantity ?? 1;
+        _push({ type, platform, username, ts: _ts(),
+          label: `gifted ${qty} sub${qty !== 1 ? 's' : ''} on Twitch`,
+          detail: null });
+        return;
       }
+      if (type === 'bits') {
+        _push({ type, platform, username, ts: _ts(),
+          label: `cheered ${amount ?? '?'} bits`,
+          detail: message || null });
+        return;
+      }
+      log.debug('[stream-events] Unhandled Twitch donation type:', JSON.stringify(donation));
+    }
+  });
 
-      return _origSendDonation(donation);
-    };
-  }
+  // ── queue.onRedeem — Twitch channel point redemptions ────────────────────
 
-  // ── api.sendRedeem intercept ──────────────────────────────────────────────
-  // discord.js calls api.sendRedeem() for channel point redemptions.
-  // Shape: { username, title, cost, input, timestamp }
+  queue.onRedeem(redeem => {
+    const { username, title, input } = redeem ?? {};
+    _push({ type: 'redeem', platform: 'twitch', username, ts: _ts(),
+      label: `redeemed: ${title ?? 'channel points'}`,
+      detail: input || null });
+  });
 
-  if (context?.sendRedeem) {
-    const _origSendRedeem = context.sendRedeem.bind(context);
-    context.sendRedeem = function (redeem) {
-      const { username, title, input } = redeem ?? {};
-      _push({ type: 'redeem', platform: 'twitch', username, ts: _ts(),
-        label: `redeemed: ${title ?? 'channel points'}`,
-        detail: input || null });
-      return _origSendRedeem(redeem);
-    };
-  }
+  // ── queue.onMessage — YouTube events: subscribe, video, like, superchat ──
+
+  queue.onMessage(msg => {
+    const { type, platform, username, message, amount, currency } = msg ?? {};
+
+    if (platform === 'youtube') {
+      if (type === 'subscribe') {
+        _push({ type, platform, username, ts: _ts(),
+          label: 'subscribed on YouTube',
+          detail: null });
+        return;
+      }
+      if (type === 'video') {
+        _push({ type, platform, username: username ?? 'YouTube', ts: _ts(),
+          label: 'new video / stream notification',
+          detail: msg.title || null });
+        return;
+      }
+      if (type === 'like') {
+        _push({ type, platform, username: username ?? 'viewer', ts: _ts(),
+          label: 'liked on YouTube',
+          detail: null });
+        return;
+      }
+      if (type === 'superchat') {
+        const amountStr = (amount != null && currency)
+          ? `${currency}${amount}`
+          : amount != null ? String(amount) : null;
+        _push({ type, platform, username, ts: _ts(),
+          label: `super chat${amountStr ? ` (${amountStr})` : ''}`,
+          detail: message || null });
+        return;
+      }
+      // Not a special YouTube event type — let it pass through for chat mirroring
+    }
+  });
+
+  _notify();
 }
 
 // ── Exports ───────────────────────────────────────────────────────────────────
