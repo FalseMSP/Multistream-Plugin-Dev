@@ -3,12 +3,13 @@
 /**
  * chat-overlay plugin
  *
- * Serves two transparent OBS browser-source overlays:
- *   http://localhost:<OVERLAY_PORT>/ip/yt_chat      — YouTube chat
- *   http://localhost:<OVERLAY_PORT>/ip/twitch_chat  — Twitch chat
+ * Serves three transparent OBS browser-source overlays:
+ *   http://localhost:<OVERLAY_PORT>/yt_chat      — YouTube chat
+ *   http://localhost:<OVERLAY_PORT>/twitch_chat  — Twitch chat
+ *   http://localhost:<OVERLAY_PORT>/combined     — Both platforms interleaved
  *
  * Messages scroll upward, newest at the bottom.
- * Each platform has its own colour scheme and badge.
+ * Each platform has its own accent colour; combined shows both with per-platform colouring.
  *
  * Env vars (all optional):
  *   CHAT_OVERLAY_MAX_MESSAGES   — max messages kept on screen (default: 30)
@@ -26,14 +27,17 @@ const MAX_MESSAGES = parseInt(process.env.CHAT_OVERLAY_MAX_MESSAGES ?? '30', 10)
 const FONT_SIZE    = parseInt(process.env.CHAT_OVERLAY_FONT_SIZE    ?? '16', 10);
 const WIDTH        = parseInt(process.env.CHAT_OVERLAY_WIDTH        ?? '420', 10);
 
+const ACCENT = { youtube: '#FF0000', twitch: '#9146FF' };
+
 // ─── State ────────────────────────────────────────────────────────────────────
 
 const state = {
-  youtube: /** @type {ChatMessage[]} */ ([]),
-  twitch:  /** @type {ChatMessage[]} */ ([]),
+  youtube:  /** @type {ChatMessage[]} */ ([]),
+  twitch:   /** @type {ChatMessage[]} */ ([]),
+  combined: /** @type {ChatMessage[]} */ ([]),
 };
 
-/** @typedef {{ id: number, username: string, message: string, color: string }} ChatMessage */
+/** @typedef {{ id: number, platform: string, username: string, message: string, color: string }} ChatMessage */
 
 let msgId = 0;
 
@@ -44,13 +48,19 @@ let msgId = 0;
  * @param {string} [color]
  */
 function pushMessage(platform, username, message, color) {
+  const entry = { id: ++msgId, platform, username, message, color: color ?? '' };
+
   const list = state[platform];
-  list.push({ id: ++msgId, username, message, color: color ?? '' });
+  list.push(entry);
   if (list.length > MAX_MESSAGES) list.splice(0, list.length - MAX_MESSAGES);
   updateSection(`chat-overlay-${platform}`, { messages: list });
+
+  state.combined.push(entry);
+  if (state.combined.length > MAX_MESSAGES) state.combined.splice(0, state.combined.length - MAX_MESSAGES);
+  updateSection('chat-overlay-combined', { messages: state.combined });
 }
 
-// ─── Overlay sections (dashboard only — the real overlay is the HTML routes) ──
+// ─── Overlay sections (dashboard only) ───────────────────────────────────────
 
 for (const platform of ['youtube', 'twitch']) {
   const isYT = platform === 'youtube';
@@ -81,23 +91,46 @@ for (const platform of ['youtube', 'twitch']) {
   updateSection(`chat-overlay-${platform}`, { messages: [] });
 }
 
-// ─── Shared HTML builder ──────────────────────────────────────────────────────
+registerSection('chat-overlay-combined', {
+  title: 'Combined Chat',
+  order: 12,
+  icon: `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg">
+    <rect width="22" height="22" rx="5" fill="#333"/>
+    <rect x="3" y="3" width="7" height="7" rx="1" fill="#FF0000"/>
+    <rect x="12" y="3" width="7" height="7" rx="1" fill="#9146FF"/>
+    <rect x="3" y="12" width="16" height="2" rx="1" fill="#fff" opacity="0.5"/>
+    <rect x="3" y="16" width="10" height="2" rx="1" fill="#fff" opacity="0.3"/>
+  </svg>`,
+  render: (function render(data, el, esc, { badge }) {
+    const count = data?.messages?.length ?? 0;
+    badge.textContent = count + ' msgs';
+    el.style.cssText = 'padding:8px 12px;font-family:monospace;font-size:13px;max-height:160px;overflow:hidden';
+    if (!count) { el.textContent = 'No messages yet.'; return; }
+    el.innerHTML = data.messages.slice(-5).map(m =>
+      '<div><b>' + esc(m.username) + '</b> [' + esc(m.platform) + ']: ' + esc(m.message) + '</div>'
+    ).join('');
+  }).toString(),
+});
+updateSection('chat-overlay-combined', { messages: [] });
+
+// ─── HTML builder ─────────────────────────────────────────────────────────────
 
 /**
- * @param {'youtube'|'twitch'} platform
+ * Build the overlay page HTML.
+ * @param {'youtube'|'twitch'|'combined'} mode
  */
-function buildPage(platform) {
-  const isYT      = platform === 'youtube';
-  const accentHex = isYT ? '#FF0000' : '#9146FF';
-  const badgeBg   = isYT ? '#FF0000' : '#9146FF';
-  const badgeLabel = isYT ? 'YT' : 'TW';
-  const sseId     = `chat-overlay-${platform}`;
+function buildPage(mode) {
+  const isCombined = mode === 'combined';
+  const title      = isCombined ? 'Combined Chat Overlay' : (mode === 'youtube' ? 'YouTube' : 'Twitch') + ' Chat Overlay';
+  // For single-platform pages the accent is fixed; for combined it's overridden per-message in JS.
+  const accentHex  = isCombined ? '#ffffff' : ACCENT[mode];
+  const sseId      = isCombined ? 'chat-overlay-combined' : `chat-overlay-${mode}`;
 
   return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>${isYT ? 'YouTube' : 'Twitch'} Chat Overlay</title>
+<title>${title}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap">
 <style>
@@ -120,63 +153,42 @@ function buildPage(platform) {
     width: 100%;
   }
 
-  /* ── individual message row ── */
   .msg {
     display: flex;
-    align-items: flex-start;
-    gap: 7px;
+    align-items: baseline;
+    gap: 5px;
     animation: fadeSlideIn 0.25s ease forwards;
     max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
   }
 
   @keyframes fadeSlideIn {
-    from { opacity: 0; transform: translateY(8px); }
+    from { opacity: 0; transform: translateY(6px); }
     to   { opacity: 1; transform: translateY(0);   }
   }
 
-  /* platform badge */
-  .badge {
-    flex-shrink: 0;
-    width: 22px;
-    height: 22px;
-    border-radius: 4px;
-    background: ${badgeBg};
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 9px;
-    font-weight: 700;
-    color: #fff;
-    letter-spacing: 0.03em;
-    margin-top: 1px;
-  }
-
-  /* bubble */
-  .bubble {
-    background: rgba(0, 0, 0, 0.72);
-    border-left: 3px solid ${accentHex};
-    border-radius: 0 6px 6px 0;
-    padding: 5px 9px;
-    line-height: 1.35;
-    word-break: break-word;
-    max-width: calc(100% - 30px);
-  }
-
   .username {
-    font-weight: 600;
-    font-size: 0.78em;
+    flex-shrink: 0;
+    font-weight: 700;
+    font-size: 1em;
     color: ${accentHex};
-    margin-bottom: 2px;
-    text-shadow: 0 0 8px ${accentHex}66;
+    text-shadow: 0 0 8px ${accentHex}88, 0 1px 3px rgba(0,0,0,0.9);
+  }
+
+  .separator {
+    flex-shrink: 0;
+    color: rgba(255,255,255,0.4);
+    font-size: 1em;
   }
 
   .text {
     color: #f0f0f0;
-    font-size: 0.97em;
+    font-size: 1em;
     text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-
-  /* custom username colours applied via inline style on .username */
 </style>
 </head>
 <body>
@@ -184,53 +196,46 @@ function buildPage(platform) {
 
 <script>
 (function () {
-  var feed   = document.getElementById('feed');
-  var MAX    = ${MAX_MESSAGES};
-  var SSE_ID = '${sseId}';
-
-  function esc(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
+  var feed      = document.getElementById('feed');
+  var MAX       = ${MAX_MESSAGES};
+  var SSE_ID    = '${sseId}';
+  var COMBINED  = ${isCombined};
+  var ACCENTS   = { youtube: '#FF0000', twitch: '#9146FF' };
 
   function appendMessage(msg) {
     var row = document.createElement('div');
     row.className = 'msg';
     row.dataset.id = msg.id;
 
-    var badge = document.createElement('div');
-    badge.className = 'badge';
-    badge.textContent = '${badgeLabel}';
-
-    var bubble = document.createElement('div');
-    bubble.className = 'bubble';
-
-    var nameEl = document.createElement('div');
+    var nameEl = document.createElement('span');
     nameEl.className = 'username';
-    if (msg.color) nameEl.style.color = msg.color;
+    // Per-user Twitch colour takes priority; fall back to platform accent for combined
+    var nameColor = msg.color || (COMBINED ? (ACCENTS[msg.platform] || '#ffffff') : null);
+    if (nameColor) {
+      nameEl.style.color = nameColor;
+      nameEl.style.textShadow = '0 0 8px ' + nameColor + '88, 0 1px 3px rgba(0,0,0,0.9)';
+    }
     nameEl.textContent = msg.username;
 
-    var textEl = document.createElement('div');
-    textEl.className = 'text';
-    textEl.innerHTML = esc(msg.message);
+    var sep = document.createElement('span');
+    sep.className = 'separator';
+    sep.textContent = ':';
 
-    bubble.appendChild(nameEl);
-    bubble.appendChild(textEl);
-    row.appendChild(badge);
-    row.appendChild(bubble);
+    var textEl = document.createElement('span');
+    textEl.className = 'text';
+    textEl.textContent = msg.message;
+
+    row.appendChild(nameEl);
+    row.appendChild(sep);
+    row.appendChild(textEl);
     feed.appendChild(row);
 
-    // trim old messages
     while (feed.children.length > MAX) {
       feed.removeChild(feed.firstChild);
     }
   }
 
   function syncMessages(messages) {
-    // Full replace (e.g. on reconnect)
     feed.innerHTML = '';
     messages.forEach(appendMessage);
   }
@@ -265,6 +270,11 @@ addRoute('/yt_chat', (_req, res) => {
 addRoute('/twitch_chat', (_req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(buildPage('twitch'));
+});
+
+addRoute('/combined', (_req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(buildPage('combined'));
 });
 
 // ─── Plugin entry point ───────────────────────────────────────────────────────
