@@ -202,7 +202,7 @@ function buildPage(mode) {
   html, body {
     background: transparent;
     width: ${WIDTH}px;
-    height: 100vh; /* Force full height so column alignment works at the bottom */
+    height: 100%;
     overflow: hidden;
     font-family: 'Inter', sans-serif;
     font-size: ${FONT_SIZE}px;
@@ -211,11 +211,15 @@ function buildPage(mode) {
   #feed {
     display: flex;
     flex-direction: column;
-    justify-content: flex-end; /* Keeps messages glued to the bottom */
+    justify-content: flex-end;
     gap: 5px;
     padding: 8px;
     width: 100%;
-    height: 100%;
+    
+    /* FIX: Force absolute positioning to lock the feed container to the absolute bottom of the OBS window */
+    position: absolute;
+    bottom: 0;
+    left: 0;
   }
 
   .msg {
@@ -226,10 +230,9 @@ function buildPage(mode) {
     max-width: 100%;
     white-space: nowrap;
     overflow: hidden;
-    transition: opacity 0.5s ease, transform 0.5s ease; /* Smooth transition when fading out */
+    transition: opacity 0.5s ease, transform 0.5s ease;
   }
 
-  /* When this class is added, the element transitions out smoothly */
   .msg.fade-out {
     opacity: 0;
     transform: translateY(-4px);
