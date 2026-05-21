@@ -61,25 +61,22 @@ registerSection('sfx', {
   render: (function render(data, el, esc) {
     if (!data || !data.url) return;
 
-    // Use a sequence number so the same sound can retrigger back-to-back.
     const prev = el.dataset.seq;
-    if (prev === String(data.seq)) return;   // already handled this event
+    if (prev === String(data.seq)) return;
     el.dataset.seq = data.seq;
 
-    // Reuse or create the <audio> element.
-    let audio = el.querySelector('audio');
-    if (!audio) {
-      audio = document.createElement('audio');
-      audio.style.display = 'none';
-      el.appendChild(audio);
-    }
-
+    const audio = document.createElement('audio');
+    audio.style.display = 'none';
     audio.src    = data.url;
     audio.volume = Math.min(1, Math.max(0, data.volume ?? 1));
-    audio.currentTime = 0;
+    el.appendChild(audio);
 
-    audio.play().catch(function (err) {
+    audio.play().catch(function(err) {
       console.warn('[sfx] audio play failed:', err.message);
+    });
+
+    audio.addEventListener('ended', function() {
+      el.removeChild(audio);
     });
   }).toString(),
 });

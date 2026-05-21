@@ -122,7 +122,20 @@ dashboard.registerWidget('gd-queue', {
       return;
     }
 
-    el.innerHTML = queue.map(function (e, i) {
+    // Next button — copies the first level ID to clipboard and dequeues it
+    var nextBtn =
+      '<div style="padding:6px 0 10px">' +
+        '<button id="gd-queue-next-btn" style="' +
+          'display:flex;align-items:center;gap:6px;' +
+          'padding:5px 12px;border-radius:5px;border:none;cursor:pointer;' +
+          'background:var(--accent);color:#fff;font-size:12px;font-weight:700;' +
+          'letter-spacing:0.04em;transition:opacity 0.15s"' +
+        '>' +
+          '⏭ Next' +
+        '</button>' +
+      '</div>';
+
+    el.innerHTML = nextBtn + queue.map(function (e, i) {
       var platformColor = e.platform === 'twitch' ? '#9147ff' : '#ff0000';
       var notesHtml = e.notes
         ? '<div style="font-size:10px;color:var(--muted);font-style:italic;margin-top:1px;' +
@@ -148,9 +161,53 @@ dashboard.registerWidget('gd-queue', {
         '</div>' +
       '</div>';
     }).join('');
+
+    // Wire up the Next button after innerHTML is set
+    var btn = document.getElementById('gd-queue-next-btn');
+    if (btn) {
+      btn.addEventListener('click', function () {
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        fetch('/api/gd-queue/next', { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function (entry) {
+            if (entry && entry.levelId) {
+              navigator.clipboard.writeText(entry.levelId).catch(function () {});
+              btn.textContent = '✅ Copied ' + entry.levelId + '!';
+            } else {
+              btn.textContent = '📭 Queue empty';
+            }
+            setTimeout(function () {
+              btn.textContent = '⏭ Next';
+              btn.disabled = false;
+              btn.style.opacity = '1';
+            }, 2000);
+          })
+          .catch(function () {
+            btn.textContent = '❌ Error';
+            btn.disabled = false;
+            btn.style.opacity = '1';
+          });
+      });
+    }
   }).toString(),
 });
 
+
+// ── Dashboard "Next" API route ────────────────────────────────────────────
+// POST /api/gd-queue/next — dequeues the first entry and returns it as JSON.
+// Called by the dashboard widget's Next button via fetch().
+
+addRoute('/api/gd-queue/next', (req, res) => {
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Method not allowed' }));
+  }
+  const entry = _next();
+  _notify();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(entry ?? null));
+});
 
 // Serves a self-contained overlay page showing only the queue section.
 // Add http://<host>:2999/gd-queue as a Browser Source in OBS.
