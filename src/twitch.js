@@ -30,6 +30,8 @@ async function _fetchThirdPartyEmotes(channelLogin) {
 
   // Strip any leading '#' that tmi.js channel names may have
   const login = channelLogin ? channelLogin.replace(/^#/, '').toLowerCase() : null;
+  log.info(`[Twitch] Fetching third-party emotes. channelLogin=${JSON.stringify(channelLogin)} → login=${JSON.stringify(login)}`);
+  if (!login) log.warn('[Twitch] No channel login — set TWITCH_BROADCASTER_LOGIN in env to load channel emotes');
 
   // ── BTTV global ──────────────────────────────────────────────────────────
   try {
