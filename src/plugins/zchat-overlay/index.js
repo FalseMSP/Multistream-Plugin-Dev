@@ -37,18 +37,118 @@ const state = {
   combined: /** @type {ChatMessage[]} */ ([]),
 };
 
-/** @typedef {{ id: number, platform: string, username: string, message: string, color: string }} ChatMessage */
+/**
+ * @typedef {{ id: number, platform: string, username: string, message: string, color: string, emotes: EmoteSegment[] }} ChatMessage
+ *
+ * @typedef {{ type: 'text',  text: string }}                          TextSegment
+ * @typedef {{ type: 'emote', url: string,  alt: string }}             EmoteSegment
+ * @typedef {TextSegment | EmoteSegment}                               Segment
+ */
 
 let msgId = 0;
+
+/**
+ * Parse Twitch `emotes` tag into a sorted list of {start,end,url}.
+ * emotes tag format:  "302856228:0-6,8-14/emotesv2_abc:16-22"
+ * @param {string|undefined} emotesTag
+ * @returns {{ start:number, end:number, url:string }[]}
+ */
+function parseTwitchEmotesTag(emotesTag) {
+  if (!emotesTag) return [];
+  const result = [];
+  for (const part of emotesTag.split('/')) {
+    const [id, positions] = part.split(':');
+    if (!id || !positions) continue;
+    const url = `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/2.0`;
+    for (const range of positions.split(',')) {
+      const [s, e] = range.split('-').map(Number);
+      if (!isNaN(s) && !isNaN(e)) result.push({ start: s, end: e, url });
+    }
+  }
+  return result.sort((a, b) => a.start - b.start);
+}
+
+/**
+ * Build a Segment[] from raw message text + Twitch emote ranges + YouTube emoji objects
+ * + optional third-party emote word→url map (BTTV/FFZ/7TV).
+ *
+ * @param {string}  message           Raw UTF-16 message text
+ * @param {string}  [emotesTag]       Twitch IRC emotes tag value
+ * @param {Array<{altText:string, url:string, startIndex:number, endIndex:number}>} [ytEmotes]
+ * @param {Record<string,string>} [thirdPartyEmotes]   word → CDN url
+ * @returns {Segment[]}
+ */
+function buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes) {
+  // Collect all char-level replacements from Twitch native + YouTube emotes
+  const replacements = []; // { start, end (exclusive), url, alt }
+
+  for (const { start, end, url } of parseTwitchEmotesTag(emotesTag)) {
+    replacements.push({ start, end: end + 1, url, alt: message.slice(start, end + 1) });
+  }
+
+  if (Array.isArray(ytEmotes)) {
+    for (const e of ytEmotes) {
+      if (e.url && typeof e.startIndex === 'number' && typeof e.endIndex === 'number') {
+        replacements.push({ start: e.startIndex, end: e.endIndex, url: e.url, alt: e.altText || '' });
+      }
+    }
+  }
+
+  // Sort and deduplicate (drop overlaps)
+  replacements.sort((a, b) => a.start - b.start);
+  const deduped = [];
+  let cursor = 0;
+  for (const r of replacements) {
+    if (r.start >= cursor) { deduped.push(r); cursor = r.end; }
+  }
+
+  // Build initial segments
+  const segments = /** @type {Segment[]} */ ([]);
+  let pos = 0;
+  for (const { start, end, url, alt } of deduped) {
+    if (start > pos) segments.push({ type: 'text', text: message.slice(pos, start) });
+    segments.push({ type: 'emote', url, alt });
+    pos = end;
+  }
+  if (pos < message.length) segments.push({ type: 'text', text: message.slice(pos) });
+
+  // Third-party emote pass: split text segments on known emote words
+  if (thirdPartyEmotes && Object.keys(thirdPartyEmotes).length) {
+    const out = /** @type {Segment[]} */ ([]);
+    for (const seg of segments) {
+      if (seg.type !== 'text') { out.push(seg); continue; }
+      const words = seg.text.split(/(\s+)/);
+      let buf = '';
+      for (const token of words) {
+        if (/\s/.test(token)) { buf += token; continue; }
+        const url = thirdPartyEmotes[token];
+        if (url) {
+          if (buf) { out.push({ type: 'text', text: buf }); buf = ''; }
+          out.push({ type: 'emote', url, alt: token });
+        } else {
+          buf += token;
+        }
+      }
+      if (buf) out.push({ type: 'text', text: buf });
+    }
+    return out;
+  }
+
+  return segments.length ? segments : [{ type: 'text', text: message }];
+}
 
 /**
  * @param {'youtube'|'twitch'} platform
  * @param {string} username
  * @param {string} message
  * @param {string} [color]
+ * @param {string} [emotesTag]          Twitch IRC emotes tag
+ * @param {Array}  [ytEmotes]           YouTube emoji array
+ * @param {Record<string,string>} [thirdPartyEmotes]
  */
-function pushMessage(platform, username, message, color) {
-  const entry = { id: ++msgId, platform, username, message, color: color ?? '' };
+function pushMessage(platform, username, message, color, emotesTag, ytEmotes, thirdPartyEmotes) {
+  const segments = buildSegments(message, emotesTag, ytEmotes, thirdPartyEmotes);
+  const entry = { id: ++msgId, platform, username, message, color: color ?? '', segments };
 
   const list = state[platform];
   list.push(entry);
@@ -155,7 +255,7 @@ function buildPage(mode) {
 
   .msg {
     display: flex;
-    align-items: baseline;
+    align-items: center;
     gap: 5px;
     animation: fadeSlideIn 0.25s ease forwards;
     max-width: 100%;
@@ -188,6 +288,18 @@ function buildPage(mode) {
     text-shadow: 0 1px 3px rgba(0,0,0,0.9);
     overflow: hidden;
     text-overflow: ellipsis;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-wrap: nowrap;
+  }
+
+  .emote {
+    display: inline-block;
+    height: 1.6em;
+    width: auto;
+    vertical-align: middle;
+    flex-shrink: 0;
   }
 </style>
 </head>
@@ -223,7 +335,26 @@ function buildPage(mode) {
 
     var textEl = document.createElement('span');
     textEl.className = 'text';
-    textEl.textContent = msg.message;
+
+    // Render pre-parsed segments (text nodes + emote <img>s) when available
+    var segments = msg.segments;
+    if (Array.isArray(segments) && segments.length) {
+      for (var i = 0; i < segments.length; i++) {
+        var seg = segments[i];
+        if (seg.type === 'emote') {
+          var img = document.createElement('img');
+          img.src = seg.url;
+          img.alt = seg.alt || '';
+          img.title = seg.alt || '';
+          img.className = 'emote';
+          textEl.appendChild(img);
+        } else {
+          textEl.appendChild(document.createTextNode(seg.text));
+        }
+      }
+    } else {
+      textEl.textContent = msg.message;
+    }
 
     row.appendChild(nameEl);
     row.appendChild(sep);
@@ -286,15 +417,17 @@ function init(_context) {
   }
 
   queue.onMessage(msg => {
-    const { platform, username, message, color } = msg ?? {};
+    const { platform, username, message, color, emotes, ytEmotes, thirdPartyEmotes } = msg ?? {};
     if (!message || !username) return;
 
     if (platform === 'youtube') {
-      pushMessage('youtube', username, message, color);
+      // `ytEmotes` is an array of YouTube emoji objects; `emotes` is the fallback field name
+      pushMessage('youtube', username, message, color, undefined, ytEmotes ?? emotes, thirdPartyEmotes);
       return;
     }
     if (platform === 'twitch') {
-      pushMessage('twitch', username, message, color);
+      // `emotes` is the raw Twitch IRC emotes tag string; `thirdPartyEmotes` is a BTTV/FFZ/7TV word→url map
+      pushMessage('twitch', username, message, color, emotes, undefined, thirdPartyEmotes);
     }
   });
 }
