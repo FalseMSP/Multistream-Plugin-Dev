@@ -230,7 +230,7 @@ function buildPage(mode) {
     max-width: 100%;
     white-space: nowrap;
     overflow: hidden;
-    transition: opacity 0.5s ease, transform 0.5s ease;
+    transition: opacity 0.5s ease, transform 0.5s ease; 
   }
 
   .msg.fade-out {
@@ -288,13 +288,17 @@ function buildPage(mode) {
   var SSE_ID    = '${sseId}';
   var COMBINED  = ${isCombined};
   var ACCENTS   = { youtube: '#FF0000', twitch: '#9146FF' };
-  var TIMEOUT_MS = 20000; // 20 seconds before disappearing
+  var TIMEOUT_MS = 20000; // 20 seconds per message
 
-  function appendMessage(msg) {
-    // FIX: Check if the message ID already exists in the DOM to avoid duplicating or disrupting it
-    if (feed.querySelector('[data-id="' + msg.id + '"]')) {
+  // Track message IDs we have already processed in this session
+  var processedIds = {};
+
+  function handleIncomingMessage(msg) {
+    // If we've already seen and rendered this exact message ID, ignore it completely
+    if (processedIds[msg.id]) {
       return;
     }
+    processedIds[msg.id] = true;
 
     var row = document.createElement('div');
     row.className = 'msg';
@@ -340,7 +344,7 @@ function buildPage(mode) {
     row.appendChild(textEl);
     feed.appendChild(row);
 
-    // Individual timer stays entirely intact now
+    // Strictly individual timer tied only to this exact DOM node instance
     setTimeout(function() {
       row.classList.add('fade-out');
       setTimeout(function() {
@@ -350,14 +354,10 @@ function buildPage(mode) {
       }, 500);
     }, TIMEOUT_MS);
 
+    // Safety fallback layout cap
     while (feed.children.length > MAX) {
       feed.removeChild(feed.firstChild);
     }
-  }
-
-  function syncMessages(messages) {
-    if (!Array.isArray(messages)) return;
-    messages.forEach(appendMessage);
   }
 
   function connect() {
@@ -365,8 +365,9 @@ function buildPage(mode) {
     es.onmessage = function (e) {
       try {
         var msg = JSON.parse(e.data);
-        if (msg.type === 'section' && msg.id === SSE_ID && msg.data) {
-          syncMessages(msg.data.messages ?? []);
+        if (msg.type === 'section' && msg.id === SSE_ID && msg.data && Array.isArray(msg.data.messages)) {
+          // Process the messages array sequentially
+          msg.data.messages.forEach(handleIncomingMessage);
         }
       } catch (_) {}
     };
