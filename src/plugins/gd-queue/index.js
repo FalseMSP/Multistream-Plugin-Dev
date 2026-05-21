@@ -104,7 +104,7 @@ dashboard.registerWidget('gd-queue', {
     <polygon points="11,2 13.5,8.5 20.5,8.5 14.9,12.7 17,19.5 11,15.3 5,19.5 7.1,12.7 1.5,8.5 8.5,8.5"
              fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
   </svg>`,
-  render: (function render(data, el, esc, { card, badge }) {
+  render: (function render(data, el, esc, { badge }) {
     if (!data) {
       el.innerHTML = '<p style="color:var(--muted);font-size:12px">Waiting for data…</p>';
       badge.textContent = '';
@@ -113,7 +113,6 @@ dashboard.registerWidget('gd-queue', {
     var queue   = data.queue   || [];
     var enabled = data.enabled !== false;
 
-    card.dataset.state = enabled ? '' : 'closed';
     badge.textContent  = queue.length === 1 ? '1 level' : queue.length + ' levels';
 
     if (queue.length === 0) {
