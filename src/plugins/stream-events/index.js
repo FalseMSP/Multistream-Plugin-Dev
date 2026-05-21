@@ -19,16 +19,17 @@
  *     like          — new like (via poll)
  *     superchat     — super chat / super sticker
  *
- * The feed keeps the 50 most recent events, newest first.
+ * The feed keeps the 10 most recent events, newest first.
  * The badge pill shows the count of events seen this session.
  */
 
 const log       = require('../../logger');
 const dashboard = require('../../dashboard');
+const { addRoute } = require('../../overlay-server');
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-const MAX_EVENTS  = 50;
+const MAX_EVENTS  = 10;
 const _events     = [];   // newest-first; each entry is a plain object
 let   _totalCount = 0;
 
@@ -75,6 +76,24 @@ dashboard.registerWidget('stream-events', {
     }
 
     badge.textContent = data.total + ' this session';
+
+    // Clear button — rendered outside el, into a sibling container we create once
+    var clearId = 'stream-events-clear';
+    if (!document.getElementById(clearId)) {
+      var btn = document.createElement('button');
+      btn.id = clearId;
+      btn.textContent = 'Clear';
+      btn.style.cssText =
+        'display:block;margin:6px 14px 0;padding:3px 10px;font-size:10px;font-family:var(--mono);' +
+        'color:var(--muted);background:none;border:1px solid var(--border);border-radius:3px;' +
+        'cursor:pointer;transition:color 0.15s,border-color 0.15s;width:calc(100% - 28px)';
+      btn.onmouseover = function() { btn.style.color='var(--text)'; btn.style.borderColor='var(--muted)'; };
+      btn.onmouseout  = function() { btn.style.color='var(--muted)'; btn.style.borderColor='var(--border)'; };
+      btn.onclick = function() {
+        fetch('/stream-events/clear', { method: 'POST' }).catch(function(){});
+      };
+      el.parentNode.insertBefore(btn, el);
+    }
 
     if (!data.events || data.events.length === 0) {
       el.innerHTML = '<p style="color:var(--muted);font-size:12px;font-family:var(--mono)">No events yet.</p>';
@@ -240,6 +259,18 @@ function init(context) {
 
   _notify();
 }
+
+// ── Clear route ───────────────────────────────────────────────────────────────
+
+addRoute('/stream-events/clear', (req, res) => {
+  if (req.method !== 'POST') { res.writeHead(405); res.end(); return; }
+  _events.length = 0;
+  _totalCount    = 0;
+  log.info('[stream-events] Feed cleared via dashboard');
+  _notify();
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true }));
+});
 
 // ── Exports ───────────────────────────────────────────────────────────────────
 
