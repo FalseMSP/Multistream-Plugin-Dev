@@ -950,26 +950,38 @@ function _buildDashboardPage() {
     }
   }
 
+  // Store removed cards so they can be restored
+  const removedCards = {};
+
   function minimizeWidget(id) {
     minimizedSet.add(id);
     saveMinimized();
     const card = document.getElementById('wcard-' + id);
-    if (card) card.classList.add('minimized');
+    if (card) {
+      removedCards[id] = { card, nextSibling: card.nextSibling };
+      card.remove();
+    }
     updateWidgetsMenu();
   }
 
   function restoreWidget(id) {
     minimizedSet.delete(id);
     saveMinimized();
-    const card = document.getElementById('wcard-' + id);
-    if (card) card.classList.remove('minimized');
+    const saved = removedCards[id];
+    if (saved) {
+      grid.insertBefore(saved.card, saved.nextSibling);
+      delete removedCards[id];
+    }
     updateWidgetsMenu();
   }
 
   // Apply persisted minimized state on load
   for (const id of minimizedSet) {
     const card = document.getElementById('wcard-' + id);
-    if (card) card.classList.add('minimized');
+    if (card) {
+      removedCards[id] = { card, nextSibling: card.nextSibling };
+      card.remove();
+    }
   }
   updateWidgetsMenu();
 
