@@ -230,12 +230,14 @@ function buildPage(mode) {
     max-width: 100%;
     white-space: nowrap;
     overflow: hidden;
-    transition: opacity 0.5s ease, transform 0.5s ease; 
+    transition:
+      opacity 0.8s ease,
+      transform 0.8s ease;
   }
 
   .msg.fade-out {
     opacity: 0;
-    transform: translateY(-4px);
+    transform: translateY(-10px);
   }
 
   @keyframes fadeSlideIn {
@@ -356,7 +358,19 @@ function buildPage(mode) {
 
     // Safety fallback layout cap
     while (feed.children.length > MAX) {
-      feed.removeChild(feed.firstChild);
+      const first = feed.firstChild;
+
+      if (!first.classList.contains('fade-out')) {
+        first.classList.add('fade-out');
+
+        setTimeout(() => {
+          if (first.parentNode === feed) {
+            feed.removeChild(first);
+          }
+        }, 500);
+      } else {
+        break;
+      }
     }
   }
 
