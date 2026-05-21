@@ -251,7 +251,7 @@ function _buildDashboardPage() {
   }
   html, body { height: 100%; background: var(--bg); font-family: 'Inter', system-ui, sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
   /* ── Layout ── */
-  .shell { display: flex; flex-direction: column; min-height: 100vh; }
+  .shell { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
   /* ── Topbar ── */
   .topbar {
     display: flex; align-items: center; gap: 12px; padding: 0 20px; height: 52px;
@@ -267,8 +267,81 @@ function _buildDashboardPage() {
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
   .topbar-logout { font-size: 12px; color: var(--muted); text-decoration: none; padding: 5px 10px; border: 1px solid var(--border); border-radius: 4px; transition: color 0.15s, border-color 0.15s; }
   .topbar-logout:hover { color: var(--text); border-color: var(--muted); }
-  /* ── Grid ── */
-  .grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; padding: 20px; align-content: start; }
+  /* ── Layout shell ── */
+  .dashboard-layout { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+  /* ── Left: widget grid ── */
+  .grid { flex: 1; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; padding: 20px; align-content: start; overflow-y: auto; }
+  /* ── Right: chat column ── */
+  .chat-column {
+    width: 380px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid var(--border);
+    background: var(--surface);
+    overflow: hidden;
+  }
+  .chat-column-header {
+    display: flex; align-items: center; gap: 10px;
+    padding: 11px 14px; border-bottom: 1px solid var(--border);
+    background: var(--accent-lo); flex-shrink: 0;
+  }
+  .chat-column-title { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+  .chat-column-tabs { display: flex; gap: 6px; margin-left: auto; }
+  .chat-tab {
+    font-size: 10px; font-family: var(--mono); font-weight: 700;
+    padding: 3px 8px; border-radius: 3px; border: 1px solid var(--border);
+    background: transparent; color: var(--muted); cursor: pointer; transition: all 0.15s;
+  }
+  .chat-tab.active { background: var(--accent-lo); border-color: rgba(229,57,53,0.35); color: var(--accent); }
+  .chat-tab:hover:not(.active) { color: var(--text); border-color: var(--muted); }
+  .chat-feed {
+    flex: 1; overflow-y: auto; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 4px;
+    scroll-behavior: smooth;
+  }
+  .chat-feed::-webkit-scrollbar { width: 4px; }
+  .chat-feed::-webkit-scrollbar-track { background: transparent; }
+  .chat-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+  .chat-msg { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; line-height: 1.45; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .chat-msg:last-child { border-bottom: none; }
+  .chat-platform-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+  .chat-platform-dot.youtube { background: #FF0000; }
+  .chat-platform-dot.twitch  { background: #9146FF; }
+  .chat-username {
+    font-weight: 700; font-size: 12px; flex-shrink: 0;
+    cursor: pointer; text-decoration: none;
+    transition: opacity 0.15s;
+    background: none; border: none; padding: 0;
+    font-family: inherit; line-height: inherit;
+  }
+  .chat-username:hover { opacity: 0.7; text-decoration: underline; }
+  .chat-sep { color: var(--muted); flex-shrink: 0; }
+  .chat-text { color: var(--text); word-break: break-word; min-width: 0; flex: 1; }
+  .chat-empty { color: var(--muted); font-size: 12px; font-family: var(--mono); padding: 20px 0; text-align: center; }
+  /* ── Moderation modal ── */
+  .mod-overlay {
+    display: none; position: fixed; inset: 0; z-index: 1000;
+    background: rgba(0,0,0,0.6); align-items: center; justify-content: center;
+  }
+  .mod-overlay.open { display: flex; }
+  .mod-modal {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 24px; width: 320px; position: relative;
+  }
+  .mod-modal h3 { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+  .mod-modal .mod-platform { font-size: 11px; font-family: var(--mono); color: var(--muted); margin-bottom: 18px; }
+  .mod-actions { display: flex; flex-direction: column; gap: 8px; }
+  .mod-btn {
+    width: 100%; padding: 9px 14px; border-radius: 5px; border: 1px solid var(--border);
+    font-size: 13px; font-weight: 600; cursor: pointer; text-align: left;
+    background: var(--surface2); color: var(--text); transition: all 0.15s; font-family: inherit;
+  }
+  .mod-btn:hover { border-color: var(--muted); }
+  .mod-btn.danger { color: #ff5252; border-color: rgba(255,82,82,0.3); }
+  .mod-btn.danger:hover { background: rgba(255,82,82,0.1); border-color: #ff5252; }
+  .mod-btn.cancel { color: var(--muted); }
+  .mod-close { position: absolute; top: 12px; right: 14px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; }
   /* ── Widget card ── */
   .widget-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .widget-header { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); background: var(--accent-lo); }
@@ -303,15 +376,54 @@ function _buildDashboardPage() {
     <a class="topbar-logout" href="/dashboard/logout">Sign out</a>
   </header>
 
-  <main class="grid" id="widget-grid">
-    ${_widgets.size === 0 ? `
-    <div class="empty">
-      <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-      <p>No widgets registered yet.<br>Call <code>dashboard.registerWidget()</code> to add one.</p>
-    </div>` : ''}
-  </main>
+  <div class="dashboard-layout">
+    <main class="grid" id="widget-grid">
+      ${_widgets.size === 0 ? `
+      <div class="empty">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <p>No widgets registered yet.<br>Call <code>dashboard.registerWidget()</code> to add one.</p>
+      </div>` : ''}
+    </main>
+
+    <aside class="chat-column">
+      <div class="chat-column-header">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span class="chat-column-title">Live Chat</span>
+        <div class="chat-column-tabs">
+          <button class="chat-tab active" data-feed="combined">All</button>
+          <button class="chat-tab" data-feed="youtube">
+            <span style="color:#FF0000">▶</span> YT
+          </button>
+          <button class="chat-tab" data-feed="twitch">
+            <span style="color:#9146FF">◆</span> TW
+          </button>
+        </div>
+      </div>
+      <div class="chat-feed" id="chat-feed">
+        <div class="chat-empty">No messages yet</div>
+      </div>
+    </aside>
+  </div>
 
   <div class="reconnect-bar" id="reconnect-bar">⚠ Lost connection — reconnecting…</div>
+</div>
+
+<!-- Moderation modal -->
+<div class="mod-overlay" id="mod-overlay">
+  <div class="mod-modal">
+    <button class="mod-close" id="mod-close">×</button>
+    <h3 id="mod-username"></h3>
+    <div class="mod-platform" id="mod-platform"></div>
+    <div class="mod-actions">
+      <button class="mod-btn" id="mod-timeout-60">⏱ Timeout 60s</button>
+      <button class="mod-btn" id="mod-timeout-600">⏱ Timeout 10 min</button>
+      <button class="mod-btn" id="mod-timeout-3600">⏱ Timeout 1 hour</button>
+      <button class="mod-btn danger" id="mod-ban">🚫 Ban permanently</button>
+      <button class="mod-btn cancel" id="mod-cancel">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -341,7 +453,6 @@ function _buildDashboardPage() {
   const bodies = {};
   const badges = {};
 
-  // Clear empty-state placeholder if widgets exist
   if (WIDGETS.length > 0) grid.innerHTML = '';
 
   for (const w of WIDGETS) {
@@ -369,7 +480,154 @@ function _buildDashboardPage() {
 
   for (const w of WIDGETS) invoke(w.id, initialData[w.id]);
 
-  // SSE
+  // ── Chat column ──────────────────────────────────────────────────────────
+
+  const chatFeed   = document.getElementById('chat-feed');
+  const chatTabs   = document.querySelectorAll('.chat-tab');
+  let   chatFilter = 'combined';  // 'combined' | 'youtube' | 'twitch'
+
+  // All received messages, keyed by platform
+  const allMessages = { youtube: [], twitch: [], combined: [] };
+  const MAX_CHAT = 200;
+
+  const PLATFORM_COLORS = { youtube: '#FF0000', twitch: '#9146FF' };
+
+  chatTabs.forEach(tab => {
+    tab.addEventListener('click', () => {
+      chatTabs.forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      chatFilter = tab.dataset.feed;
+      rerenderChat();
+    });
+  });
+
+  function buildChatRow(msg) {
+    const row = document.createElement('div');
+    row.className = 'chat-msg';
+
+    const dot = document.createElement('span');
+    dot.className = 'chat-platform-dot ' + msg.platform;
+    row.appendChild(dot);
+
+    const nameBtn = document.createElement('button');
+    nameBtn.className = 'chat-username';
+    nameBtn.textContent = msg.username;
+    const nameColor = msg.color || PLATFORM_COLORS[msg.platform] || '#ffffff';
+    nameBtn.style.color = nameColor;
+    nameBtn.addEventListener('click', () => openModModal(msg.username, msg.platform));
+    row.appendChild(nameBtn);
+
+    const sep = document.createElement('span');
+    sep.className = 'chat-sep';
+    sep.textContent = ':';
+    row.appendChild(sep);
+
+    const text = document.createElement('span');
+    text.className = 'chat-text';
+    if (Array.isArray(msg.segments) && msg.segments.length) {
+      for (const seg of msg.segments) {
+        if (seg.type === 'emote') {
+          const img = document.createElement('img');
+          img.src = seg.url; img.alt = seg.alt || '';
+          img.style.cssText = 'height:1.3em;vertical-align:middle;margin:0 1px';
+          text.appendChild(img);
+        } else {
+          text.appendChild(document.createTextNode(seg.text));
+        }
+      }
+    } else {
+      text.textContent = msg.message;
+    }
+    row.appendChild(text);
+
+    return row;
+  }
+
+  function rerenderChat() {
+    const msgs = allMessages[chatFilter] || [];
+    chatFeed.innerHTML = '';
+    if (!msgs.length) {
+      chatFeed.innerHTML = '<div class="chat-empty">No messages yet</div>';
+      return;
+    }
+    for (const m of msgs) chatFeed.appendChild(buildChatRow(m));
+    chatFeed.scrollTop = chatFeed.scrollHeight;
+  }
+
+  function pushChatMessages(platform, messages) {
+    const list = allMessages[platform];
+    // Determine new messages by tracking last known length; just push all for combined
+    for (const m of messages) {
+      if (!list.find(x => x.id === m.id)) {
+        list.push(m);
+        if (platform !== 'combined') {
+          // Also add to combined if not already there
+          if (!allMessages.combined.find(x => x.id === m.id)) {
+            allMessages.combined.push(m);
+          }
+        }
+      }
+    }
+    // Trim
+    if (list.length > MAX_CHAT) list.splice(0, list.length - MAX_CHAT);
+    if (allMessages.combined.length > MAX_CHAT) allMessages.combined.splice(0, allMessages.combined.length - MAX_CHAT);
+    // Sort combined by id
+    allMessages.combined.sort((a, b) => a.id - b.id);
+
+    // If currently viewing this platform or combined, append new rows
+    const activeList = allMessages[chatFilter];
+    const atBottom   = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
+
+    // Full re-render is simplest; only perf-sensitive at very high volume
+    rerenderChat();
+    if (atBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
+  }
+
+  // Handle SSE widget updates that carry chat data
+  const CHAT_SECTION_IDS = {
+    'chat-overlay-youtube':  'youtube',
+    'chat-overlay-twitch':   'twitch',
+    'chat-overlay-combined': 'combined',
+  };
+
+  // ── Moderation modal ─────────────────────────────────────────────────────
+
+  const modOverlay  = document.getElementById('mod-overlay');
+  let   modTarget   = { username: '', platform: '' };
+
+  function openModModal(username, platform) {
+    modTarget = { username, platform };
+    document.getElementById('mod-username').textContent = username;
+    document.getElementById('mod-platform').textContent =
+      (platform === 'youtube' ? '▶ YouTube' : '◆ Twitch') + ' · click an action below';
+    modOverlay.classList.add('open');
+  }
+
+  function closeModModal() { modOverlay.classList.remove('open'); }
+
+  async function sendModAction(action, duration) {
+    closeModModal();
+    try {
+      await fetch('/dashboard/moderate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: modTarget.username, platform: modTarget.platform, action, duration }),
+      });
+    } catch (e) {
+      console.warn('[dashboard] moderate request failed:', e);
+    }
+  }
+
+  document.getElementById('mod-close').addEventListener('click', closeModModal);
+  document.getElementById('mod-cancel').addEventListener('click', closeModModal);
+  document.getElementById('mod-timeout-60').addEventListener('click',   () => sendModAction('timeout', 60));
+  document.getElementById('mod-timeout-600').addEventListener('click',  () => sendModAction('timeout', 600));
+  document.getElementById('mod-timeout-3600').addEventListener('click', () => sendModAction('timeout', 3600));
+  document.getElementById('mod-ban').addEventListener('click',          () => sendModAction('ban', 0));
+  modOverlay.addEventListener('click', (e) => { if (e.target === modOverlay) closeModModal(); });
+
+  // ── SSE ──────────────────────────────────────────────────────────────────
+
   const statusDot  = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
   const reconnBar  = document.getElementById('reconnect-bar');
@@ -387,7 +645,14 @@ function _buildDashboardPage() {
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'widget') invoke(msg.id, msg.data);
+        if (msg.type === 'widget') {
+          invoke(msg.id, msg.data);
+          // Also feed chat column
+          const platform = CHAT_SECTION_IDS[msg.id];
+          if (platform && msg.data && Array.isArray(msg.data.messages)) {
+            pushChatMessages(platform, msg.data.messages);
+          }
+        }
       } catch {}
     };
     es.onerror = () => {
@@ -397,6 +662,12 @@ function _buildDashboardPage() {
     };
   }
   connect();
+
+  // Bootstrap chat from initial data
+  for (const [sectionId, platform] of Object.entries(CHAT_SECTION_IDS)) {
+    const d = initialData[sectionId];
+    if (d && Array.isArray(d.messages)) pushChatMessages(platform, d.messages);
+  }
 })();
 </script>
 </body>
@@ -487,6 +758,21 @@ async function handleRequest(req, res) {
     return true;
   }
 
+  // ── POST /dashboard/moderate ──────────────────────────────────────────────
+  if (method === 'POST' && url === '/dashboard/moderate') {
+    const raw = await _readBody(req);
+    let body;
+    try { body = JSON.parse(raw); } catch { body = {}; }
+    const { username, platform, action, duration } = body;
+    if (username && platform && action) {
+      log.info(`[dashboard] Moderation: ${action} ${username} on ${platform}${duration ? ' for ' + duration + 's' : ''}`);
+      _broadcast({ type: 'moderate', username, platform, action, duration: duration ?? 0 });
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return true;
+  }
+
   return false;
 }
 
@@ -503,7 +789,7 @@ async function handleRequest(req, res) {
  * @param {{ addRoute: Function }} overlayModule
  */
 function mountOnOverlayServer(overlayModule) {
-  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state']) {
+  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state', '/dashboard/moderate']) {
     overlayModule.addRoute(route, (req, res) => {
       handleRequest(req, res).then(handled => {
         if (!handled) { res.writeHead(404); res.end('Not found'); }

@@ -161,11 +161,13 @@ for (const platform of ['youtube', 'twitch']) {
     render: (function render(data, el, esc, { badge }) {
       const count = data?.messages?.length ?? 0;
       badge.textContent = count + ' msgs';
-      el.style.cssText = 'padding:8px 12px;font-family:monospace;font-size:13px;max-height:160px;overflow:hidden';
-      if (!count) { el.textContent = 'No messages yet.'; return; }
-      el.innerHTML = data.messages.slice(-5).map(m =>
-        '<div><b>' + esc(m.username) + ':</b> ' + esc(m.message) + '</div>'
-      ).join('');
+      el.style.cssText = 'padding:8px 12px;font-family:monospace;font-size:12px;';
+      const last = data?.messages?.slice(-3) ?? [];
+      if (!last.length) { el.textContent = 'No messages yet.'; return; }
+      el.innerHTML = last.map(m =>
+        '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+        '<b style="color:' + (m.color || '#aaa') + '">' + esc(m.username) + '</b>: ' + esc(m.message) + '</div>'
+      ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
     }).toString(),
   });
   updateSection(`chat-overlay-${platform}`, { messages: [] });
@@ -178,11 +180,13 @@ registerSection('chat-overlay-combined', {
   render: (function render(data, el, esc, { badge }) {
     const count = data?.messages?.length ?? 0;
     badge.textContent = count + ' msgs';
-    el.style.cssText = 'padding:8px 12px;font-family:monospace;font-size:13px;max-height:160px;overflow:hidden';
-    if (!count) { el.textContent = 'No messages yet.'; return; }
-    el.innerHTML = data.messages.slice(-5).map(m =>
-      '<div><b>' + esc(m.username) + '</b> [' + esc(m.platform) + ']: ' + esc(m.message) + '</div>'
-    ).join('');
+    el.style.cssText = 'padding:8px 12px;font-family:monospace;font-size:12px;';
+    const last = data?.messages?.slice(-3) ?? [];
+    if (!last.length) { el.textContent = 'No messages yet.'; return; }
+    el.innerHTML = last.map(m =>
+      '<div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+      '<b style="color:' + (m.color || '#aaa') + '">' + esc(m.username) + '</b> [' + esc(m.platform) + ']: ' + esc(m.message) + '</div>'
+    ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
   }).toString(),
 });
 updateSection('chat-overlay-combined', { messages: [] });
