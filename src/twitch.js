@@ -53,6 +53,8 @@ async function _fetchThirdPartyEmotes(channelLogin) {
           const emotes = [...(d.channelEmotes ?? []), ...(d.sharedEmotes ?? [])];
           for (const e of emotes) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
           log.info(`[Twitch] BTTV channel: loaded ${emotes.length} emotes for ${login}`);
+        } else {
+          log.warn(`[Twitch] BTTV channel fetch returned ${r.status} for ${login} (id: ${userId})`);
         }
       }
     } catch (err) { log.warn('[Twitch] BTTV channel fetch failed:', err.message); }
@@ -135,18 +137,36 @@ async function _fetchThirdPartyEmotes(channelLogin) {
   _thirdPartyEmotes = map;
 }
 
-/** Cache the broadcaster's numeric user ID so emote fetches don't re-hit the Helix API */
+/** Resolve Twitch login → numeric user ID.
+ *  Tries Helix first; falls back to ivr.fi (no auth required) if Helix fails. */
 let _broadcasterUserId = null;
 async function _resolveUserId(login) {
   if (_broadcasterUserId) return _broadcasterUserId;
+  const { default: fetch } = await import('node-fetch');
+
+  // Primary: Helix API (needs CLIENT_ID + app token)
   try {
     const data = await helixRequest('GET', `/users?login=${login}`);
     _broadcasterUserId = data?.data?.[0]?.id ?? null;
-    if (_broadcasterUserId) log.info(`[Twitch] Resolved user ID for ${login}: ${_broadcasterUserId}`);
-    else log.warn(`[Twitch] Could not resolve user ID for login: ${login}`);
   } catch (err) {
-    log.warn(`[Twitch] _resolveUserId failed for ${login}:`, err.message);
+    log.warn(`[Twitch] _resolveUserId Helix failed for ${login}:`, err.message);
   }
+
+  // Fallback: ivr.fi — public proxy, no auth needed
+  if (!_broadcasterUserId) {
+    try {
+      const r = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${encodeURIComponent(login)}`);
+      if (r.ok) {
+        const d = await r.json();
+        _broadcasterUserId = d?.[0]?.id ?? null;
+      }
+    } catch (err) {
+      log.warn(`[Twitch] _resolveUserId ivr.fi fallback failed for ${login}:`, err.message);
+    }
+  }
+
+  if (_broadcasterUserId) log.info(`[Twitch] Resolved user ID for ${login}: ${_broadcasterUserId}`);
+  else log.warn(`[Twitch] Could not resolve user ID for ${login} — channel emotes (BTTV/7TV) will be skipped`);
   return _broadcasterUserId;
 }
 
