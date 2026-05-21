@@ -291,6 +291,11 @@ function buildPage(mode) {
   var TIMEOUT_MS = 20000; // 20 seconds before disappearing
 
   function appendMessage(msg) {
+    // FIX: Check if the message ID already exists in the DOM to avoid duplicating or disrupting it
+    if (feed.querySelector('[data-id="' + msg.id + '"]')) {
+      return;
+    }
+
     var row = document.createElement('div');
     row.className = 'msg';
     row.dataset.id = msg.id;
@@ -335,10 +340,9 @@ function buildPage(mode) {
     row.appendChild(textEl);
     feed.appendChild(row);
 
-    // Set expiration timer to fade out and remove the row
+    // Individual timer stays entirely intact now
     setTimeout(function() {
       row.classList.add('fade-out');
-      // Wait for the opacity CSS transition to finish before dropping DOM node
       setTimeout(function() {
         if (row.parentNode === feed) {
           feed.removeChild(row);
@@ -352,7 +356,7 @@ function buildPage(mode) {
   }
 
   function syncMessages(messages) {
-    feed.innerHTML = '';
+    if (!Array.isArray(messages)) return;
     messages.forEach(appendMessage);
   }
 
