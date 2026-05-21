@@ -22,9 +22,8 @@ const queue               = require('./src/queue');
 const log                 = require('./src/logger');
 const plugins             = require('./src/plugins/index');
 
-// ▶ ADD THIS LINE — must come after plugins require() so registerSection()
-//   calls inside plugin modules (which fire at require-time) are already wired.
 const { startOverlayServer } = require('./src/overlay-server');
+const dashboard = require('./src/dashboard');
 
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
 process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err));
@@ -40,7 +39,8 @@ async function main() {
   //     already-loaded ids. initPlugins() runs init() again with the richer context.
   plugins.loadPlugins();
   plugins.initPlugins({ ...discord, queue });
-
+  dashboard.mountOnOverlayServer(require('./src/overlay-server'));
+  
   // 1c. ▶ ADD THIS LINE — start the overlay HTTP server.
   //     Port is optional; defaults to 2999.
   //     OBS Browser Source URL: http://127.0.0.1:2999/overlay
