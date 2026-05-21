@@ -20,6 +20,12 @@
  * when a user has not yet spoken (participant cache miss).
  * Quota tracker retained; if quota is exhausted the channel-ID
  * scan falls back gracefully with a clear error.
+ *
+ * Env vars:
+ *   YT_POLL_INTERVAL      — watchdog scrape interval in seconds (default: 30; no quota cost)
+ *   YT_LIKE_POLL_INTERVAL — like count Data API poll in seconds (default: 60; min clamped to 30)
+ *   YT_SUB_POLL_INTERVAL  — subscriber count Data API poll in seconds (default: 60; min clamped to 30)
+ *   YT_QUOTA_LIMIT        — daily Data API quota budget (default: 100000)
  */
 
 const log = require('./logger');
@@ -27,8 +33,14 @@ const log = require('./logger');
 const YT_API_KEY    = process.env.YT_API_KEY       ?? '';
 const YT_VIDEO_ID   = process.env.YT_VIDEO_ID      ?? '';
 const YT_CHANNEL_ID = process.env.YT_CHANNEL_ID    ?? '';
-const POLL_INTERVAL     = parseInt(process.env.YT_POLL_INTERVAL     ?? '30', 10) * 1000;
-const SUB_POLL_INTERVAL = parseInt(process.env.YT_SUB_POLL_INTERVAL ?? '60', 10) * 1000;
+const POLL_INTERVAL      = parseInt(process.env.YT_POLL_INTERVAL      ?? '30', 10) * 1000;
+const LIKE_POLL_INTERVAL = parseInt(process.env.YT_LIKE_POLL_INTERVAL ?? '60', 10) * 1000;
+const SUB_POLL_INTERVAL  = parseInt(process.env.YT_SUB_POLL_INTERVAL  ?? '60', 10) * 1000;
+
+// Sanity-clamp pollers that hit the Data API to avoid quota blowout
+// (watchdog uses a scrape, not the API, so POLL_INTERVAL can be lower)
+const _LIKE_POLL_MS = Math.max(LIKE_POLL_INTERVAL, 30_000);  // floor 30 s
+const _SUB_POLL_MS  = Math.max(SUB_POLL_INTERVAL,  30_000);  // floor 30 s
 
 // ── Hoisted fetch ─────────────────────────────────────────────────────────
 
@@ -160,6 +172,10 @@ function _getYoutubeClient() {
 // ── Data API: live chat ID lookup (1 quota unit) ──────────────────────────
 
 async function _getLiveChatId(videoId) {
+  if (!_hasQuota()) {
+    log.warn('[YouTube] _getLiveChatId skipped — quota exhausted');
+    return null;
+  }
   const fetch = await _getFetch();
   const url   = `https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=${videoId}&key=${YT_API_KEY}`;
   const res   = await fetch(url);
@@ -257,7 +273,8 @@ async function _runFetchLane(laneId, session, queue, isFirstLane) {
         _cacheParticipant(session, displayName, channelId);
 
         if (!id || _isDuplicate(session, id) || !message) continue;
-        queue.pushMessage({ platform: 'youtube', username: displayName, message });
+        const ytEmotes = _extractYtEmotes(action.message);
+        queue.pushMessage({ platform: 'youtube', username: displayName, message, ytEmotes: ytEmotes.length ? ytEmotes : undefined });
       }
     } else {
       for (const action of result?.actions ?? []) {
@@ -278,6 +295,32 @@ function _stringifyRuns(runs) {
   return runs
     .map(r => r.text ?? r.emoji?.shortcuts?.[0] ?? r.emoji?.emojiId ?? '')
     .join('');
+}
+
+/**
+ * Extract structured emoji segments from masterchat runs for the overlay renderer.
+ * Returns an array in the same format index.js passes as ytEmotes:
+ *   { url, altText, startIndex, endIndex }
+ * Only emojis with image URLs are included; plain text runs are skipped.
+ */
+function _extractYtEmotes(runs) {
+  if (!runs) return [];
+  const emotes = [];
+  let charPos = 0;
+  for (const r of runs) {
+    if (r.text) {
+      charPos += r.text.length;
+    } else if (r.emoji) {
+      const imgUrl = r.emoji.image?.thumbnails?.[0]?.url ?? null;
+      const alt    = r.emoji.shortcuts?.[0] ?? r.emoji.emojiId ?? '';
+      const len    = alt.length || 1;
+      if (imgUrl) {
+        emotes.push({ url: imgUrl, altText: alt, startIndex: charPos, endIndex: charPos + len });
+      }
+      charPos += len;
+    }
+  }
+  return emotes;
 }
 
 // ── masterchat session ────────────────────────────────────────────────────
@@ -441,8 +484,15 @@ async function _resolveChannelId(youtube, session, displayName) {
   }
 
   log.debug(`[YouTube] Participant cache miss for "${displayName}" — scanning live chat via Data API`);
+  // Cap at 5 pages (1000 messages, 25 quota units) to prevent runaway scans on busy chats
+  const MAX_SCAN_PAGES = 5;
   let pageToken;
+  let pagesScanned = 0;
   do {
+    if (!_hasQuota()) {
+      log.warn(`[YouTube] _resolveChannelId: quota exhausted mid-scan for "${displayName}"`);
+      break;
+    }
     const res = await youtube.liveChatMessages.list({
       liveChatId: session.liveChatId,
       part: ['authorDetails'],
@@ -450,6 +500,7 @@ async function _resolveChannelId(youtube, session, displayName) {
       ...(pageToken ? { pageToken } : {}),
     });
     _consumeQuota(QUOTA_PER_SCAN_CALL);
+    pagesScanned++;
     for (const item of res.data.items ?? []) {
       const name = item.authorDetails?.displayName;
       const id   = item.authorDetails?.channelId;
@@ -457,8 +508,11 @@ async function _resolveChannelId(youtube, session, displayName) {
       if (name?.toLowerCase() === key) return id;
     }
     pageToken = res.data.nextPageToken;
-  } while (pageToken);
+  } while (pageToken && pagesScanned < MAX_SCAN_PAGES);
 
+  if (pagesScanned >= MAX_SCAN_PAGES && pageToken) {
+    log.warn(`[YouTube] _resolveChannelId: page cap (${MAX_SCAN_PAGES}) reached for "${displayName}" — user not found in last ${MAX_SCAN_PAGES * 200} messages`);
+  }
   return null;
 }
 
@@ -551,6 +605,7 @@ async function ytUnvip(_, username) {
         liveChatId: session.liveChatId, part: ['snippet'], maxResults: 50,
         ...(pageToken ? { pageToken } : {}),
       });
+      _consumeQuota(1); // liveChatModerators.list costs 1 unit per page
       for (const item of res.data.items ?? []) {
         if (item.snippet?.moderatorDetails?.displayName?.toLowerCase() === normalised) {
           moderatorId = item.id;
@@ -629,6 +684,10 @@ let _namedSubThisCycle = 0;
 
 async function _fetchSubscriberCount() {
   if (!YT_API_KEY || !YT_CHANNEL_ID) return null;
+  if (!_hasQuota()) {
+    log.warn('[YouTube] Subscriber count fetch skipped — quota exhausted');
+    return null;
+  }
   const fetch = await _getFetch();
   const url   = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${YT_CHANNEL_ID}&key=${YT_API_KEY}`;
   const res   = await fetch(url);
@@ -672,17 +731,21 @@ function _startSubscriberPoller(queue) {
     log.warn('[YouTube] Subscriber count poller disabled — YT_API_KEY and YT_CHANNEL_ID both required.');
     return;
   }
-  log.info(`[YouTube] Subscriber poller started (interval: ${SUB_POLL_INTERVAL / 1000}s)`);
+  log.info(`[YouTube] Subscriber poller started (interval: ${_SUB_POLL_MS / 1000}s)`);
   _pollSubscriberCount(queue).catch(() => {});
   _subPollerTimer = setInterval(() => {
     _pollSubscriberCount(queue).catch(err => log.warn('[YouTube] Subscriber poll error:', err.message));
-  }, SUB_POLL_INTERVAL);
+  }, _SUB_POLL_MS);
 }
 
 // ── Like count poller ─────────────────────────────────────────────────────
 
 async function _fetchLikeCount(videoId) {
   if (!YT_API_KEY || !videoId) return null;
+  if (!_hasQuota()) {
+    log.warn('[YouTube] Like count fetch skipped — quota exhausted');
+    return null;
+  }
   const fetch = await _getFetch();
   const url   = `https://www.googleapis.com/youtube/v3/videos?part=statistics&id=${videoId}&key=${YT_API_KEY}`;
   const res   = await fetch(url);
@@ -723,11 +786,11 @@ function _startLikePoller(videoId, session, queue) {
     log.warn('[YouTube] Like count poller disabled — YT_API_KEY required.');
     return;
   }
-  log.info(`[YouTube] Like poller started for video=${videoId} (interval: ${POLL_INTERVAL / 1000}s)`);
+  log.info(`[YouTube] Like poller started for video=${videoId} (interval: ${_LIKE_POLL_MS / 1000}s)`);
   _pollLikeCount(videoId, session, queue).catch(() => {});
   session.likePollerTimer = setInterval(() => {
     _pollLikeCount(videoId, session, queue).catch(err => log.warn('[YouTube] Like poll error:', err.message));
-  }, POLL_INTERVAL);
+  }, _LIKE_POLL_MS);
 }
 
 async function startYouTube(queue, websubRunning) {
@@ -737,12 +800,14 @@ async function startYouTube(queue, websubRunning) {
   }
 
   log.info('[YouTube] Chat reader: masterchat dual-lane pipelined fetch (primary)');
+  log.info(`[YouTube] Watchdog interval: ${POLL_INTERVAL / 1000}s | Like poller: ${_LIKE_POLL_MS / 1000}s | Sub poller: ${_SUB_POLL_MS / 1000}s`);
 
   if (YT_API_KEY) {
     log.info(
       `[YouTube] Data API available for mod channel-ID scans. ` +
       `Daily budget: ${QUOTA_DAILY_LIMIT} units. ` +
-      `Participant cache eliminates API calls for users who have chatted.`
+      `Participant cache eliminates API calls for users who have chatted. ` +
+      `Scan page cap: 5 pages (25 quota units max per cache-miss mod action).`
     );
   } else {
     log.warn('[YouTube] YT_API_KEY not set — mod actions require users to have chatted (participant cache only).');
