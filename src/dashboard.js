@@ -870,47 +870,47 @@ function _buildDashboardPage() {
   grid.addEventListener('mousedown', (e) => {
     const header = e.target.closest('.widget-header');
     if (!header) return;
-    // Don't hijack minimize button
     if (e.target.closest('.widget-minimize')) return;
     const card = header.closest('.widget-card');
     if (!card) return;
     e.preventDefault();
-    const startX   = e.clientX;
-    const startY   = e.clientY;
-    const startL   = parseInt(card.style.left) || 0;
-    const startT   = parseInt(card.style.top)  || 0;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startL = parseInt(card.style.left) || 0;
+    const startT = parseInt(card.style.top)  || 0;
     card.style.zIndex = '50';
     card.classList.add('dragging');
     wDrag = { card, startX, startY, startL, startT };
-  });
 
-  document.addEventListener('mousemove', (e) => {
-    if (!wDrag) return;
-    const { card, startX, startY, startL, startT } = wDrag;
-    let nx = startL + (e.clientX - startX);
-    let ny = startT + (e.clientY - startY);
-    if (e.shiftKey) {
-      nx = Math.round(nx / SNAP_GRID) * SNAP_GRID;
-      ny = Math.round(ny / SNAP_GRID) * SNAP_GRID;
-      card.classList.add('snap-preview');
-    } else {
-      card.classList.remove('snap-preview');
+    function onMove(e) {
+      let nx = startL + (e.clientX - startX);
+      let ny = startT + (e.clientY - startY);
+      if (e.shiftKey) {
+        nx = Math.round(nx / SNAP_GRID) * SNAP_GRID;
+        ny = Math.round(ny / SNAP_GRID) * SNAP_GRID;
+        card.classList.add('snap-preview');
+      } else {
+        card.classList.remove('snap-preview');
+      }
+      card.style.left = Math.max(0, nx) + 'px';
+      card.style.top  = Math.max(0, ny) + 'px';
     }
-    card.style.left = Math.max(0, nx) + 'px';
-    card.style.top  = Math.max(0, ny) + 'px';
-  });
 
-  document.addEventListener('mouseup', (e) => {
-    if (!wDrag) return;
-    wDrag.card.classList.remove('dragging', 'snap-preview');
-    wDrag.card.style.zIndex = '';
-    expandCanvas();
-    savePositions();
-    wDrag = null;
+    function onUp() {
+      card.classList.remove('dragging', 'snap-preview');
+      card.style.zIndex = '';
+      expandCanvas();
+      savePositions();
+      wDrag = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
   });
 
   // ── Widget resize ────────────────────────────────────────────────────────
-  let wResizing = null;
   document.addEventListener('mousedown', (e) => {
     const handle = e.target.closest('.widget-resize-handle');
     if (!handle) return;
@@ -920,31 +920,32 @@ function _buildDashboardPage() {
     const startX = e.clientX, startY = e.clientY;
     const startW = card.offsetWidth, startH = card.offsetHeight;
     card.classList.add('is-resizing');
-    wResizing = { card, startX, startY, startW, startH };
     document.body.style.cursor = 'se-resize';
-  });
-  document.addEventListener('mousemove', (e) => {
-    if (!wResizing) return;
-    const { card, startX, startY, startW, startH } = wResizing;
-    const newW = Math.max(220, startW + (e.clientX - startX));
-    const newH = Math.max(120, startH + (e.clientY - startY));
-    card.style.width  = newW + 'px';
-    card.style.height = newH + 'px';
-    // Make body fill remaining height
-    const body = card.querySelector('.widget-body');
-    if (body) {
-      const headerH = card.querySelector('.widget-header')?.offsetHeight || 0;
-      body.style.height = (newH - headerH) + 'px';
-      body.style.overflow = 'auto';
+
+    function onMove(e) {
+      const newW = Math.max(220, startW + (e.clientX - startX));
+      const newH = Math.max(120, startH + (e.clientY - startY));
+      card.style.width  = newW + 'px';
+      card.style.height = newH + 'px';
+      const body = card.querySelector('.widget-body');
+      if (body) {
+        const headerH = card.querySelector('.widget-header')?.offsetHeight || 0;
+        body.style.height = (newH - headerH) + 'px';
+        body.style.overflow = 'auto';
+      }
     }
-  });
-  document.addEventListener('mouseup', () => {
-    if (!wResizing) return;
-    wResizing.card.classList.remove('is-resizing');
-    wResizing = null;
-    document.body.style.cursor = '';
-    expandCanvas();
-    savePositions();
+
+    function onUp() {
+      card.classList.remove('is-resizing');
+      document.body.style.cursor = '';
+      expandCanvas();
+      savePositions();
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    }
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
   });
 
   function invoke(id, data) {
