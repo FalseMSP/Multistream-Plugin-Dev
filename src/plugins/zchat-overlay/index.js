@@ -18,6 +18,7 @@
  */
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
+const dashboard = require('../../dashboard');
 const twitch    = require('../../twitch'); 
 const queue = require('../../queue');
 const log   = require('../../logger');
@@ -153,7 +154,7 @@ function pushMessage(platform, username, message, color, emotesTag, ytEmotes, th
 
 for (const platform of ['youtube', 'twitch']) {
   const isYT = platform === 'youtube';
-  registerSection(`chat-overlay-${platform}`, {
+  const widgetOpts = {
     title: isYT ? 'YouTube Chat' : 'Twitch Chat',
     order: isYT ? 10 : 11,
     icon: isYT
@@ -170,11 +171,13 @@ for (const platform of ['youtube', 'twitch']) {
         '<b style="color:' + (m.color || '#aaa') + '">' + esc(m.username) + '</b>: ' + esc(m.message) + '</div>'
       ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
     }).toString(),
-  });
+  };
+  registerSection(`chat-overlay-${platform}`, widgetOpts);
+  dashboard.registerWidget(`chat-overlay-${platform}`, widgetOpts);
   updateSection(`chat-overlay-${platform}`, { messages: [] });
 }
 
-registerSection('chat-overlay-combined', {
+const combinedOpts = {
   title: 'Combined Chat',
   order: 12,
   icon: `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><rect width="22" height="22" rx="5" fill="#333"/><rect x="3" y="3" width="7" height="7" rx="1" fill="#FF0000"/><rect x="12" y="3" width="7" height="7" rx="1" fill="#9146FF"/><rect x="3" y="12" width="16" height="2" rx="1" fill="#fff" opacity="0.5"/><rect x="3" y="16" width="10" height="2" rx="1" fill="#fff" opacity="0.3"/></svg>`,
@@ -189,7 +192,9 @@ registerSection('chat-overlay-combined', {
       '<b style="color:' + (m.color || '#aaa') + '">' + esc(m.username) + '</b> [' + esc(m.platform) + ']: ' + esc(m.message) + '</div>'
     ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
   }).toString(),
-});
+};
+registerSection('chat-overlay-combined', combinedOpts);
+dashboard.registerWidget('chat-overlay-combined', combinedOpts);
 updateSection('chat-overlay-combined', { messages: [] });
 
 // ─── HTML builder ─────────────────────────────────────────────────────────────
