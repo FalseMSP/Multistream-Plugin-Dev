@@ -977,7 +977,7 @@ function _buildDashboardPage() {
       chatTabs.forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       chatFilter = tab.dataset.feed;
-      rerenderChat(true);
+      rerenderChat();
     });
   });
 
@@ -1032,46 +1032,70 @@ function _buildDashboardPage() {
     return row;
   }
 
-  function rerenderChat(scrollToBottom = false) {
+  // Tracks which message ids are currently rendered in the feed
+  const renderedIds = new Set();
+
+  function rerenderChat() {
+    // Full rebuild — used when switching tabs
+    renderedIds.clear();
     const msgs = allMessages[chatFilter] || [];
     chatFeed.innerHTML = '';
     if (!msgs.length) {
       chatFeed.innerHTML = '<div class="chat-empty">No messages yet</div>';
       return;
     }
-    for (const m of msgs) chatFeed.appendChild(buildChatRow(m));
-    if (scrollToBottom) {
-      const last = chatFeed.lastElementChild;
-      if (last) last.scrollIntoView({ block: 'end' });
+    for (const m of msgs) {
+      chatFeed.appendChild(buildChatRow(m));
+      renderedIds.add(m.id);
     }
+    chatFeed.scrollTop = chatFeed.scrollHeight;
   }
 
   function pushChatMessages(platform, messages) {
     const list = allMessages[platform];
-    // Determine new messages by tracking last known length; just push all for combined
+
     for (const m of messages) {
-      if (m.dashboardSuppress) continue; // filtered by a plugin (e.g. yt-bot-filter)
+      if (m.dashboardSuppress) continue;
       if (!list.find(x => x.id === m.id)) {
         list.push(m);
         if (platform !== 'combined') {
-          // Also add to combined if not already there
           if (!allMessages.combined.find(x => x.id === m.id)) {
             allMessages.combined.push(m);
           }
         }
       }
     }
+
     // Trim
     if (list.length > MAX_CHAT) list.splice(0, list.length - MAX_CHAT);
     if (allMessages.combined.length > MAX_CHAT) allMessages.combined.splice(0, allMessages.combined.length - MAX_CHAT);
-    // Sort combined by id
     allMessages.combined.sort((a, b) => a.id - b.id);
 
-    // Check scroll position before re-render so we can restore it if at bottom
+    // Only append messages that belong to the currently active tab
+    const toAppend = messages.filter(m => {
+      if (m.dashboardSuppress) return false;
+      if (renderedIds.has(m.id)) return false;
+      if (chatFilter === 'combined') return true;
+      return m.platform === chatFilter;
+    });
+
+    if (!toAppend.length) return;
+
+    // Remove the 'no messages' placeholder if present
+    const empty = chatFeed.querySelector('.chat-empty');
+    if (empty) empty.remove();
+
     const atBottom = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
 
-    // Full re-render is simplest; only perf-sensitive at very high volume
-    rerenderChat(atBottom);
+    for (const m of toAppend) {
+      chatFeed.appendChild(buildChatRow(m));
+      renderedIds.add(m.id);
+    }
+
+    // Trim excess DOM nodes from the top
+    while (chatFeed.children.length > MAX_CHAT) chatFeed.removeChild(chatFeed.firstChild);
+
+    if (atBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
   }
 
   // Handle SSE widget updates that carry chat data
