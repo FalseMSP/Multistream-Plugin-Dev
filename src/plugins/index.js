@@ -191,4 +191,97 @@ function setChatReply(chatReply) {
 
 function getChatReply() { return _chatReply; }
 
-module.exports = { loadPlugins, initPlugins, getPluginCommands, handlePluginInteraction, runPipeline, setChatReply, getChatReply };
+/**
+ * Return metadata for all plugin slash commands in the same shape as
+ * discord.coreCommandsMeta, suitable for building dashboard UI.
+ * Each entry: { name, description, options: [{ name, description, required, choices? }] }
+ */
+function getPluginCommandsMeta() {
+  const out = [];
+  for (const plugin of _plugins) {
+    const list = plugin.commands
+      ? (Array.isArray(plugin.commands) ? plugin.commands : [plugin.commands])
+      : plugin.command
+        ? [plugin.command]
+        : [];
+    for (const cmd of list) {
+      const json = cmd.toJSON ? cmd.toJSON() : cmd;
+      out.push({
+        name:        json.name,
+        description: json.description ?? '',
+        pluginId:    plugin.id,
+        options:     (json.options ?? []).map(o => ({
+          name:        o.name,
+          description: o.description ?? '',
+          required:    o.required ?? false,
+          choices:     o.choices  ?? null,
+          type:        o.type     ?? null,   // discord option type int, useful for selects
+        })),
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Dispatch a plugin slash command from a non-Discord caller (e.g. the dashboard).
+ * Builds a minimal synthetic interaction object and routes it through handlePluginInteraction.
+ *
+ * @param {string} name     Command name owned by a plugin
+ * @param {Record<string, string>} optionValues  Map of option name → value string
+ * @returns {Promise<string[]>}  Result lines (same contract as discord.dispatchCommand)
+ */
+async function dispatchPluginCommand(name, optionValues = {}) {
+  const results = [];
+  let replied = false;
+
+  // Synthetic interaction that satisfies the read paths plugins typically use
+  const interaction = {
+    commandName: name,
+    isChatInputCommand: () => true,
+    deferred:  false,
+    replied:   false,
+    options: {
+      getString:  (key) => optionValues[key] ?? null,
+      getInteger: (key) => {
+        const v = optionValues[key];
+        return v !== undefined && v !== null ? parseInt(v, 10) : null;
+      },
+      getNumber:  (key) => {
+        const v = optionValues[key];
+        return v !== undefined && v !== null ? parseFloat(v) : null;
+      },
+      getBoolean: (key) => {
+        const v = optionValues[key];
+        if (v === null || v === undefined) return null;
+        return v === 'true' || v === true;
+      },
+      getUser:    (key) => optionValues[key] ? { username: optionValues[key], id: null } : null,
+    },
+    async deferReply()  { interaction.deferred = true; },
+    async reply(payload)  {
+      replied = true;
+      interaction.replied = true;
+      const text = typeof payload === 'string' ? payload : (payload.content ?? '');
+      if (text) results.push(text);
+    },
+    async editReply(payload) {
+      const text = typeof payload === 'string' ? payload : (payload.content ?? '');
+      if (text) results.push(text);
+    },
+    async followUp(payload) {
+      const text = typeof payload === 'string' ? payload : (payload.content ?? '');
+      if (text) results.push(text);
+    },
+  };
+
+  const handled = await handlePluginInteraction(interaction);
+  if (!handled) results.push(`⚠️ No plugin owns command /${name}`);
+  return results;
+}
+
+module.exports = {
+  loadPlugins, initPlugins, getPluginCommands, getPluginCommandsMeta,
+  handlePluginInteraction, dispatchPluginCommand,
+  runPipeline, setChatReply, getChatReply,
+};
