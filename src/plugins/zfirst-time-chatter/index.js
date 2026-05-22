@@ -118,11 +118,14 @@ async function processMessage(msg) {
 
   log.info(`[first-time-chatter] First message from ${msg.username} on ${msg.platform}.`);
 
+  // Tag the message so consumers (e.g. the dashboard) can highlight it.
+  const taggedMsg = { ...msg, firstTimer: true };
+
   const webhook = _getWebhook();
 
   if (!webhook) {
     log.warn('[first-time-chatter] No DISCORD_CHAT_WEBHOOK_URL — cannot send first-timer embed.');
-    return { message: msg }; // degrade gracefully: let the normal send happen
+    return { message: taggedMsg }; // degrade gracefully: let the normal send happen
   }
 
   // Send our styled embed ourselves …
@@ -131,11 +134,12 @@ async function processMessage(msg) {
     await webhook.send({ embeds: [embed] });
   } catch (e) {
     log.error('[first-time-chatter] Failed to send first-timer embed:', e.message);
-    return { message: msg }; // degrade gracefully
+    return { message: taggedMsg }; // degrade gracefully
   }
 
-  // … then suppress so discord.js doesn't send a plain duplicate.
-  return { message: null };
+  // Suppress the plain Discord chat send, but keep the tagged message
+  // flowing through the pipeline so the dashboard can highlight it.
+  return { message: taggedMsg, suppress: true };
 }
 
 // ── Export ────────────────────────────────────────────────────────────────

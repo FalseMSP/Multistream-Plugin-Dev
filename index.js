@@ -71,7 +71,10 @@ async function main() {
     for (const fn of sideEffects) {
       fn().catch(err => log.error('[main] sideEffect error:', err.message));
     }
-    if (finalMsg) discord.sendChat(finalMsg);
+    if (finalMsg) {
+      discord.sendChat(finalMsg);
+      dashboard.pushChatMessage(finalMsg);
+    }
   });
   queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
   queue.onDonation((donation)  => discord.sendDonation(donation));

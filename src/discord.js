@@ -322,4 +322,58 @@ async function startDiscordBot() {
   return api;
 }
 
-module.exports = { startDiscordBot };
+/**
+ * Dispatch a slash command by name from a non-Discord caller (e.g. the dashboard).
+ * Returns an array of result strings, one per platform action taken.
+ *
+ * @param {string} name     Command name: 'ban' | 'vip' | 'unvip'
+ * @param {{ user: string, platform?: string, reason?: string }} options
+ * @returns {Promise<string[]>}
+ */
+async function dispatchCommand(name, options = {}) {
+  const user     = options.user     ?? '';
+  const platform = options.platform ?? 'both';
+  const reason   = options.reason   ?? 'No reason provided';
+
+  if (!user) return ['⚠️ No username provided'];
+
+  const results = [];
+
+  async function run(platformKey, action) {
+    const handler = _modHandlers[action];
+    if (!handler) { results.push(`⚠️ No ${platformKey} handler for /${action}`); return; }
+    try {
+      await handler(platformKey, user, reason);
+      results.push(`✅ /${action} applied to **${user}** on ${platformKey}`);
+    } catch (err) {
+      results.push(`❌ ${platformKey} error: ${err.message}`);
+      log.error(`/dashboard command /${action} ${platformKey} error:`, err);
+    }
+  }
+
+  const platforms = platform === 'both' ? ['twitch', 'youtube'] : [platform];
+
+  if      (name === 'ban')   for (const p of platforms) await run(p, 'ban');
+  else if (name === 'vip')   for (const p of platforms) await run(p, 'vip');
+  else if (name === 'unvip') for (const p of platforms) await run(p, 'unvip');
+  else results.push(`⚠️ Unknown command: /${name}`);
+
+  return results;
+}
+
+/**
+ * Metadata for all core slash commands, suitable for building dashboard UI.
+ * Each entry: { name, description, options: [{ name, description, required, choices? }] }
+ */
+const coreCommandsMeta = coreCommands.map(cmd => ({
+  name:        cmd.name,
+  description: cmd.description,
+  options:     (cmd.options ?? []).map(o => ({
+    name:        o.name,
+    description: o.description,
+    required:    o.required ?? false,
+    choices:     o.choices  ?? null,
+  })),
+}));
+
+module.exports = { startDiscordBot, dispatchCommand, coreCommandsMeta };

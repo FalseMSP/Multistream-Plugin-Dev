@@ -35,6 +35,7 @@
  *   GET  /dashboard/logout   — clears session cookie
  *   GET  /dashboard/sse      — SSE stream for live widget updates (requires auth)
  *   GET  /dashboard/state    — full JSON snapshot of all widget data (requires auth)
+ *   POST /dashboard/command  — run a slash command { name, user, platform?, reason? } (requires auth)
  *
  * ── Integration with overlay-server ──────────────────────────────────────
  *
@@ -130,7 +131,35 @@ function updateWidget(id, data) {
   _broadcast({ type: 'widget', id, data });
 }
 
-// ── SSE broadcast ─────────────────────────────────────────────────────────
+/**
+ * Append a single chat message to the dashboard chat feed.
+ * Only call this with messages that have already passed through runPipeline,
+ * so the dashboard sees exactly what Discord sees.
+ * @param {{ platform: string, username: string, message: string, id?: *, firstTimer?: boolean }} msg
+ */
+function pushChatMessage(msg) {
+  const widgetId = `chat-overlay-${msg.platform}`;
+  const widget   = _widgets.get(widgetId);
+
+  // Assign a monotonic id if the message doesn't already have one
+  const entry = { ...msg, id: msg.id ?? Date.now() };
+
+  if (widget) {
+    const data     = widget.data ?? { messages: [] };
+    const messages = [...(data.messages ?? []), entry].slice(-200);
+    updateWidget(widgetId, { ...data, messages });
+  }
+
+  // Also push to the combined widget if it exists
+  const combined = _widgets.get('chat-overlay-combined');
+  if (combined) {
+    const data     = combined.data ?? { messages: [] };
+    const messages = [...(data.messages ?? []), entry].slice(-200);
+    updateWidget('chat-overlay-combined', { ...data, messages });
+  }
+}
+
+
 
 const _clients = new Set();
 
@@ -354,6 +383,24 @@ function _buildDashboardPage() {
   .chat-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
   .chat-msg { display: flex; align-items: flex-start; gap: 6px; font-size: 13px; line-height: 1.45; padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
   .chat-msg:last-child { border-bottom: none; }
+  /* First-time chatter highlight */
+  .chat-msg--first-timer {
+    background: rgba(145, 70, 255, 0.10);
+    border-radius: 4px;
+    padding: 4px 6px;
+    border-bottom: 1px solid rgba(145, 70, 255, 0.18);
+    margin: 1px 0;
+  }
+  .chat-msg--first-timer .chat-text { color: #d4b8ff; }
+  .chat-msg--first-timer .chat-sep  { color: #9146FF; }
+  .chat-first-timer-badge {
+    font-size: 9px; font-family: var(--mono); font-weight: 700;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    color: #9146FF; background: rgba(145,70,255,0.18);
+    border: 1px solid rgba(145,70,255,0.4);
+    border-radius: 3px; padding: 1px 5px;
+    flex-shrink: 0; align-self: center; white-space: nowrap;
+  }
   .chat-platform-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
   .chat-platform-dot.youtube { background: #FF0000; }
   .chat-platform-dot.twitch  { background: #9146FF; }
@@ -492,6 +539,52 @@ function _buildDashboardPage() {
   /* ── Reconnect bar ── */
   .reconnect-bar { display: none; padding: 8px 20px; background: rgba(229,57,53,0.1); border-top: 1px solid rgba(229,57,53,0.25); font-family: var(--mono); font-size: 11px; color: var(--accent); animation: blink 1s step-start infinite; }
   @keyframes blink { 50%{opacity:0} }
+  /* ── Slash command panel ── */
+  .cmd-panel {
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .cmd-panel-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 14px; border-bottom: 1px solid var(--border);
+    background: var(--surface); flex-shrink: 0; cursor: pointer;
+    user-select: none;
+  }
+  .cmd-panel-title { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+  .cmd-panel-toggle { margin-left: auto; font-size: 11px; color: var(--muted); font-family: var(--mono); }
+  .cmd-panel-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+  .cmd-panel-body.hidden { display: none; }
+  .cmd-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+  .cmd-field { display: flex; flex-direction: column; gap: 4px; }
+  .cmd-field label { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  .cmd-select, .cmd-input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--text); font-size: 13px; font-family: inherit; padding: 6px 10px;
+    outline: none; transition: border-color 0.15s;
+  }
+  .cmd-select:focus, .cmd-input:focus { border-color: var(--accent); }
+  .cmd-select { cursor: pointer; }
+  .cmd-input { width: 180px; }
+  .cmd-input.wide { width: 240px; }
+  .cmd-submit {
+    padding: 7px 16px; background: var(--accent); color: #fff;
+    border: none; border-radius: 4px; font-size: 12px; font-weight: 700;
+    cursor: pointer; letter-spacing: 0.04em; font-family: inherit;
+    transition: opacity 0.15s; white-space: nowrap; align-self: flex-end;
+  }
+  .cmd-submit:hover { opacity: 0.85; }
+  .cmd-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+  .cmd-result-bar {
+    font-family: var(--mono); font-size: 11px; line-height: 1.55;
+    padding: 6px 10px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--muted); white-space: pre-wrap;
+    display: none;
+  }
+  .cmd-result-bar.visible { display: block; }
+  .cmd-result-bar.ok    { color: #4ade80; border-color: rgba(74,222,128,0.3); }
+  .cmd-result-bar.warn  { color: #f59e0b; border-color: rgba(245,158,11,0.3); }
+  .cmd-result-bar.error { color: #f87171; border-color: rgba(248,113,113,0.3); }
 </style>
 </head>
 <body>
@@ -566,6 +659,45 @@ function _buildDashboardPage() {
     <div class="log-feed" id="log-feed"></div>
   </div>
   <div class="reconnect-bar" id="reconnect-bar">⚠ Lost connection — reconnecting…</div>
+
+  <!-- Slash command panel -->
+  <div class="cmd-panel" id="cmd-panel">
+    <div class="cmd-panel-header" id="cmd-panel-header">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span class="cmd-panel-title">/ Commands</span>
+      <span class="cmd-panel-toggle" id="cmd-toggle">▲</span>
+    </div>
+    <div class="cmd-panel-body" id="cmd-panel-body">
+      <div class="cmd-row">
+        <div class="cmd-field">
+          <label for="cmd-select">Command</label>
+          <select class="cmd-select" id="cmd-select">
+            <option value="ban">  /ban</option>
+            <option value="vip">  /vip</option>
+            <option value="unvip">/unvip</option>
+          </select>
+        </div>
+        <div class="cmd-field">
+          <label for="cmd-user">User <span style="color:var(--accent)">*</span></label>
+          <input class="cmd-input" id="cmd-user" type="text" placeholder="username" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="cmd-field" id="cmd-reason-wrap">
+          <label for="cmd-reason">Reason</label>
+          <input class="cmd-input wide" id="cmd-reason" type="text" placeholder="optional" autocomplete="off">
+        </div>
+        <div class="cmd-field">
+          <label for="cmd-platform">Platform</label>
+          <select class="cmd-select" id="cmd-platform">
+            <option value="both">Both</option>
+            <option value="twitch">Twitch</option>
+            <option value="youtube">YouTube</option>
+          </select>
+        </div>
+        <button class="cmd-submit" id="cmd-submit">Run</button>
+      </div>
+      <div class="cmd-result-bar" id="cmd-result"></div>
+    </div>
+  </div>
 </div>
 
 <!-- Moderation modal -->
@@ -700,7 +832,7 @@ function _buildDashboardPage() {
 
   function buildChatRow(msg) {
     const row = document.createElement('div');
-    row.className = 'chat-msg';
+    row.className = 'chat-msg' + (msg.firstTimer ? ' chat-msg--first-timer' : '');
 
     const dot = document.createElement('span');
     dot.className = 'chat-platform-dot ' + msg.platform;
@@ -709,7 +841,9 @@ function _buildDashboardPage() {
     const nameBtn = document.createElement('button');
     nameBtn.className = 'chat-username';
     nameBtn.textContent = msg.username;
-    const nameColor = msg.color || PLATFORM_COLORS[msg.platform] || '#ffffff';
+    const nameColor = msg.firstTimer
+      ? '#b084ff'
+      : (msg.color || PLATFORM_COLORS[msg.platform] || '#ffffff');
     nameBtn.style.color = nameColor;
     nameBtn.addEventListener('click', () => openModModal(msg.username, msg.platform));
     row.appendChild(nameBtn);
@@ -737,6 +871,13 @@ function _buildDashboardPage() {
     }
     row.appendChild(text);
 
+    if (msg.firstTimer) {
+      const badge = document.createElement('span');
+      badge.className = 'chat-first-timer-badge';
+      badge.textContent = '✦ first chat';
+      row.appendChild(badge);
+    }
+
     return row;
   }
 
@@ -755,6 +896,7 @@ function _buildDashboardPage() {
     const list = allMessages[platform];
     // Determine new messages by tracking last known length; just push all for combined
     for (const m of messages) {
+      if (m.dashboardSuppress) continue; // filtered by a plugin (e.g. yt-bot-filter)
       if (!list.find(x => x.id === m.id)) {
         list.push(m);
         if (platform !== 'combined') {
@@ -1010,6 +1152,72 @@ function _buildDashboardPage() {
     if (!wmWrap.contains(e.target)) wmDropdown.classList.remove('open');
   });
 
+  // ── Slash command panel ──────────────────────────────────────────────────
+
+  const cmdPanel   = document.getElementById('cmd-panel-body');
+  const cmdHeader  = document.getElementById('cmd-panel-header');
+  const cmdToggle  = document.getElementById('cmd-toggle');
+  const cmdSelect  = document.getElementById('cmd-select');
+  const cmdUser    = document.getElementById('cmd-user');
+  const cmdReason  = document.getElementById('cmd-reason');
+  const cmdReasonW = document.getElementById('cmd-reason-wrap');
+  const cmdPlatform= document.getElementById('cmd-platform');
+  const cmdSubmit  = document.getElementById('cmd-submit');
+  const cmdResult  = document.getElementById('cmd-result');
+
+  // Collapse / expand panel
+  cmdHeader.addEventListener('click', () => {
+    const hidden = cmdPanel.classList.toggle('hidden');
+    cmdToggle.textContent = hidden ? '▼' : '▲';
+  });
+
+  // /vip and /unvip don't use a reason field
+  cmdSelect.addEventListener('change', () => {
+    cmdReasonW.style.display = cmdSelect.value === 'ban' ? '' : 'none';
+  });
+
+  function showResult(lines) {
+    const hasError = lines.some(l => l.startsWith('❌') || l.startsWith('⚠️'));
+    const allOk    = lines.every(l => l.startsWith('✅'));
+    cmdResult.textContent = lines.join('\\n');
+    cmdResult.className   = 'cmd-result-bar visible ' + (allOk ? 'ok' : hasError ? 'error' : 'warn');
+  }
+
+  cmdSubmit.addEventListener('click', async () => {
+    const name     = cmdSelect.value;
+    const user     = cmdUser.value.trim();
+    const reason   = cmdReason.value.trim();
+    const platform = cmdPlatform.value;
+
+    if (!user) {
+      showResult(['⚠️ Username is required']);
+      cmdUser.focus();
+      return;
+    }
+
+    cmdSubmit.disabled   = true;
+    cmdResult.className  = 'cmd-result-bar';
+
+    try {
+      const resp = await fetch('/dashboard/command', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ name, user, reason: reason || undefined, platform }),
+      });
+      const data = await resp.json();
+      showResult(data.results ?? ['⚠️ No response from server']);
+    } catch (e) {
+      showResult(['❌ Request failed: ' + e.message]);
+    } finally {
+      cmdSubmit.disabled = false;
+    }
+  });
+
+  // Allow Enter in user/reason fields to submit
+  [cmdUser, cmdReason].forEach(el => {
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') cmdSubmit.click(); });
+  });
+
 })();
 </script>
 </body>
@@ -1104,6 +1312,30 @@ async function handleRequest(req, res) {
     return true;
   }
 
+  // ── POST /dashboard/command ───────────────────────────────────────────────
+  if (method === 'POST' && url === '/dashboard/command') {
+    const raw = await _readBody(req);
+    let body;
+    try { body = JSON.parse(raw); } catch { body = {}; }
+    const { name, user, reason, platform } = body;
+    let results;
+    if (!name || !user) {
+      results = ['⚠️ Missing required fields: name, user'];
+    } else {
+      try {
+        const discord = require('./discord');
+        results = await discord.dispatchCommand(name, { user, reason, platform });
+        log.info(`[dashboard] /command /${name} ${user} on ${platform ?? 'both'}: ${results.join(' | ')}`);
+      } catch (err) {
+        results = ['❌ Command dispatch error: ' + err.message];
+        log.error('[dashboard] /command error:', err.message);
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, results }));
+    return true;
+  }
+
   // ── POST /dashboard/moderate ──────────────────────────────────────────────
   if (method === 'POST' && url === '/dashboard/moderate') {
     const raw = await _readBody(req);
@@ -1138,7 +1370,7 @@ async function handleRequest(req, res) {
  * @param {{ addRoute: Function }} overlayModule
  */
 function mountOnOverlayServer(overlayModule) {
-  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state', '/dashboard/moderate']) {
+  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state', '/dashboard/moderate', '/dashboard/command']) {
     overlayModule.addRoute(route, (req, res) => {
       handleRequest(req, res).then(handled => {
         if (!handled) { res.writeHead(404); res.end('Not found'); }
@@ -1156,6 +1388,7 @@ function mountOnOverlayServer(overlayModule) {
 module.exports = {
   registerWidget,
   updateWidget,
+  pushChatMessage,
   handleRequest,
   mountOnOverlayServer,
   onModerate,
