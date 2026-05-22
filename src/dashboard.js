@@ -305,6 +305,13 @@ function _buildDashboardPage() {
     [..._widgets.entries()].map(([id, w]) => [id, w.data])
   );
 
+  // Gather all slash command metadata for the command panel
+  const discord = require('./discord');
+  const allCommandsMeta = [
+    ...discord.coreCommandsMeta,
+    ...discord.getPluginCommandsMeta(),
+  ];
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -672,19 +679,10 @@ function _buildDashboardPage() {
         <div class="cmd-field">
           <label for="cmd-select">Command</label>
           <select class="cmd-select" id="cmd-select">
-            <option value="ban">  /ban</option>
-            <option value="vip">  /vip</option>
-            <option value="unvip">/unvip</option>
+            ${allCommandsMeta.map(c => `<option value="${c.name}">/${c.name}</option>`).join('\n            ')}
           </select>
         </div>
-        <div class="cmd-field">
-          <label for="cmd-user">User <span style="color:var(--accent)">*</span></label>
-          <input class="cmd-input" id="cmd-user" type="text" placeholder="username" autocomplete="off" spellcheck="false">
-        </div>
-        <div class="cmd-field" id="cmd-reason-wrap">
-          <label for="cmd-reason">Reason</label>
-          <input class="cmd-input wide" id="cmd-reason" type="text" placeholder="optional" autocomplete="off">
-        </div>
+        <div class="cmd-field" id="cmd-dynamic-fields"></div>
         <div class="cmd-field">
           <label for="cmd-platform">Platform</label>
           <select class="cmd-select" id="cmd-platform">
@@ -720,6 +718,7 @@ function _buildDashboardPage() {
 (function () {
   const WIDGETS     = ${JSON.stringify(widgetMeta)};
   const initialData = ${JSON.stringify(initialData)};
+  const ALL_COMMANDS = ${JSON.stringify(allCommandsMeta)};
 
   // Compile render functions
   const renderers = {};
@@ -1154,27 +1153,95 @@ function _buildDashboardPage() {
 
   // ── Slash command panel ──────────────────────────────────────────────────
 
-  const cmdPanel   = document.getElementById('cmd-panel-body');
-  const cmdHeader  = document.getElementById('cmd-panel-header');
-  const cmdToggle  = document.getElementById('cmd-toggle');
-  const cmdSelect  = document.getElementById('cmd-select');
-  const cmdUser    = document.getElementById('cmd-user');
-  const cmdReason  = document.getElementById('cmd-reason');
-  const cmdReasonW = document.getElementById('cmd-reason-wrap');
-  const cmdPlatform= document.getElementById('cmd-platform');
-  const cmdSubmit  = document.getElementById('cmd-submit');
-  const cmdResult  = document.getElementById('cmd-result');
+  const cmdPanelBody = document.getElementById('cmd-panel-body');
+  const cmdHeader    = document.getElementById('cmd-panel-header');
+  const cmdToggle    = document.getElementById('cmd-toggle');
+  const cmdSelect    = document.getElementById('cmd-select');
+  const cmdDynFields = document.getElementById('cmd-dynamic-fields');
+  const cmdPlatform  = document.getElementById('cmd-platform');
+  const cmdSubmit    = document.getElementById('cmd-submit');
+  const cmdResult    = document.getElementById('cmd-result');
+
+  // Index commands by name for quick lookup
+  const cmdMap = Object.fromEntries(ALL_COMMANDS.map(c => [c.name, c]));
+
+  // Track rendered input elements so we can read values on submit
+  let _currentInputs = {};   // optionName → <input|select> element
+
+  // Discord option type integers that map to string inputs
+  // 3 = STRING, 4 = INTEGER, 10 = NUMBER; everything else we render as text too.
+  function _isStringLike(type) { return !type || type === 3 || type === 4 || type === 10; }
+
+  /**
+   * Re-render #cmd-dynamic-fields for the currently selected command.
+   * Options with choices become <select>; others become <input type="text">.
+   * The legacy 'user' / 'reason' special-casing is preserved for core commands
+   * so existing behaviour is unchanged.
+   */
+  function renderDynamicFields(cmdName) {
+    _currentInputs = {};
+    cmdDynFields.innerHTML = '';
+
+    const cmd = cmdMap[cmdName];
+    if (!cmd) return;
+
+    for (const opt of cmd.options) {
+      const wrap = document.createElement('div');
+      wrap.className = 'cmd-field';
+
+      const lbl = document.createElement('label');
+      lbl.setAttribute('for', 'cmd-opt-' + opt.name);
+      lbl.innerHTML = esc(opt.name.charAt(0).toUpperCase() + opt.name.slice(1)) +
+        (opt.required ? ' <span style="color:var(--accent)">*</span>' : '');
+      wrap.appendChild(lbl);
+
+      let input;
+      if (opt.choices && opt.choices.length) {
+        input = document.createElement('select');
+        input.className = 'cmd-select';
+        if (!opt.required) {
+          const none = document.createElement('option');
+          none.value = '';
+          none.textContent = '—';
+          input.appendChild(none);
+        }
+        for (const ch of opt.choices) {
+          const o = document.createElement('option');
+          o.value = ch.value;
+          o.textContent = ch.name;
+          input.appendChild(o);
+        }
+      } else {
+        input = document.createElement('input');
+        input.className = 'cmd-input' + (opt.name === 'reason' ? ' wide' : '');
+        input.type = 'text';
+        input.placeholder = opt.required ? opt.name : 'optional';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        // Allow Enter to submit
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') cmdSubmit.click(); });
+      }
+      input.id = 'cmd-opt-' + opt.name;
+      wrap.appendChild(input);
+      cmdDynFields.appendChild(wrap);
+      _currentInputs[opt.name] = input;
+    }
+  }
 
   // Collapse / expand panel
   cmdHeader.addEventListener('click', () => {
-    const hidden = cmdPanel.classList.toggle('hidden');
+    const hidden = cmdPanelBody.classList.toggle('hidden');
     cmdToggle.textContent = hidden ? '▼' : '▲';
   });
 
-  // /vip and /unvip don't use a reason field
+  // Re-render fields whenever the selected command changes
   cmdSelect.addEventListener('change', () => {
-    cmdReasonW.style.display = cmdSelect.value === 'ban' ? '' : 'none';
+    cmdResult.className = 'cmd-result-bar';
+    renderDynamicFields(cmdSelect.value);
   });
+
+  // Initial render for whichever command is selected by default
+  renderDynamicFields(cmdSelect.value);
 
   function showResult(lines) {
     const hasError = lines.some(l => l.startsWith('❌') || l.startsWith('⚠️'));
@@ -1185,24 +1252,33 @@ function _buildDashboardPage() {
 
   cmdSubmit.addEventListener('click', async () => {
     const name     = cmdSelect.value;
-    const user     = cmdUser.value.trim();
-    const reason   = cmdReason.value.trim();
     const platform = cmdPlatform.value;
+    const cmd      = cmdMap[name];
 
-    if (!user) {
-      showResult(['⚠️ Username is required']);
-      cmdUser.focus();
+    // Validate required fields and collect option values
+    const optionValues = {};
+    let missingField = null;
+    for (const opt of (cmd ? cmd.options : [])) {
+      const el  = _currentInputs[opt.name];
+      const val = el ? el.value.trim() : '';
+      if (opt.required && !val) { missingField = opt.name; break; }
+      if (val) optionValues[opt.name] = val;
+    }
+
+    if (missingField) {
+      showResult(['⚠️ ' + missingField.charAt(0).toUpperCase() + missingField.slice(1) + ' is required']);
+      if (_currentInputs[missingField]) _currentInputs[missingField].focus();
       return;
     }
 
-    cmdSubmit.disabled   = true;
-    cmdResult.className  = 'cmd-result-bar';
+    cmdSubmit.disabled  = true;
+    cmdResult.className = 'cmd-result-bar';
 
     try {
       const resp = await fetch('/dashboard/command', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ name, user, reason: reason || undefined, platform }),
+        body:    JSON.stringify({ name, platform, options: optionValues }),
       });
       const data = await resp.json();
       showResult(data.results ?? ['⚠️ No response from server']);
@@ -1211,11 +1287,6 @@ function _buildDashboardPage() {
     } finally {
       cmdSubmit.disabled = false;
     }
-  });
-
-  // Allow Enter in user/reason fields to submit
-  [cmdUser, cmdReason].forEach(el => {
-    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') cmdSubmit.click(); });
   });
 
 })();
@@ -1317,15 +1388,22 @@ async function handleRequest(req, res) {
     const raw = await _readBody(req);
     let body;
     try { body = JSON.parse(raw); } catch { body = {}; }
-    const { name, user, reason, platform } = body;
+
+    // Support both legacy flat shape { name, user, reason, platform }
+    // and new shape { name, platform, options: { optionName: value, … } }
+    const { name, platform } = body;
+    const optionValues = body.options
+      ? { ...body.options }                          // new shape
+      : { user: body.user, reason: body.reason };   // legacy shape
+
     let results;
-    if (!name || !user) {
-      results = ['⚠️ Missing required fields: name, user'];
+    if (!name) {
+      results = ['⚠️ Missing required field: name'];
     } else {
       try {
         const discord = require('./discord');
-        results = await discord.dispatchCommand(name, { user, reason, platform });
-        log.info(`[dashboard] /command /${name} ${user} on ${platform ?? 'both'}: ${results.join(' | ')}`);
+        results = await discord.dispatchCommand(name, { platform, _raw: optionValues });
+        log.info(`[dashboard] /command /${name} on ${platform ?? 'both'}: ${results.join(' | ')}`);
       } catch (err) {
         results = ['❌ Command dispatch error: ' + err.message];
         log.error('[dashboard] /command error:', err.message);
