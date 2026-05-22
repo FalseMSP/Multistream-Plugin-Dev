@@ -191,10 +191,29 @@ function setChatReply(chatReply) {
 
 function getChatReply() { return _chatReply; }
 
+// Discord option type constants
+const OPT_SUB_COMMAND       = 1;
+const OPT_SUB_COMMAND_GROUP = 2;
+
+/** Recursively map a discord.js option JSON blob into a plain meta object */
+function _mapOption(o) {
+  const base = {
+    name:        o.name,
+    description: o.description ?? '',
+    required:    o.required    ?? false,
+    choices:     o.choices     ?? null,
+    type:        o.type        ?? null,
+  };
+  if (o.type === OPT_SUB_COMMAND || o.type === OPT_SUB_COMMAND_GROUP) {
+    base.options = (o.options ?? []).map(_mapOption);
+  }
+  return base;
+}
+
 /**
  * Return metadata for all plugin slash commands in the same shape as
  * discord.coreCommandsMeta, suitable for building dashboard UI.
- * Each entry: { name, description, options: [{ name, description, required, choices? }] }
+ * Subcommands appear as options with type=1 and their own nested options array.
  */
 function getPluginCommandsMeta() {
   const out = [];
@@ -210,13 +229,7 @@ function getPluginCommandsMeta() {
         name:        json.name,
         description: json.description ?? '',
         pluginId:    plugin.id,
-        options:     (json.options ?? []).map(o => ({
-          name:        o.name,
-          description: o.description ?? '',
-          required:    o.required ?? false,
-          choices:     o.choices  ?? null,
-          type:        o.type     ?? null,   // discord option type int, useful for selects
-        })),
+        options:     (json.options ?? []).map(_mapOption),
       });
     }
   }
@@ -233,34 +246,43 @@ function getPluginCommandsMeta() {
  */
 async function dispatchPluginCommand(name, optionValues = {}) {
   const results = [];
-  let replied = false;
 
-  // Synthetic interaction that satisfies the read paths plugins typically use
+  // _subcommand and _subcommandGroup are injected by the dashboard
+  // alongside regular option values so plugins can read them normally
+  const subcommand      = optionValues._subcommand      ?? null;
+  const subcommandGroup = optionValues._subcommandGroup ?? null;
+
+  // The "leaf" options are those on the subcommand itself, not the top-level keys
+  const leafValues = { ...optionValues };
+  delete leafValues._subcommand;
+  delete leafValues._subcommandGroup;
+
   const interaction = {
     commandName: name,
     isChatInputCommand: () => true,
-    deferred:  false,
-    replied:   false,
+    deferred: false,
+    replied:  false,
     options: {
-      getString:  (key) => optionValues[key] ?? null,
+      getSubcommand:      () => subcommand,
+      getSubcommandGroup: () => subcommandGroup,
+      getString:  (key) => leafValues[key] ?? null,
       getInteger: (key) => {
-        const v = optionValues[key];
+        const v = leafValues[key];
         return v !== undefined && v !== null ? parseInt(v, 10) : null;
       },
       getNumber:  (key) => {
-        const v = optionValues[key];
+        const v = leafValues[key];
         return v !== undefined && v !== null ? parseFloat(v) : null;
       },
       getBoolean: (key) => {
-        const v = optionValues[key];
+        const v = leafValues[key];
         if (v === null || v === undefined) return null;
         return v === 'true' || v === true;
       },
-      getUser:    (key) => optionValues[key] ? { username: optionValues[key], id: null } : null,
+      getUser: (key) => leafValues[key] ? { username: leafValues[key], id: null } : null,
     },
     async deferReply()  { interaction.deferred = true; },
-    async reply(payload)  {
-      replied = true;
+    async reply(payload) {
       interaction.replied = true;
       const text = typeof payload === 'string' ? payload : (payload.content ?? '');
       if (text) results.push(text);

@@ -592,6 +592,22 @@ function _buildDashboardPage() {
   .cmd-result-bar.ok    { color: #4ade80; border-color: rgba(74,222,128,0.3); }
   .cmd-result-bar.warn  { color: #f59e0b; border-color: rgba(245,158,11,0.3); }
   .cmd-result-bar.error { color: #f87171; border-color: rgba(248,113,113,0.3); }
+  /* ── Command autocomplete ── */
+  .cmd-autocomplete {
+    position: absolute; top: 100%; left: 0; right: 0; z-index: 100;
+    background: var(--surface2); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 4px 4px; display: none; max-height: 220px; overflow-y: auto;
+  }
+  .cmd-autocomplete.open { display: block; }
+  .cmd-ac-item {
+    padding: 6px 10px; cursor: pointer; font-size: 12px; font-family: var(--mono);
+    display: flex; align-items: baseline; gap: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .cmd-ac-item:last-child { border-bottom: none; }
+  .cmd-ac-item:hover, .cmd-ac-item.active { background: var(--accent-lo); color: var(--text); }
+  .cmd-ac-name  { color: var(--accent); font-weight: 700; white-space: nowrap; }
+  .cmd-ac-desc  { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -676,11 +692,10 @@ function _buildDashboardPage() {
     </div>
     <div class="cmd-panel-body" id="cmd-panel-body">
       <div class="cmd-row">
-        <div class="cmd-field">
-          <label for="cmd-select">Command</label>
-          <select class="cmd-select" id="cmd-select">
-            ${allCommandsMeta.map(c => `<option value="${c.name}">/${c.name}</option>`).join('\n            ')}
-          </select>
+        <div class="cmd-field" style="position:relative">
+          <label for="cmd-input">Command</label>
+          <input class="cmd-input wide" id="cmd-input" type="text" placeholder="e.g. /ban or /queue list" autocomplete="off" spellcheck="false">
+          <div class="cmd-autocomplete" id="cmd-autocomplete"></div>
         </div>
         <div class="cmd-field" id="cmd-dynamic-fields"></div>
         <button class="cmd-submit" id="cmd-submit">Run</button>
@@ -1148,35 +1163,165 @@ function _buildDashboardPage() {
   const cmdPanelBody = document.getElementById('cmd-panel-body');
   const cmdHeader    = document.getElementById('cmd-panel-header');
   const cmdToggle    = document.getElementById('cmd-toggle');
-  const cmdSelect    = document.getElementById('cmd-select');
+  const cmdInput     = document.getElementById('cmd-input');
+  const cmdAC        = document.getElementById('cmd-autocomplete');
   const cmdDynFields = document.getElementById('cmd-dynamic-fields');
   const cmdSubmit    = document.getElementById('cmd-submit');
   const cmdResult    = document.getElementById('cmd-result');
 
-  // Index commands by name for quick lookup
-  const cmdMap = Object.fromEntries(ALL_COMMANDS.map(c => [c.name, c]));
+  // ── Build a flat list of every invocable command token ──────────────────
+  // For commands with subcommands: "/queue list", "/queue clear", etc.
+  // For plain commands: "/ban", "/sendchat", etc.
+  // acItems: [{ token, name, subcommand, subcommandGroup, description, leafOptions }]
+  const OPT_SUB = 1, OPT_SUB_GROUP = 2;
 
-  // Track rendered input elements so we can read values on submit
-  let _currentInputs = {};   // optionName → <input|select> element
+  const acItems = [];
+  for (const cmd of ALL_COMMANDS) {
+    const hasSubcommands = cmd.options.some(o => o.type === OPT_SUB || o.type === OPT_SUB_GROUP);
+    if (!hasSubcommands) {
+      acItems.push({
+        token:           '/' + cmd.name,
+        name:            cmd.name,
+        subcommand:      null,
+        subcommandGroup: null,
+        description:     cmd.description,
+        leafOptions:     cmd.options,
+      });
+    } else {
+      for (const opt of cmd.options) {
+        if (opt.type === OPT_SUB) {
+          acItems.push({
+            token:           '/' + cmd.name + ' ' + opt.name,
+            name:            cmd.name,
+            subcommand:      opt.name,
+            subcommandGroup: null,
+            description:     opt.description,
+            leafOptions:     opt.options ?? [],
+          });
+        } else if (opt.type === OPT_SUB_GROUP) {
+          for (const sub of (opt.options ?? [])) {
+            acItems.push({
+              token:           '/' + cmd.name + ' ' + opt.name + ' ' + sub.name,
+              name:            cmd.name,
+              subcommand:      sub.name,
+              subcommandGroup: opt.name,
+              description:     sub.description,
+              leafOptions:     sub.options ?? [],
+            });
+          }
+        }
+      }
+    }
+  }
 
-  // Discord option type integers that map to string inputs
-  // 3 = STRING, 4 = INTEGER, 10 = NUMBER; everything else we render as text too.
-  function _isStringLike(type) { return !type || type === 3 || type === 4 || type === 10; }
+  // ── Autocomplete state ───────────────────────────────────────────────────
+  let acVisible  = false;
+  let acIndex    = -1;
+  let acFiltered = [];
+  let _currentItem    = null;   // resolved acItem
+  let _currentInputs  = {};     // optName → <input|select>
 
-  /**
-   * Re-render #cmd-dynamic-fields for the currently selected command.
-   * Options with choices become <select>; others become <input type="text">.
-   * The legacy 'user' / 'reason' special-casing is preserved for core commands
-   * so existing behaviour is unchanged.
-   */
-  function renderDynamicFields(cmdName) {
+  function acFilter(raw) {
+    const q = raw.startsWith('/') ? raw.toLowerCase() : ('/' + raw).toLowerCase();
+    return acItems.filter(i => i.token.toLowerCase().startsWith(q));
+  }
+
+  function acRender(items) {
+    acFiltered = items;
+    acIndex    = -1;
+    acAC();
+  }
+
+  function acAC() {
+    if (!acFiltered.length) { acClose(); return; }
+    acAC_inner();
+    acVisible = true;
+    cmdAC.classList.add('open');
+  }
+
+  function acAC_inner() {
+    cmdAC.innerHTML = '';
+    acFiltered.slice(0, 20).forEach((item, i) => {
+      const el = document.createElement('div');
+      el.className = 'cmd-ac-item' + (i === acIndex ? ' active' : '');
+      el.innerHTML = '<span class="cmd-ac-name">' + esc(item.token) + '</span>' +
+                     '<span class="cmd-ac-desc">'  + esc(item.description) + '</span>';
+      el.addEventListener('mousedown', (e) => { e.preventDefault(); selectItem(item); });
+      cmdAC.appendChild(el);
+    });
+  }
+
+  function acClose() {
+    acVisible = false;
+    acIndex   = -1;
+    cmdAC.classList.remove('open');
+    cmdAC.innerHTML = '';
+  }
+
+  function selectItem(item) {
+    _currentItem = item;
+    cmdInput.value = item.token;
+    acClose();
+    renderDynamicFields(item);
+    // Focus first dynamic input if any
+    const first = cmdDynFields.querySelector('input, select');
+    if (first) first.focus();
+  }
+
+  cmdInput.addEventListener('input', () => {
+    cmdResult.className = 'cmd-result-bar';
+    const val = cmdInput.value.trim();
+    if (!val) { acClose(); _currentItem = null; renderDynamicFields(null); return; }
+
+    // Check for exact match — resolve immediately without showing dropdown
+    const exact = acItems.find(i => i.token.toLowerCase() === val.toLowerCase());
+    if (exact) { _currentItem = exact; acClose(); renderDynamicFields(exact); return; }
+
+    _currentItem = null;
+    renderDynamicFields(null);
+    acRender(acFilter(val));
+  });
+
+  cmdInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' || e.key === 'ArrowDown') {
+      if (!acVisible && cmdInput.value.trim()) {
+        acRender(acFilter(cmdInput.value.trim()));
+      }
+      if (acVisible) {
+        e.preventDefault();
+        acIndex = (acIndex + 1) % acFiltered.length;
+        acAC_inner();
+      }
+    } else if (e.key === 'ArrowUp') {
+      if (acVisible) {
+        e.preventDefault();
+        acIndex = (acIndex - 1 + acFiltered.length) % acFiltered.length;
+        acAC_inner();
+      }
+    } else if (e.key === 'Enter') {
+      if (acVisible && acIndex >= 0) {
+        e.preventDefault();
+        selectItem(acFiltered[acIndex]);
+      } else if (_currentItem) {
+        cmdSubmit.click();
+      }
+    } else if (e.key === 'Escape') {
+      acClose();
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!cmdInput.contains(e.target) && !cmdAC.contains(e.target)) acClose();
+  });
+
+  // ── Dynamic fields ───────────────────────────────────────────────────────
+
+  function renderDynamicFields(item) {
     _currentInputs = {};
     cmdDynFields.innerHTML = '';
+    if (!item || !item.leafOptions.length) return;
 
-    const cmd = cmdMap[cmdName];
-    if (!cmd) return;
-
-    for (const opt of cmd.options) {
+    for (const opt of item.leafOptions) {
       const wrap = document.createElement('div');
       wrap.className = 'cmd-field';
 
@@ -1192,14 +1337,12 @@ function _buildDashboardPage() {
         input.className = 'cmd-select';
         if (!opt.required) {
           const none = document.createElement('option');
-          none.value = '';
-          none.textContent = '—';
+          none.value = ''; none.textContent = '—';
           input.appendChild(none);
         }
         for (const ch of opt.choices) {
           const o = document.createElement('option');
-          o.value = ch.value;
-          o.textContent = ch.name;
+          o.value = ch.value; o.textContent = ch.name;
           input.appendChild(o);
         }
       } else {
@@ -1209,7 +1352,6 @@ function _buildDashboardPage() {
         input.placeholder = opt.required ? opt.name : 'optional';
         input.autocomplete = 'off';
         input.spellcheck = false;
-        // Allow Enter to submit
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') cmdSubmit.click(); });
       }
       input.id = 'cmd-opt-' + opt.name;
@@ -1225,15 +1367,6 @@ function _buildDashboardPage() {
     cmdToggle.textContent = hidden ? '▼' : '▲';
   });
 
-  // Re-render fields whenever the selected command changes
-  cmdSelect.addEventListener('change', () => {
-    cmdResult.className = 'cmd-result-bar';
-    renderDynamicFields(cmdSelect.value);
-  });
-
-  // Initial render for whichever command is selected by default
-  renderDynamicFields(cmdSelect.value);
-
   function showResult(lines) {
     const hasError = lines.some(l => l.startsWith('❌') || l.startsWith('⚠️'));
     const allOk    = lines.every(l => l.startsWith('✅'));
@@ -1242,13 +1375,15 @@ function _buildDashboardPage() {
   }
 
   cmdSubmit.addEventListener('click', async () => {
-    const name = cmdSelect.value;
-    const cmd  = cmdMap[name];
+    if (!_currentItem) {
+      showResult(['⚠️ Type a command first, e.g. /ban or /queue list']);
+      cmdInput.focus();
+      return;
+    }
 
-    // Validate required fields and collect option values
     const optionValues = {};
     let missingField = null;
-    for (const opt of (cmd ? cmd.options : [])) {
+    for (const opt of _currentItem.leafOptions) {
       const el  = _currentInputs[opt.name];
       const val = el ? el.value.trim() : '';
       if (opt.required && !val) { missingField = opt.name; break; }
@@ -1261,6 +1396,10 @@ function _buildDashboardPage() {
       return;
     }
 
+    // Pass subcommand info as special keys so the server can set them on the synthetic interaction
+    if (_currentItem.subcommand)      optionValues._subcommand      = _currentItem.subcommand;
+    if (_currentItem.subcommandGroup) optionValues._subcommandGroup = _currentItem.subcommandGroup;
+
     cmdSubmit.disabled  = true;
     cmdResult.className = 'cmd-result-bar';
 
@@ -1268,7 +1407,7 @@ function _buildDashboardPage() {
       const resp = await fetch('/dashboard/command', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ name, options: optionValues }),
+        body:    JSON.stringify({ name: _currentItem.name, options: optionValues }),
       });
       const data = await resp.json();
       showResult(data.results ?? ['⚠️ No response from server']);
