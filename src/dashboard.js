@@ -1141,6 +1141,7 @@ function _buildDashboardPage() {
   let cmdResizing = false, cmdResizeStartY = 0, cmdResizeStartH = 0;
 
   cmdResize.addEventListener('mousedown', (e) => {
+    e.stopPropagation();
     cmdResizing     = true;
     cmdResizeStartY = e.clientY;
     cmdResizeStartH = cmdPanel.offsetHeight;
@@ -1150,8 +1151,8 @@ function _buildDashboardPage() {
   document.addEventListener('mousemove', (e) => {
     if (!cmdResizing) return;
     const delta = cmdResizeStartY - e.clientY;
-    cmdPanel.style.maxHeight = Math.max(48, Math.min(400, cmdResizeStartH + delta)) + 'px';
-    cmdPanel.style.overflow  = 'hidden';
+    const newH = Math.max(48, Math.min(400, cmdResizeStartH + delta));
+    cmdPanel.style.minHeight = newH + 'px';
   });
   document.addEventListener('mouseup', () => {
     if (!cmdResizing) return;
@@ -1560,8 +1561,10 @@ function _buildDashboardPage() {
     }
   }
 
-  // Collapse / expand panel
-  cmdHeader.addEventListener('click', () => {
+  // Collapse / expand panel — only on a true click, not after resize drag
+  cmdHeader.addEventListener('click', (e) => {
+    if (cmdResizing) return;
+    if (e.target.closest('#cmd-resize')) return;
     const hidden = cmdPanelBody.classList.toggle('hidden');
     cmdToggle.textContent = hidden ? '▼' : '▲';
   });
