@@ -976,7 +976,7 @@ function _buildDashboardPage() {
       chatTabs.forEach(t => t.classList.remove('active'));
       tab.classList.add('active');
       chatFilter = tab.dataset.feed;
-      rerenderChat();
+      rerenderChat(true);
     });
   });
 
@@ -1031,7 +1031,7 @@ function _buildDashboardPage() {
     return row;
   }
 
-  function rerenderChat() {
+  function rerenderChat(scrollToBottom = false) {
     const msgs = allMessages[chatFilter] || [];
     chatFeed.innerHTML = '';
     if (!msgs.length) {
@@ -1039,7 +1039,7 @@ function _buildDashboardPage() {
       return;
     }
     for (const m of msgs) chatFeed.appendChild(buildChatRow(m));
-    chatFeed.scrollTop = chatFeed.scrollHeight;
+    if (scrollToBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
   }
 
   function pushChatMessages(platform, messages) {
@@ -1063,13 +1063,11 @@ function _buildDashboardPage() {
     // Sort combined by id
     allMessages.combined.sort((a, b) => a.id - b.id);
 
-    // If currently viewing this platform or combined, append new rows
-    const activeList = allMessages[chatFilter];
-    const atBottom   = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
+    // Check scroll position before re-render so we can restore it if at bottom
+    const atBottom = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
 
     // Full re-render is simplest; only perf-sensitive at very high volume
-    rerenderChat();
-    if (atBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
+    rerenderChat(atBottom);
   }
 
   // Handle SSE widget updates that carry chat data
