@@ -74,6 +74,9 @@ async function main() {
     if (finalMsg) {
       discord.sendChat(finalMsg);
       dashboard.pushChatMessage(finalMsg);
+    } else {
+      // Suppressed by pipeline — still push to dashboard so nothing is invisible
+      dashboard.pushChatMessage({ ...msg, dashboardSuppress: true });
     }
   });
   queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
