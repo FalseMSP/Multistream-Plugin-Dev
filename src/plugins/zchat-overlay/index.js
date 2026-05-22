@@ -18,21 +18,9 @@
  */
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
-const dashboard = require('../../dashboard');
 const twitch    = require('../../twitch'); 
 const queue = require('../../queue');
 const log   = require('../../logger');
-
-// Bridge: mirror overlay sections into dashboard widgets so the dashboard
-// receives the same data that drives the OBS overlays.
-function registerSection2(id, opts) {
-  registerSection(id, opts);
-  try { dashboard.registerWidget(id, opts); } catch(e) { log.warn('[chat-overlay] dashboard.registerWidget failed:', e.message); }
-}
-function updateSection2(id, data) {
-  updateSection(id, data);
-  try { dashboard.updateWidget(id, data); } catch(e) {}
-}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -154,18 +142,18 @@ function pushMessage(platform, username, message, color, emotesTag, ytEmotes, th
   const list = state[platform];
   list.push(entry);
   if (list.length > MAX_MESSAGES) list.splice(0, list.length - MAX_MESSAGES);
-  updateSection2(`chat-overlay-${platform}`, { messages: list });
+  updateSection(`chat-overlay-${platform}`, { messages: list });
 
   state.combined.push(entry);
   if (state.combined.length > MAX_MESSAGES) state.combined.splice(0, state.combined.length - MAX_MESSAGES);
-  updateSection2('chat-overlay-combined', { messages: state.combined });
+  updateSection('chat-overlay-combined', { messages: state.combined });
 }
 
-// ─── Overlay sections (dashboard only) ───────────────────────────────────────
+// ─── Overlay sections ────────────────────────────────────────────────────────
 
 for (const platform of ['youtube', 'twitch']) {
   const isYT = platform === 'youtube';
-  registerSection2(`chat-overlay-${platform}`, {
+  registerSection(`chat-overlay-${platform}`, {
     title: isYT ? 'YouTube Chat' : 'Twitch Chat',
     order: isYT ? 10 : 11,
     icon: isYT
@@ -183,10 +171,10 @@ for (const platform of ['youtube', 'twitch']) {
       ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
     }).toString(),
   });
-  updateSection2(`chat-overlay-${platform}`, { messages: [] });
+  updateSection(`chat-overlay-${platform}`, { messages: [] });
 }
 
-registerSection2('chat-overlay-combined', {
+registerSection('chat-overlay-combined', {
   title: 'Combined Chat',
   order: 12,
   icon: `<svg viewBox="0 0 22 22" xmlns="http://www.w3.org/2000/svg"><rect width="22" height="22" rx="5" fill="#333"/><rect x="3" y="3" width="7" height="7" rx="1" fill="#FF0000"/><rect x="12" y="3" width="7" height="7" rx="1" fill="#9146FF"/><rect x="3" y="12" width="16" height="2" rx="1" fill="#fff" opacity="0.5"/><rect x="3" y="16" width="10" height="2" rx="1" fill="#fff" opacity="0.3"/></svg>`,
@@ -202,7 +190,7 @@ registerSection2('chat-overlay-combined', {
     ).join('') + '<div style="margin-top:6px;font-size:10px;color:#5a5a6a">Full feed → chat column →</div>';
   }).toString(),
 });
-updateSection2('chat-overlay-combined', { messages: [] });
+updateSection('chat-overlay-combined', { messages: [] });
 
 // ─── HTML builder ─────────────────────────────────────────────────────────────
 
@@ -446,12 +434,6 @@ function init(_context) {
   if (!queue?.onMessage) {
     log.warn('[chat-overlay] queue.onMessage not available — chat messages will not appear.');
     return;
-  }
-
-  // Wire dashboard moderation actions to Twitch mod handlers
-  if (twitch?.modHandlers) {
-    dashboard.onModerate(twitch.modHandlers);
-    log.info('[chat-overlay] Twitch mod handlers registered with dashboard');
   }
 
   queue.onMessage(msg => {

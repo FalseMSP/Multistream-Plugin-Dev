@@ -139,7 +139,7 @@ async function processMessage(msg) {
 
   // Suppress the plain Discord chat send, but keep the tagged message
   // flowing through the pipeline so the dashboard can highlight it.
-  return null; // first-timer — suppress main feed message, but not side effects
+  return { message: taggedMsg, suppress: true };
 }
 
 // ── Export ────────────────────────────────────────────────────────────────
