@@ -683,14 +683,6 @@ function _buildDashboardPage() {
           </select>
         </div>
         <div class="cmd-field" id="cmd-dynamic-fields"></div>
-        <div class="cmd-field">
-          <label for="cmd-platform">Platform</label>
-          <select class="cmd-select" id="cmd-platform">
-            <option value="both">Both</option>
-            <option value="twitch">Twitch</option>
-            <option value="youtube">YouTube</option>
-          </select>
-        </div>
         <button class="cmd-submit" id="cmd-submit">Run</button>
       </div>
       <div class="cmd-result-bar" id="cmd-result"></div>
@@ -1158,7 +1150,6 @@ function _buildDashboardPage() {
   const cmdToggle    = document.getElementById('cmd-toggle');
   const cmdSelect    = document.getElementById('cmd-select');
   const cmdDynFields = document.getElementById('cmd-dynamic-fields');
-  const cmdPlatform  = document.getElementById('cmd-platform');
   const cmdSubmit    = document.getElementById('cmd-submit');
   const cmdResult    = document.getElementById('cmd-result');
 
@@ -1251,9 +1242,8 @@ function _buildDashboardPage() {
   }
 
   cmdSubmit.addEventListener('click', async () => {
-    const name     = cmdSelect.value;
-    const platform = cmdPlatform.value;
-    const cmd      = cmdMap[name];
+    const name = cmdSelect.value;
+    const cmd  = cmdMap[name];
 
     // Validate required fields and collect option values
     const optionValues = {};
@@ -1278,7 +1268,7 @@ function _buildDashboardPage() {
       const resp = await fetch('/dashboard/command', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ name, platform, options: optionValues }),
+        body:    JSON.stringify({ name, options: optionValues }),
       });
       const data = await resp.json();
       showResult(data.results ?? ['⚠️ No response from server']);
@@ -1391,11 +1381,11 @@ async function handleRequest(req, res) {
     try { body = JSON.parse(raw); } catch { body = {}; }
 
     // Support both legacy flat shape { name, user, reason, platform }
-    // and new shape { name, platform, options: { optionName: value, … } }
-    const { name, platform } = body;
+    // and new shape { name, options: { optionName: value, … } }
+    const { name } = body;
     const optionValues = body.options
-      ? { ...body.options }                          // new shape
-      : { user: body.user, reason: body.reason };   // legacy shape
+      ? { ...body.options }
+      : { user: body.user, reason: body.reason, platform: body.platform };
 
     let results;
     if (!name) {
@@ -1403,8 +1393,8 @@ async function handleRequest(req, res) {
     } else {
       try {
         const discord = require('./discord');
-        results = await discord.dispatchCommand(name, { platform, _raw: optionValues });
-        log.info(`[dashboard] /command /${name} on ${platform ?? 'both'}: ${results.join(' | ')}`);
+        results = await discord.dispatchCommand(name, { _raw: optionValues });
+        log.info(`[dashboard] /command /${name}: ${results.join(' | ')}`);
       } catch (err) {
         results = ['❌ Command dispatch error: ' + err.message];
         log.error('[dashboard] /command error:', err.message);

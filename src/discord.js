@@ -331,16 +331,20 @@ async function startDiscordBot() {
  * @returns {Promise<string[]>}
  */
 async function dispatchCommand(name, options = {}) {
-  // options may arrive as { user, reason, platform } (legacy) or
-  // { platform, _raw: { optionName: value } } (new dashboard shape)
   const raw      = options._raw ?? options;
   const user     = raw.user     ?? '';
   const platform = options.platform ?? raw.platform ?? 'both';
   const reason   = raw.reason   ?? 'No reason provided';
 
-  if (!user) return ['⚠️ No username provided'];
-
   const results = [];
+
+  // Plugin commands don't use user/platform/reason — dispatch immediately
+  if (name !== 'ban' && name !== 'vip' && name !== 'unvip') {
+    const { dispatchPluginCommand } = require('./plugins/index');
+    return await dispatchPluginCommand(name, raw);
+  }
+
+  if (!user) return ['⚠️ No username provided'];
 
   async function run(platformKey, action) {
     const handler = _modHandlers[action];
@@ -359,16 +363,10 @@ async function dispatchCommand(name, options = {}) {
   if      (name === 'ban')   for (const p of platforms) await run(p, 'ban');
   else if (name === 'vip')   for (const p of platforms) await run(p, 'vip');
   else if (name === 'unvip') for (const p of platforms) await run(p, 'unvip');
-  else {
-    // Fall through to plugin commands
-    const { dispatchPluginCommand } = require('./plugins/index');
-    // Pass all raw options through so the plugin can read them via interaction.options
-    const pluginResults = await dispatchPluginCommand(name, raw);
-    results.push(...pluginResults);
-  }
 
   return results;
 }
+
 
 /**
  * Metadata for all core slash commands, suitable for building dashboard UI.
