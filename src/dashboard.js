@@ -308,8 +308,8 @@ function _buildDashboardPage() {
   // Gather all slash command metadata for the command panel
   const discord = require('./discord');
   const allCommandsMeta = [
-    ...discord.coreCommandsMeta,
-    ...discord.getPluginCommandsMeta(),
+    ...(discord.coreCommandsMeta ?? []),
+    ...(typeof discord.getPluginCommandsMeta === 'function' ? discord.getPluginCommandsMeta() : []),
   ];
 
   return `<!DOCTYPE html>
@@ -1349,8 +1349,9 @@ async function handleRequest(req, res) {
 
   // ── GET /dashboard ───────────────────────────────────────────────────────
   if (method === 'GET' && url === '/dashboard') {
+    const html = _buildDashboardPage();
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(_buildDashboardPage());
+    res.end(html);
     return true;
   }
 
