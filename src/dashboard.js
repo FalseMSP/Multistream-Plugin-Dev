@@ -363,8 +363,8 @@ function _buildDashboardPage() {
   /* ── Layout shell ── */
   .dashboard-layout { flex: 1; display: flex; overflow: hidden; min-height: 0; }
   /* ── Left: widget grid ── */
-  .grid { flex: 1; position: relative; overflow-y: auto; min-height: 0; }
-  .grid-inner { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; padding: 20px; align-content: start; }
+  .grid { flex: 1; position: relative; overflow: auto; min-height: 0; }
+  .grid-inner { position: relative; width: 100%; min-height: 100%; }
   /* ── Right: chat column ── */
   .chat-column {
     width: 380px;
@@ -455,7 +455,12 @@ function _buildDashboardPage() {
   .mod-btn.cancel { color: var(--muted); }
   .mod-close { position: absolute; top: 12px; right: 14px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; }
   /* ── Widget card ── */
-  .widget-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; position: relative; }
+  .widget-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; overflow: hidden; position: absolute;
+    width: 320px; min-width: 200px; min-height: 80px;
+  }
+  .widget-card.snap-preview { outline: 2px dashed var(--accent); outline-offset: 2px; }
   .widget-resize-handle {
     position: absolute; bottom: 0; right: 0;
     width: 14px; height: 14px; cursor: se-resize;
@@ -485,8 +490,7 @@ function _buildDashboardPage() {
   .widget-card { cursor: default; user-select: none; }
   .widget-header { cursor: grab; }
   .widget-header:active { cursor: grabbing; }
-  .widget-card.dragging { opacity: 0.5; box-shadow: 0 8px 32px rgba(0,0,0,0.5); }
-  .widget-card.drag-over { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .widget-card.dragging { opacity: 0.85; box-shadow: 0 12px 40px rgba(0,0,0,0.6); z-index: 50; cursor: grabbing; }
   .widget-card.minimized .widget-body { display: none; }
   .widget-minimize {
     margin-left: 6px; background: none; border: none; color: var(--muted);
@@ -623,9 +627,11 @@ function _buildDashboardPage() {
   .cmd-result-bar.error { color: #f87171; border-color: rgba(248,113,113,0.3); }
   /* ── Command autocomplete ── */
   .cmd-autocomplete {
-    position: absolute; top: 100%; left: 0; right: 0; z-index: 100;
-    background: var(--surface2); border: 1px solid var(--border); border-top: none;
-    border-radius: 0 0 4px 4px; display: none; max-height: 220px; overflow-y: auto;
+    position: fixed; z-index: 9999;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 4px; display: none; max-height: 260px; overflow-y: auto;
+    box-shadow: 0 -8px 32px rgba(0,0,0,0.55);
+    min-width: 320px;
   }
   .cmd-autocomplete.open { display: block; }
   .cmd-ac-item {
@@ -717,10 +723,9 @@ function _buildDashboardPage() {
     </div>
     <div class="cmd-panel-body" id="cmd-panel-body">
       <div class="cmd-row">
-        <div class="cmd-field" style="position:relative">
+        <div class="cmd-field">
           <label for="cmd-input">Command</label>
           <input class="cmd-input wide" id="cmd-input" type="text" placeholder="e.g. /ban or /queue list" autocomplete="off" spellcheck="false">
-          <div class="cmd-autocomplete" id="cmd-autocomplete"></div>
         </div>
         <div class="cmd-field" id="cmd-dynamic-fields"></div>
         <button class="cmd-submit" id="cmd-submit">Run</button>
@@ -757,6 +762,9 @@ function _buildDashboardPage() {
   </div>
 </div>
 
+<!-- Autocomplete portal (top-level to avoid clipping) -->
+<div class="cmd-autocomplete" id="cmd-autocomplete"></div>
+
 <script>
 (function () {
   const WIDGETS     = ${JSON.stringify(widgetMeta)};
@@ -791,7 +799,6 @@ function _buildDashboardPage() {
     const card  = document.createElement('div');
     card.className = 'widget-card';
     card.id        = 'wcard-' + w.id;
-    card.draggable = true;
     card.innerHTML =
       '<div class="widget-header">' +
         '<span class="widget-icon">'  + w.icon          + '</span>' +
@@ -808,39 +815,98 @@ function _buildDashboardPage() {
     badges[w.id] = card.querySelector('.widget-badge');
   }
 
-  // ── Drag-and-drop reordering ─────────────────────────────────────────────
-  let dragSrc = null;
-  grid.addEventListener('dragstart', (e) => {
-    dragSrc = e.target.closest('.widget-card');
-    if (!dragSrc) return;
-    dragSrc.classList.add('dragging');
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', dragSrc.id);
-  });
-  grid.addEventListener('dragend', (e) => {
-    document.querySelectorAll('.widget-card').forEach(c => c.classList.remove('dragging', 'drag-over'));
-    dragSrc = null;
-  });
-  grid.addEventListener('dragover', (e) => {
+  // ── Freeform widget positioning ──────────────────────────────────────────
+  const SNAP_GRID = 20; // px grid when shift held
+  const widgetPositions = JSON.parse(localStorage.getItem('dash-positions') || '{}');
+
+  function savePositions() {
+    const pos = {};
+    document.querySelectorAll('.widget-card').forEach(c => {
+      pos[c.id] = { x: parseInt(c.style.left) || 0, y: parseInt(c.style.top) || 0,
+                    w: c.style.width || '', h: c.style.height || '' };
+    });
+    localStorage.setItem('dash-positions', JSON.stringify(pos));
+  }
+
+  function applyPositions() {
+    // Auto-layout: place widgets in a loose grid as default
+    let col = 0, row = 0, maxRowH = 0;
+    const PAD = 20, COLS = 3, DEF_W = 320;
+    document.querySelectorAll('.widget-card').forEach((card) => {
+      const saved = widgetPositions[card.id];
+      if (saved) {
+        card.style.left   = saved.x + 'px';
+        card.style.top    = saved.y + 'px';
+        if (saved.w) card.style.width  = saved.w;
+        if (saved.h) card.style.height = saved.h;
+      } else {
+        // Initial grid placement
+        const x = PAD + col * (DEF_W + PAD);
+        const y = PAD + row * (maxRowH || 160 + PAD);
+        card.style.left = x + 'px';
+        card.style.top  = y + 'px';
+        col++;
+        if (col >= COLS) { col = 0; row++; maxRowH = 0; }
+      }
+    });
+  }
+
+  // Apply positions after cards are in DOM
+  applyPositions();
+
+  // Expand canvas to fit all cards
+  function expandCanvas() {
+    let maxX = 0, maxY = 0;
+    document.querySelectorAll('.widget-card').forEach(c => {
+      maxX = Math.max(maxX, (parseInt(c.style.left) || 0) + c.offsetWidth + 20);
+      maxY = Math.max(maxY, (parseInt(c.style.top)  || 0) + c.offsetHeight + 20);
+    });
+    grid.querySelector('.grid-inner').style.width  = maxX + 'px';
+    grid.querySelector('.grid-inner').style.height = maxY + 'px';
+  }
+
+  // ── Mouse drag on widget headers ─────────────────────────────────────────
+  let wDrag = null;
+  grid.addEventListener('mousedown', (e) => {
+    const header = e.target.closest('.widget-header');
+    if (!header) return;
+    // Don't hijack minimize button
+    if (e.target.closest('.widget-minimize')) return;
+    const card = header.closest('.widget-card');
+    if (!card) return;
     e.preventDefault();
-    const target = e.target.closest('.widget-card');
-    if (!target || target === dragSrc) return;
-    document.querySelectorAll('.widget-card').forEach(c => c.classList.remove('drag-over'));
-    target.classList.add('drag-over');
+    const startX   = e.clientX;
+    const startY   = e.clientY;
+    const startL   = parseInt(card.style.left) || 0;
+    const startT   = parseInt(card.style.top)  || 0;
+    card.style.zIndex = '50';
+    card.classList.add('dragging');
+    wDrag = { card, startX, startY, startL, startT };
   });
-  grid.addEventListener('dragleave', (e) => {
-    const target = e.target.closest('.widget-card');
-    if (target) target.classList.remove('drag-over');
+
+  document.addEventListener('mousemove', (e) => {
+    if (!wDrag) return;
+    const { card, startX, startY, startL, startT } = wDrag;
+    let nx = startL + (e.clientX - startX);
+    let ny = startT + (e.clientY - startY);
+    if (e.shiftKey) {
+      nx = Math.round(nx / SNAP_GRID) * SNAP_GRID;
+      ny = Math.round(ny / SNAP_GRID) * SNAP_GRID;
+      card.classList.add('snap-preview');
+    } else {
+      card.classList.remove('snap-preview');
+    }
+    card.style.left = Math.max(0, nx) + 'px';
+    card.style.top  = Math.max(0, ny) + 'px';
   });
-  grid.addEventListener('drop', (e) => {
-    e.preventDefault();
-    const target = e.target.closest('.widget-card');
-    if (!target || !dragSrc || target === dragSrc) return;
-    target.classList.remove('drag-over');
-    // Insert dragSrc before or after target based on pointer position
-    const rect = target.getBoundingClientRect();
-    const after = e.clientY > rect.top + rect.height / 2;
-    grid.insertBefore(dragSrc, after ? target.nextSibling : target);
+
+  document.addEventListener('mouseup', (e) => {
+    if (!wDrag) return;
+    wDrag.card.classList.remove('dragging', 'snap-preview');
+    wDrag.card.style.zIndex = '';
+    expandCanvas();
+    savePositions();
+    wDrag = null;
   });
 
   // ── Widget resize ────────────────────────────────────────────────────────
@@ -877,6 +943,8 @@ function _buildDashboardPage() {
     wResizing.card.classList.remove('is-resizing');
     wResizing = null;
     document.body.style.cursor = '';
+    expandCanvas();
+    savePositions();
   });
 
   function invoke(id, data) {
@@ -887,6 +955,7 @@ function _buildDashboardPage() {
   }
 
   for (const w of WIDGETS) invoke(w.id, initialData[w.id]);
+  expandCanvas();
 
   // ── Chat column ──────────────────────────────────────────────────────────
 
@@ -1215,7 +1284,7 @@ function _buildDashboardPage() {
     saveMinimized();
     const card = document.getElementById('wcard-' + id);
     if (card) {
-      removedCards[id] = { card, nextSibling: card.nextSibling };
+      removedCards[id] = card;
       card.remove();
     }
     updateWidgetsMenu();
@@ -1224,10 +1293,17 @@ function _buildDashboardPage() {
   function restoreWidget(id) {
     minimizedSet.delete(id);
     saveMinimized();
-    const saved = removedCards[id];
-    if (saved) {
-      grid.insertBefore(saved.card, saved.nextSibling);
+    const card = removedCards[id];
+    if (card) {
+      grid.querySelector('.grid-inner').appendChild(card);
+      // Re-apply saved position
+      const savedPos = widgetPositions[card.id];
+      if (savedPos) {
+        card.style.left = savedPos.x + 'px';
+        card.style.top  = savedPos.y + 'px';
+      }
       delete removedCards[id];
+      expandCanvas();
     }
     updateWidgetsMenu();
   }
@@ -1236,7 +1312,7 @@ function _buildDashboardPage() {
   for (const id of minimizedSet) {
     const card = document.getElementById('wcard-' + id);
     if (card) {
-      removedCards[id] = { card, nextSibling: card.nextSibling };
+      removedCards[id] = card;
       card.remove();
     }
   }
@@ -1344,6 +1420,19 @@ function _buildDashboardPage() {
   function acAC() {
     if (!acFiltered.length) { acClose(); return; }
     acAC_inner();
+    // Position above the input using fixed coords so no clipping
+    const rect = cmdInput.getBoundingClientRect();
+    cmdAC.style.left  = rect.left + 'px';
+    cmdAC.style.width = Math.max(rect.width, 320) + 'px';
+    // Show above, but flip below if not enough room
+    const acH = Math.min(260, acFiltered.length * 36);
+    if (rect.top - acH > 8) {
+      cmdAC.style.top    = '';
+      cmdAC.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+    } else {
+      cmdAC.style.bottom = '';
+      cmdAC.style.top    = (rect.bottom + 4) + 'px';
+    }
     acVisible = true;
     cmdAC.classList.add('open');
   }
