@@ -351,6 +351,15 @@ function _buildDashboardPage() {
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
   .topbar-logout { font-size: 12px; color: var(--muted); text-decoration: none; padding: 5px 10px; border: 1px solid var(--border); border-radius: 4px; transition: color 0.15s, border-color 0.15s; }
   .topbar-logout:hover { color: var(--text); border-color: var(--muted); }
+  .topbar-console-btn {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); background: none;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 10px; cursor: pointer; font-family: inherit;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+  }
+  .topbar-console-btn:hover { color: var(--text); border-color: var(--muted); }
+  .topbar-console-btn.active { color: var(--accent); border-color: rgba(229,57,53,0.35); background: var(--accent-lo); }
   /* ── Layout shell ── */
   .dashboard-layout { flex: 1; display: flex; overflow: hidden; min-height: 0; }
   /* ── Left: widget grid ── */
@@ -446,7 +455,23 @@ function _buildDashboardPage() {
   .mod-btn.cancel { color: var(--muted); }
   .mod-close { position: absolute; top: 12px; right: 14px; background: none; border: none; color: var(--muted); cursor: pointer; font-size: 18px; line-height: 1; }
   /* ── Widget card ── */
-  .widget-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .widget-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; position: relative; }
+  .widget-resize-handle {
+    position: absolute; bottom: 0; right: 0;
+    width: 14px; height: 14px; cursor: se-resize;
+    opacity: 0; transition: opacity 0.15s;
+    z-index: 10;
+  }
+  .widget-resize-handle::after {
+    content: '';
+    position: absolute; bottom: 3px; right: 3px;
+    width: 6px; height: 6px;
+    border-right: 2px solid var(--muted);
+    border-bottom: 2px solid var(--muted);
+    border-radius: 0 0 2px 0;
+  }
+  .widget-card:hover .widget-resize-handle { opacity: 1; }
+  .widget-card.is-resizing { user-select: none; }
   .widget-header { display: flex; align-items: center; gap: 10px; padding: 11px 14px; border-bottom: 1px solid var(--border); background: var(--accent-lo); }
   .widget-icon { width: 20px; height: 20px; flex-shrink: 0; color: var(--accent); }
   .widget-title { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
@@ -521,7 +546,9 @@ function _buildDashboardPage() {
     border-top: 1px solid var(--border);
     display: flex; flex-direction: column;
     background: #0a0a0c;
+    transition: height 0.2s ease;
   }
+  .log-console.hidden { height: 0 !important; overflow: hidden; border-top: none; }
   .log-console-header {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 14px; border-bottom: 1px solid var(--border);
@@ -552,6 +579,8 @@ function _buildDashboardPage() {
     background: var(--surface);
     flex-shrink: 0;
   }
+  .cmd-panel-resize { height: 4px; background: var(--border); cursor: ns-resize; flex-shrink: 0; transition: background 0.15s; }
+  .cmd-panel-resize:hover { background: var(--accent); }
   .cmd-panel-header {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 14px; border-bottom: 1px solid var(--border);
@@ -632,6 +661,10 @@ function _buildDashboardPage() {
         <div id="widgets-dropdown-list"><div class="widgets-dropdown-empty">No minimized widgets</div></div>
       </div>
     </div>
+    <button class="topbar-console-btn" id="console-toggle-btn" title="Toggle console">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      Console
+    </button>
     <div class="topbar-status">
       <span class="status-dot" id="status-dot"></span>
       <span id="status-text">connected</span>
@@ -672,19 +705,11 @@ function _buildDashboardPage() {
     </aside>
   </div>
 
-  <div class="log-console" id="log-console">
-    <div class="log-console-resize" id="log-resize"></div>
-    <div class="log-console-header">
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--muted)"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-      <span class="log-console-title">Console</span>
-      <button class="log-console-clear" id="log-clear">Clear</button>
-    </div>
-    <div class="log-feed" id="log-feed"></div>
-  </div>
   <div class="reconnect-bar" id="reconnect-bar">⚠ Lost connection — reconnecting…</div>
 
   <!-- Slash command panel -->
   <div class="cmd-panel" id="cmd-panel">
+    <div class="cmd-panel-resize" id="cmd-resize"></div>
     <div class="cmd-panel-header" id="cmd-panel-header">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
       <span class="cmd-panel-title">/ Commands</span>
@@ -702,6 +727,17 @@ function _buildDashboardPage() {
       </div>
       <div class="cmd-result-bar" id="cmd-result"></div>
     </div>
+  </div>
+
+  <!-- Log console -->
+  <div class="log-console" id="log-console">
+    <div class="log-console-resize" id="log-resize"></div>
+    <div class="log-console-header">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" style="color:var(--muted)"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      <span class="log-console-title">Console</span>
+      <button class="log-console-clear" id="log-clear">Clear</button>
+    </div>
+    <div class="log-feed" id="log-feed"></div>
   </div>
 </div>
 
@@ -765,7 +801,8 @@ function _buildDashboardPage() {
           '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
         '</button>' +
       '</div>' +
-      '<div class="widget-body" id="wbody-' + w.id + '"></div>';
+      '<div class="widget-body" id="wbody-' + w.id + '"></div>' +
+      '<div class="widget-resize-handle" data-widget-resize="' + w.id + '"></div>';
     grid.appendChild(card);
     bodies[w.id] = card.querySelector('.widget-body');
     badges[w.id] = card.querySelector('.widget-badge');
@@ -804,6 +841,42 @@ function _buildDashboardPage() {
     const rect = target.getBoundingClientRect();
     const after = e.clientY > rect.top + rect.height / 2;
     grid.insertBefore(dragSrc, after ? target.nextSibling : target);
+  });
+
+  // ── Widget resize ────────────────────────────────────────────────────────
+  let wResizing = null;
+  document.addEventListener('mousedown', (e) => {
+    const handle = e.target.closest('.widget-resize-handle');
+    if (!handle) return;
+    const card = handle.closest('.widget-card');
+    if (!card) return;
+    e.preventDefault();
+    const startX = e.clientX, startY = e.clientY;
+    const startW = card.offsetWidth, startH = card.offsetHeight;
+    card.classList.add('is-resizing');
+    wResizing = { card, startX, startY, startW, startH };
+    document.body.style.cursor = 'se-resize';
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!wResizing) return;
+    const { card, startX, startY, startW, startH } = wResizing;
+    const newW = Math.max(220, startW + (e.clientX - startX));
+    const newH = Math.max(120, startH + (e.clientY - startY));
+    card.style.width  = newW + 'px';
+    card.style.height = newH + 'px';
+    // Make body fill remaining height
+    const body = card.querySelector('.widget-body');
+    if (body) {
+      const headerH = card.querySelector('.widget-header')?.offsetHeight || 0;
+      body.style.height = (newH - headerH) + 'px';
+      body.style.overflow = 'auto';
+    }
+  });
+  document.addEventListener('mouseup', () => {
+    if (!wResizing) return;
+    wResizing.card.classList.remove('is-resizing');
+    wResizing = null;
+    document.body.style.cursor = '';
   });
 
   function invoke(id, data) {
@@ -977,6 +1050,42 @@ function _buildDashboardPage() {
   document.addEventListener('mouseup', () => {
     if (!resizing) return;
     resizing = false;
+    document.body.style.cursor = '';
+  });
+
+  // ── Console show/hide toggle ─────────────────────────────────────────────
+  const consoleToggleBtn = document.getElementById('console-toggle-btn');
+  let consoleVisible = true;
+
+  consoleToggleBtn.addEventListener('click', () => {
+    consoleVisible = !consoleVisible;
+    logConsole.classList.toggle('hidden', !consoleVisible);
+    consoleToggleBtn.classList.toggle('active', consoleVisible);
+  });
+  // Start with console visible and button highlighted
+  consoleToggleBtn.classList.add('active');
+
+  // ── Cmd panel resize ─────────────────────────────────────────────────────
+  const cmdPanel  = document.getElementById('cmd-panel');
+  const cmdResize = document.getElementById('cmd-resize');
+  let cmdResizing = false, cmdResizeStartY = 0, cmdResizeStartH = 0;
+
+  cmdResize.addEventListener('mousedown', (e) => {
+    cmdResizing     = true;
+    cmdResizeStartY = e.clientY;
+    cmdResizeStartH = cmdPanel.offsetHeight;
+    document.body.style.cursor = 'ns-resize';
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!cmdResizing) return;
+    const delta = cmdResizeStartY - e.clientY;
+    cmdPanel.style.maxHeight = Math.max(48, Math.min(400, cmdResizeStartH + delta)) + 'px';
+    cmdPanel.style.overflow  = 'hidden';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!cmdResizing) return;
+    cmdResizing = false;
     document.body.style.cursor = '';
   });
 
