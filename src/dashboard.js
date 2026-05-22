@@ -391,9 +391,10 @@ function _buildDashboardPage() {
   .chat-tab:hover:not(.active) { color: var(--text); border-color: var(--muted); }
   .chat-feed {
     flex: 1; overflow-y: auto; padding: 10px 12px;
-    display: flex; flex-direction: column; gap: 4px;
+    display: block;
     scroll-behavior: smooth;
   }
+  .chat-feed .chat-msg { margin-bottom: 4px; }
   .chat-feed::-webkit-scrollbar { width: 4px; }
   .chat-feed::-webkit-scrollbar-track { background: transparent; }
   .chat-feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
@@ -1039,7 +1040,10 @@ function _buildDashboardPage() {
       return;
     }
     for (const m of msgs) chatFeed.appendChild(buildChatRow(m));
-    if (scrollToBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
+    if (scrollToBottom) {
+      const last = chatFeed.lastElementChild;
+      if (last) last.scrollIntoView({ block: 'end' });
+    }
   }
 
   function pushChatMessages(platform, messages) {
