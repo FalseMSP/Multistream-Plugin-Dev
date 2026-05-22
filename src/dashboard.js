@@ -789,11 +789,12 @@ function _buildDashboardPage() {
   }
 
   // Build widget cards
-  const grid   = document.getElementById('widget-grid');
+  const grid      = document.getElementById('widget-grid-wrap');
+  const gridInner = document.getElementById('widget-grid');
   const bodies = {};
   const badges = {};
 
-  if (WIDGETS.length > 0) grid.innerHTML = '';
+  if (WIDGETS.length > 0) gridInner.innerHTML = '';
 
   for (const w of WIDGETS) {
     const card  = document.createElement('div');
@@ -810,7 +811,7 @@ function _buildDashboardPage() {
       '</div>' +
       '<div class="widget-body" id="wbody-' + w.id + '"></div>' +
       '<div class="widget-resize-handle" data-widget-resize="' + w.id + '"></div>';
-    grid.appendChild(card);
+    gridInner.appendChild(card);
     bodies[w.id] = card.querySelector('.widget-body');
     badges[w.id] = card.querySelector('.widget-badge');
   }
@@ -832,7 +833,7 @@ function _buildDashboardPage() {
     // Auto-layout: place widgets in a loose grid as default
     let col = 0, row = 0, maxRowH = 0;
     const PAD = 20, COLS = 3, DEF_W = 320;
-    document.querySelectorAll('.widget-card').forEach((card) => {
+    gridInner.querySelectorAll('.widget-card').forEach((card) => {
       const saved = widgetPositions[card.id];
       if (saved) {
         card.style.left   = saved.x + 'px';
@@ -857,12 +858,12 @@ function _buildDashboardPage() {
   // Expand canvas to fit all cards
   function expandCanvas() {
     let maxX = 0, maxY = 0;
-    document.querySelectorAll('.widget-card').forEach(c => {
+    gridInner.querySelectorAll('.widget-card').forEach(c => {
       maxX = Math.max(maxX, (parseInt(c.style.left) || 0) + c.offsetWidth + 20);
       maxY = Math.max(maxY, (parseInt(c.style.top)  || 0) + c.offsetHeight + 20);
     });
-    grid.querySelector('.grid-inner').style.width  = maxX + 'px';
-    grid.querySelector('.grid-inner').style.height = maxY + 'px';
+    gridInner.style.width  = Math.max(maxX, grid.clientWidth)  + 'px';
+    gridInner.style.height = Math.max(maxY, grid.clientHeight) + 'px';
   }
 
   // ── Mouse drag on widget headers ─────────────────────────────────────────
@@ -1297,7 +1298,7 @@ function _buildDashboardPage() {
     saveMinimized();
     const card = removedCards[id];
     if (card) {
-      grid.querySelector('.grid-inner').appendChild(card);
+      gridInner.appendChild(card);
       // Re-apply saved position
       const savedPos = widgetPositions[card.id];
       if (savedPos) {
