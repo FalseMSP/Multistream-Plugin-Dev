@@ -432,6 +432,32 @@ function _buildDashboardPage() {
   .chat-sep { color: var(--muted); flex-shrink: 0; }
   .chat-text { color: var(--text); word-break: break-word; min-width: 0; flex: 1; }
   .chat-empty { color: var(--muted); font-size: 12px; font-family: var(--mono); padding: 20px 0; text-align: center; }
+  /* ── Stream event rows (Events tab) ── */
+  .stream-event-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 5px 0; border-bottom: 1px solid var(--border);
+    font-size: 12px; line-height: 1.45;
+  }
+  .stream-event-row:last-child { border-bottom: none; }
+  .stream-event-icon { font-size: 14px; flex-shrink: 0; line-height: 1.4; }
+  .stream-event-body { flex: 1; min-width: 0; }
+  .stream-event-name {
+    font-size: 12px; font-weight: 700;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px;
+    display: inline-block;
+  }
+  .stream-event-label {
+    font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .stream-event-detail {
+    font-size: 10px; color: var(--muted); margin-top: 1px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .stream-event-ts {
+    font-family: var(--mono); font-size: 10px; color: var(--muted);
+    flex-shrink: 0; align-self: center;
+  }
   /* ── Moderation modal ── */
   .mod-overlay {
     display: none; position: fixed; inset: 0; z-index: 1000;
@@ -704,6 +730,9 @@ function _buildDashboardPage() {
           <button class="chat-tab" data-feed="twitch">
             <span style="color:#9146FF">◆</span> TW
           </button>
+          <button class="chat-tab" data-feed="events">
+            <span style="color:#fbbd08">⚡</span> Events
+          </button>
         </div>
       </div>
       <div class="chat-feed" id="chat-feed">
@@ -964,11 +993,25 @@ function _buildDashboardPage() {
 
   const chatFeed   = document.getElementById('chat-feed');
   const chatTabs   = document.querySelectorAll('.chat-tab');
-  let   chatFilter = 'combined';  // 'combined' | 'youtube' | 'twitch'
+  let   chatFilter = 'combined';  // 'combined' | 'youtube' | 'twitch' | 'events'
 
   // All received messages, keyed by platform
   const allMessages = { youtube: [], twitch: [], combined: [] };
   const MAX_CHAT = 200;
+
+  // Stream events feed
+  const streamEvents = [];
+  const MAX_EVENTS   = 200;
+
+  const EVENT_COLORS = {
+    follow: '#9147ff', sub: '#00b5ad', resub: '#00b5ad', subgift: '#f2711c',
+    redeem: '#fbbd08', bits: '#00d4aa',
+    subscribe: '#ff0000', video: '#ff6b6b', like: '#ff9f43', superchat: '#ffd700',
+  };
+  const EVENT_ICONS = {
+    follow: '👤', sub: '⭐', resub: '🔁', subgift: '🎁', redeem: '🏆', bits: '💎',
+    subscribe: '📺', video: '🎬', like: '👍', superchat: '💛',
+  };
 
   const PLATFORM_COLORS = { youtube: '#FF0000', twitch: '#9146FF' };
 
@@ -1032,14 +1075,68 @@ function _buildDashboardPage() {
     return row;
   }
 
+  function buildEventRow(ev) {
+    const row = document.createElement('div');
+    row.className = 'stream-event-row';
+    const color = EVENT_COLORS[ev.type] || 'var(--muted)';
+    const icon  = EVENT_ICONS[ev.type]  || '📡';
+    row.innerHTML =
+      '<span class="stream-event-icon">' + icon + '</span>' +
+      '<div class="stream-event-body">' +
+        '<div style="display:flex;align-items:baseline;gap:6px;flex-wrap:wrap">' +
+          '<span class="stream-event-name" style="color:' + color + '">' + esc(ev.username || 'anonymous') + '</span>' +
+          '<span class="stream-event-label">' + esc(ev.label) + '</span>' +
+        '</div>' +
+        (ev.detail ? '<div class="stream-event-detail">' + esc(ev.detail) + '</div>' : '') +
+      '</div>' +
+      '<span class="stream-event-ts">' + esc(ev.ts) + '</span>';
+    return row;
+  }
+
+  function pushStreamEvents(events) {
+    if (!Array.isArray(events) || !events.length) return;
+
+    // events from the widget arrive newest-first; reverse to get chronological order for appending
+    const incoming = [...events].reverse();
+
+    // Deduplicate by ts+type+username key (no stable id on events)
+    for (const ev of incoming) {
+      const key = ev.ts + '|' + ev.type + '|' + (ev.username || '');
+      if (!streamEvents.find(x => x._key === key)) {
+        streamEvents.push({ ...ev, _key: key });
+      }
+    }
+
+    // Keep newest MAX_EVENTS entries (array is chronological, so trim from front)
+    if (streamEvents.length > MAX_EVENTS) streamEvents.splice(0, streamEvents.length - MAX_EVENTS);
+
+    if (chatFilter !== 'events') return;
+
+    // Rebuild the events view (simple approach — list is small)
+    rerenderChat();
+  }
+
   // Tracks which message ids are currently rendered in the feed
   const renderedIds = new Set();
 
   function rerenderChat() {
     // Full rebuild — used when switching tabs
     renderedIds.clear();
-    const msgs = allMessages[chatFilter] || [];
     chatFeed.innerHTML = '';
+
+    if (chatFilter === 'events') {
+      if (!streamEvents.length) {
+        chatFeed.innerHTML = '<div class="chat-empty">No events yet</div>';
+        return;
+      }
+      // Show newest first
+      const toShow = [...streamEvents].reverse();
+      for (const ev of toShow) chatFeed.appendChild(buildEventRow(ev));
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+      return;
+    }
+
+    const msgs = allMessages[chatFilter] || [];
     if (!msgs.length) {
       chatFeed.innerHTML = '<div class="chat-empty">No messages yet</div>';
       return;
@@ -1244,10 +1341,14 @@ function _buildDashboardPage() {
         const msg = JSON.parse(e.data);
         if (msg.type === 'widget') {
           invoke(msg.id, msg.data);
-          // Also feed chat column
+          // Feed chat column from chat overlay widgets
           const platform = CHAT_SECTION_IDS[msg.id];
           if (platform && msg.data && Array.isArray(msg.data.messages)) {
             pushChatMessages(platform, msg.data.messages);
+          }
+          // Feed events tab from stream-events widget
+          if (msg.id === 'stream-events' && msg.data && Array.isArray(msg.data.events)) {
+            pushStreamEvents(msg.data.events);
           }
         } else if (msg.type === 'log' && msg.entry) {
           addLogEntry(msg.entry);
@@ -1267,6 +1368,9 @@ function _buildDashboardPage() {
     const d = initialData[sectionId];
     if (d && Array.isArray(d.messages)) pushChatMessages(platform, d.messages);
   }
+  // Bootstrap stream events from initial data
+  const initEvents = initialData['stream-events'];
+  if (initEvents && Array.isArray(initEvents.events)) pushStreamEvents(initEvents.events);
   // ── Minimize / restore widgets ───────────────────────────────────────────
 
   const minimizedSet = new Set(
