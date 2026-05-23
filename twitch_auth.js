@@ -42,7 +42,7 @@ const SCOPES = [
   'channel:read:redemptions',
   'channel:manage:redemptions', 
   'user:edit:broadcast',
-  'user:manage:broadcast',
+  'channel:manage:broadcast',
 ].join(' ');
 
 if (!CLIENT_ID || !CLIENT_SECRET) {
