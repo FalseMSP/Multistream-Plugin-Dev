@@ -238,12 +238,17 @@ function handlePull(data) {
 }
 
 // ── SSE connection to overlay-server ─────────────────────────────────────────
+// The overlay-server broadcasts: { type: 'section', id: 'gacha', data: { state, ... } }
+// via the standard /sse endpoint — no named events, just onmessage.
 function connect() {
-  const es = new EventSource('/overlay-events');
+  const es = new EventSource('/sse');
 
-  es.addEventListener('gacha', e => {
+  es.onmessage = function(e) {
     try {
-      const data = JSON.parse(e.data);
+      const msg = JSON.parse(e.data);
+      if (msg.type !== 'section' || msg.id !== 'gacha') return;
+      const data = msg.data;
+      if (!data) return;
       if (data.state === 'pulling') {
         handlePull(data);
       } else if (data.state === 'idle') {
@@ -252,12 +257,12 @@ function connect() {
     } catch(err) {
       console.error('[gacha overlay] parse error', err);
     }
-  });
+  };
 
-  es.addEventListener('error', () => {
+  es.onerror = function() {
     es.close();
     setTimeout(connect, 3000); // reconnect
-  });
+  };
 }
 
 connect();

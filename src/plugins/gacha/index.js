@@ -2,7 +2,11 @@
 
 const log = require('../../logger');
 const commandsList = require('../commands-list');
-const { registerSection, updateSection } = require('../../overlay-server');
+const { registerSection, updateSection, addRoute } = require('../../overlay-server');
+const fs   = require('fs');
+const path = require('path');
+
+const GACHA_HTML = path.resolve(__dirname, 'overlay.html');
 
 // ─── Loot Table ─────────────────────────────────────────────────────────────
 // Each entry: { id, label, rarity, icon (folder name under gachaicons/) }
@@ -229,6 +233,18 @@ function init(context) {
   } else {
     log.warn('[gacha] context.queue.onSub not available — sub triggers disabled');
   }
+
+  // ── Gacha overlay route ──────────────────────────────────────────────────
+  addRoute('/gacha', (req, res) => {
+    try {
+      const html = fs.readFileSync(GACHA_HTML, 'utf8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } catch (e) {
+      log.error('[gacha] Could not read overlay.html:', e.message);
+      res.writeHead(500); res.end('Gacha overlay not found');
+    }
+  });
 
   log.info('[gacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
   log.info('[gacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
