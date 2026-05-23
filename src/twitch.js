@@ -788,27 +788,70 @@ async function setRewardEnabled(rewardName, enabled) {
   }
 }
 
+// ── Stream info update (title, category, tags) ────────────────────────────
+ 
 /**
- * Update the Twitch stream title for the broadcaster's channel.
- * Requires the broadcaster's user OAuth token with the
- * `channel:manage:broadcast` scope.
+ * Update any combination of stream title, category (game), and tags
+ * for the broadcaster's Twitch channel.
  *
- * The token is the same one stored in .twitch-tokens.json by twitch-auth.js.
- * If that file is missing or the scope was not granted, this will throw.
+ * All fields are optional — only the fields you supply will be changed.
+ * Omitting a field leaves it unchanged on Twitch's side because PATCH
+ * /channels ignores missing keys.
  *
- * @param {string} title  New stream title (max 140 chars)
- * @returns {Promise<void>}
+ * Requires the broadcaster user OAuth token with channel:manage:broadcast.
+ * The token must be in .twitch-tokens.json (written by twitch-auth.js).
+ *
+ * @param {{ title?: string, category?: string, tags?: string[] }} opts
+ *   title    — Stream title (max 140 chars)
+ *   category — Game/category name (e.g. "Just Chatting"). Resolved to a
+ *              game_id via GET /helix/games before the PATCH.
+ *   tags     — Array of free-form tag strings (max 10, each max 25 chars).
+ *              Pass an empty array [] to clear all tags.
  */
-async function updateStreamTitle(title) {
+async function updateStreamInfo({ title, category, tags } = {}) {
   const broadcasterId = await getBroadcasterId();
   if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+ 
+  const body = {};
+ 
+  if (title !== undefined && title !== null) {
+    body.title = String(title).slice(0, 140);
+  }
+ 
+  if (category !== undefined && category !== null && category !== '') {
+    // Resolve category name → game_id
+    const gamesData = await helixRequest('GET', `/games?name=${encodeURIComponent(category)}`);
+    const game = gamesData?.data?.[0];
+    if (!game) throw new Error(`Twitch category not found: "${category}"`);
+    body.game_id = game.id;
+    log.info(`[Twitch] Resolved category "${category}" → game_id ${game.id}`);
+  }
+ 
+  if (tags !== undefined && tags !== null) {
+    // Sanitise: max 10 tags, each trimmed to 25 chars, no empty strings
+    body.tags = tags
+      .map(t => String(t).trim().slice(0, 25))
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+ 
+  if (Object.keys(body).length === 0) {
+    log.warn('[Twitch] updateStreamInfo called with no fields to update');
+    return;
+  }
  
   await helixUserRequest(
     'PATCH',
     `/channels?broadcaster_id=${broadcasterId}`,
-    { title: String(title).slice(0, 140) }
+    body
   );
-  log.info(`[Twitch] Stream title updated: "${title}"`);
+ 
+  const parts = [
+    body.title    !== undefined ? `title="${body.title}"`          : null,
+    body.game_id  !== undefined ? `category="${category}"`         : null,
+    body.tags     !== undefined ? `tags=[${body.tags.join(', ')}]` : null,
+  ].filter(Boolean);
+  log.info(`[Twitch] Stream info updated: ${parts.join(', ')}`);
 }
 
 module.exports = {
@@ -820,7 +863,7 @@ module.exports = {
   setRewardEnabled,
   helixUserRequest,
   getBroadcasterId,
-  updateStreamTitle,
+  updateStreamInfo,
   modHandlers: {
     ban:     twitchBan,
     timeout: twitchTimeout,

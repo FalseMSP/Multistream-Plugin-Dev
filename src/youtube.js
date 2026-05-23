@@ -832,31 +832,39 @@ function triggerVideo(videoId, queue) {
 }
 
 /**
- * Update the title of the currently active live video (or YT_VIDEO_ID if set).
+ * Update any combination of title, tags, and categoryId on the currently
+ * active live video (or YT_VIDEO_ID if set).
  *
- * Requires the channel owner's OAuth token (.youtube-tokens.json, written by
- * youtube-auth.js) with the youtube.force-ssl scope.
+ * All fields are optional — only supplied fields are changed. The existing
+ * snippet is fetched first so that unmentioned fields (description, etc.)
+ * are preserved; YouTube's videos.update would erase them otherwise.
  *
- * YouTube's videos.update API requires you to re-supply the full snippet
- * (categoryId + title + description + tags), so we fetch the existing snippet
- * first and patch only the title field.
+ * Requires the channel owner's OAuth token (.youtube-tokens.json) with the
+ * youtube.force-ssl scope (already required for mod actions).
  *
- * @param {string} title  New video title (max 100 chars per YouTube's limit)
- * @returns {Promise<void>}
+ * @param {{ title?: string, tags?: string[], categoryId?: string }} opts
+ *   title      — Video title (max 100 chars per YouTube's limit)
+ *   tags       — Array of tag strings. Pass [] to clear all tags.
+ *   categoryId — YouTube category ID as a string (e.g. "20" for Gaming).
+ *                See: https://gist.github.com/dgp/1b24bf2961521bd75d6c
  */
-async function updateVideoTitle(title) {
+async function updateVideoInfo({ title, tags, categoryId } = {}) {
   const youtube = _getYoutubeClient();
  
-  // Resolve which video ID to update: prefer active session, fall back to env var
+  // Resolve which video ID to update
   const videoId = (() => {
-    // Grab the first active session's video ID
     for (const [id] of _activeSessions) return id;
     return YT_VIDEO_ID || null;
   })();
  
   if (!videoId) throw new Error('No active YouTube video ID — stream may not be live');
  
-  // Fetch the existing snippet so we don't clobber description/tags/categoryId
+  if (title === undefined && tags === undefined && categoryId === undefined) {
+    log.warn('[YouTube] updateVideoInfo called with no fields to update');
+    return;
+  }
+ 
+  // Fetch the existing snippet to preserve all un-edited fields
   const existing = await youtube.videos.list({
     part: ['snippet'],
     id:   [videoId],
@@ -865,22 +873,35 @@ async function updateVideoTitle(title) {
   const snippet = existing?.data?.items?.[0]?.snippet;
   if (!snippet) throw new Error(`Could not fetch snippet for video ${videoId}`);
  
-  // Apply the new title (YouTube enforces a 100-char limit)
-  snippet.title = String(title).slice(0, 100);
+  // Apply only the fields that were supplied
+  if (title !== undefined && title !== null) {
+    snippet.title = String(title).slice(0, 100);
+  }
+  if (tags !== undefined && tags !== null) {
+    snippet.tags = tags.map(t => String(t).trim()).filter(Boolean);
+  }
+  if (categoryId !== undefined && categoryId !== null && categoryId !== '') {
+    snippet.categoryId = String(categoryId);
+  }
  
   await youtube.videos.update({
     part: ['snippet'],
     requestBody: { id: videoId, snippet },
   });
  
-  log.info(`[YouTube] Video title updated for ${videoId}: "${title}"`);
+  const parts = [
+    title      !== undefined ? `title="${snippet.title}"`   : null,
+    tags       !== undefined ? `tags=[${snippet.tags?.join(', ')}]` : null,
+    categoryId !== undefined ? `categoryId=${snippet.categoryId}`   : null,
+  ].filter(Boolean);
+  log.info(`[YouTube] Video info updated for ${videoId}: ${parts.join(', ')}`);
 }
 
 module.exports = {
   say,
   startYouTube,
   triggerVideo,
-  updateVideoTitle,
+  updateVideoInfo,
   stopSubscriberPoller() {
     if (_subPollerTimer) { clearInterval(_subPollerTimer); _subPollerTimer = null; }
     _lastKnownSubCount = null;
