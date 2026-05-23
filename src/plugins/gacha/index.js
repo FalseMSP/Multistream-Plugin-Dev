@@ -17,36 +17,36 @@ const LOOT_TABLE = [
   // Common
   // redeem: exact Twitch reward title to fire when this item is revealed.
   // null = no automatic redeem (handled manually, or not applicable).
-  { id: 'play-gd-level',    label: 'Play your GD Level',            rarity: 'common',    icon: 'play-gd-level',    odds: 10.00, premiumOdds: 2.00, redeem: 'Play your GD Level'   },
+  { id: 'play-gd-level',    label: 'Play your GD Level',            rarity: 'common',    icon: 'play-gd-level',    odds: 10.00, premiumOdds: 2.00, redeem: 'Play your GD Level'    },
   { id: 'read-your-name',   label: 'Read your name',                rarity: 'common',    icon: 'read-your-name',   odds: 10.00, premiumOdds: 0.00, redeem: 'Read your name'        },
   { id: 'vine-boom',        label: 'Vine Boom',                     rarity: 'common',    icon: 'vine-boom',        odds: 10.00, premiumOdds: 4.00, redeem: 'Vine Boom'             },
   { id: 'metal-pipe',       label: 'Metal Pipe',                    rarity: 'common',    icon: 'metal-pipe',       odds: 10.00, premiumOdds: 4.00, redeem: 'Metal Pipe'            },
   // Uncommon
   { id: 'fah',              label: 'Fahhhhh',                       rarity: 'uncommon',  icon: 'fah',              odds:  5.00, premiumOdds: 5.00, redeem: 'Fah'                   },
   { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'uncommon',  icon: 'screaming-chicken',odds:  5.00, premiumOdds: 5.00, redeem: 'Screaming Chicken'     },
-  { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  5.00, premiumOdds: 9.00, redeem: null                    },
-  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  5.00, premiumOdds: 2.00, redeem: null                    },
-  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  5.00, premiumOdds: 0.00, redeem: null                    },
+  { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  5.00, premiumOdds: 9.00, redeem: 'Vip'                   },
+  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  5.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
+  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  5.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
   // Rare
-  { id: 'premium-roll',     label: '1x Premium Roll',               rarity: 'rare',      icon: 'premium-roll',     odds:  3.00, premiumOdds: 0.00, redeem: null                    },
-  { id: '50pt-discount',    label: '50 Point Discount',             rarity: 'rare',      icon: '50pt-discount',    odds:  3.00, premiumOdds: 9.00, redeem: null                    },
+  { id: 'premium-roll',     label: '1x Premium Roll',               rarity: 'rare',      icon: 'premium-roll',     odds:  3.00, premiumOdds: 0.00, redeem: '1x Premium Roll'       },
+  { id: '50pt-discount',    label: '50 Point Discount',             rarity: 'rare',      icon: '50pt-discount',    odds:  3.00, premiumOdds: 9.00, redeem: '50 Point Discount'     },
   // Epic
   { id: 'say-phrase',       label: 'Say a Phrase',                  rarity: 'epic',      icon: 'say-phrase',       odds:  3.00, premiumOdds: 9.00, redeem: 'Say a Phrase'          },
   { id: 'turn-model-180',   label: 'Turn Model 180°',               rarity: 'epic',      icon: 'turn-model-180',   odds:  2.00, premiumOdds: 9.00, redeem: 'Turn Model 180'        },
-  { id: 'custom-sfx',       label: 'Add Custom SFX',                rarity: 'epic',      icon: 'custom-sfx',       odds:  2.00, premiumOdds: 9.00, redeem: 'Add Custom SFX'       },
+  { id: 'custom-sfx',       label: 'Add Custom SFX',                rarity: 'epic',      icon: 'custom-sfx',       odds:  2.00, premiumOdds: 9.00, redeem: 'Add Custom SFX'        },
   { id: '1v1',              label: '1v1',                           rarity: 'epic',      icon: '1v1',              odds:  2.00, premiumOdds: 9.00, redeem: '1v1'                   },
   // Legendary
-  { id: 'choose-game',      label: 'Choose Game to Stream Tomorrow',rarity: 'legendary', icon: 'choose-game',      odds:  1.00, premiumOdds: 5.00, redeem: null                    },
-  { id: 'free-art',         label: 'Free Art',                      rarity: 'legendary', icon: 'free-art',         odds:  1.00, premiumOdds: 5.00, redeem: null                    },
-  { id: 'free-art-3d',      label: 'Free Art (3D)',                 rarity: 'legendary', icon: 'free-art-3d',      odds:  1.00, premiumOdds: 5.00, redeem: null                    },
-  { id: 'mod',              label: 'Mod',                           rarity: 'legendary', icon: 'mod',              odds:  1.00, premiumOdds: 5.00, redeem: null                    },
+  { id: 'choose-game',      label: 'Choose Game to Stream Tomorrow',rarity: 'legendary', icon: 'choose-game',      odds:  1.00, premiumOdds: 5.00, redeem: 'Choose Game to Stream Tomorrow' },
+  { id: 'free-art',         label: 'Free Art',                      rarity: 'legendary', icon: 'free-art',         odds:  1.00, premiumOdds: 5.00, redeem: 'Free Art'              },
+  { id: 'free-art-3d',      label: 'Free Art (3D)',                 rarity: 'legendary', icon: 'free-art-3d',      odds:  1.00, premiumOdds: 5.00, redeem: 'Free Art (3D)'         },
+  { id: 'mod',              label: 'Mod',                           rarity: 'legendary', icon: 'mod',              odds:  1.00, premiumOdds: 5.00, redeem: 'Mod'                   },
   // Mythic
-  { id: 'custom-mc-mod',    label: 'Custom Minecraft Mod',          rarity: 'mythic',    icon: 'custom-mc-mod',    odds:  0.10, premiumOdds: 1.00, redeem: null                    },
-  { id: 'shower-stream',    label: 'Shower Stream',                 rarity: 'mythic',    icon: 'shower-stream',    odds:  0.01, premiumOdds: 1.00, redeem: null                    },
+  { id: 'custom-mc-mod',    label: 'Custom Minecraft Mod',          rarity: 'mythic',    icon: 'custom-mc-mod',    odds:  0.10, premiumOdds: 1.00, redeem: 'Custom Minecraft Mod'  },
+  { id: 'shower-stream',    label: 'Shower Stream',                 rarity: 'mythic',    icon: 'shower-stream',    odds:  0.01, premiumOdds: 1.00, redeem: 'Shower Stream'         },
   // One of One
-  { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.01, premiumOdds: 0.01, redeem: null                    },
+  { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.01, premiumOdds: 0.01, redeem: 'Literally Nothing (Rare)'},
   // Dud (virtual — handled separately)
-  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 15.88, premiumOdds: 1.99, redeem: null                    },
+  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 15.88, premiumOdds: 1.99, redeem: 'Dud'                   },
 ];
 
 const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
