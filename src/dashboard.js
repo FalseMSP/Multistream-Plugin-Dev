@@ -1100,20 +1100,54 @@ function _buildDashboardPage() {
     const incoming = [...events].reverse();
 
     // Deduplicate by ts+type+username key (no stable id on events)
+    const newEvents = [];
     for (const ev of incoming) {
       const key = ev.ts + '|' + ev.type + '|' + (ev.username || '');
       if (!streamEvents.find(x => x._key === key)) {
-        streamEvents.push({ ...ev, _key: key });
+        // Derive a numeric sort id from the HH:MM:SS timestamp so events
+        // interleave correctly with chat messages in the combined feed.
+        const parts = (ev.ts || '00:00:00').split(':').map(Number);
+        const sortId = (parts[0] * 3600 + parts[1] * 60 + (parts[2] || 0)) * 1000;
+        const entry = { ...ev, _key: key, id: sortId, _isEvent: true };
+        streamEvents.push(entry);
+        newEvents.push(entry);
       }
     }
 
     // Keep newest MAX_EVENTS entries (array is chronological, so trim from front)
     if (streamEvents.length > MAX_EVENTS) streamEvents.splice(0, streamEvents.length - MAX_EVENTS);
 
-    if (chatFilter !== 'events') return;
+    // Also insert new events into the combined feed and keep it sorted
+    for (const entry of newEvents) {
+      if (!allMessages.combined.find(x => x._key === entry._key)) {
+        allMessages.combined.push(entry);
+      }
+    }
+    if (allMessages.combined.length > MAX_CHAT) allMessages.combined.splice(0, allMessages.combined.length - MAX_CHAT);
+    allMessages.combined.sort((a, b) => a.id - b.id);
 
-    // Rebuild the events view (simple approach — list is small)
-    rerenderChat();
+    if (chatFilter === 'events') {
+      rerenderChat();
+      return;
+    }
+
+    // If on the All tab, append new event rows live (without full rebuild)
+    if (chatFilter === 'combined') {
+      const empty = chatFeed.querySelector('.chat-empty');
+      if (empty) empty.remove();
+
+      const atBottom = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
+
+      for (const entry of newEvents) {
+        if (!renderedIds.has(entry._key)) {
+          chatFeed.appendChild(buildEventRow(entry));
+          renderedIds.add(entry._key);
+        }
+      }
+
+      while (chatFeed.children.length > MAX_CHAT) chatFeed.removeChild(chatFeed.firstChild);
+      if (atBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
+    }
   }
 
   // Tracks which message ids are currently rendered in the feed
@@ -1142,8 +1176,13 @@ function _buildDashboardPage() {
       return;
     }
     for (const m of msgs) {
-      chatFeed.appendChild(buildChatRow(m));
-      renderedIds.add(m.id);
+      if (m._isEvent) {
+        chatFeed.appendChild(buildEventRow(m));
+        renderedIds.add(m._key);
+      } else {
+        chatFeed.appendChild(buildChatRow(m));
+        renderedIds.add(m.id);
+      }
     }
     chatFeed.scrollTop = chatFeed.scrollHeight;
   }
@@ -1171,6 +1210,7 @@ function _buildDashboardPage() {
     // Only append messages that belong to the currently active tab
     const toAppend = messages.filter(m => {
       if (m.dashboardSuppress) return false;
+      if (m._isEvent) return false;          // events have their own append path
       if (renderedIds.has(m.id)) return false;
       if (chatFilter === 'combined') return true;
       return m.platform === chatFilter;
