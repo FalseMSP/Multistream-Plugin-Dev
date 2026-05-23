@@ -93,19 +93,15 @@ registerSection('gacha', {
 // ─── State helpers ────────────────────────────────────────────────────────────
 
 let _pullActive = false;
+const _pullQueue = []; // { user, isPremium }
 
 function pushState(state, extra = {}) {
   updateSection('gacha', { state, ...extra });
 }
 
-// ─── Main pull trigger ────────────────────────────────────────────────────────
-// Call this from your redeem / bits handler.
+// ─── Internal: play one pull immediately ─────────────────────────────────────
 
-function triggerPull({ user, isPremium = false }) {
-  if (_pullActive) {
-    log.warn('[gacha] Pull already active, ignoring.');
-    return;
-  }
+function _executePull({ user, isPremium }) {
   _pullActive = true;
 
   const item = roll(isPremium);
@@ -123,9 +119,8 @@ function triggerPull({ user, isPremium = false }) {
   // Icon path (null for duds)
   const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
 
-  log.info(`[gacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}]`);
+  log.info(`[gacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
 
-  // Push "pulling" state with video + eventual icon info
   pushState('pulling', {
     user,
     videoFile,
@@ -135,7 +130,6 @@ function triggerPull({ user, isPremium = false }) {
     isDud,
   });
 
-  // After a generous window (video + icon display + fade out = ~14s), reset
   setTimeout(() => {
     pushState('result', {
       result: { rarity: item.rarity, label: item.label, user },
@@ -145,7 +139,25 @@ function triggerPull({ user, isPremium = false }) {
   setTimeout(() => {
     pushState('idle');
     _pullActive = false;
+    // Start the next queued pull after a short breath between animations
+    if (_pullQueue.length > 0) {
+      const next = _pullQueue.shift();
+      log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
+      setTimeout(() => _executePull(next), 1500);
+    }
   }, 14000);
+}
+
+// ─── Main pull trigger ────────────────────────────────────────────────────────
+// Queues the pull if one is already in progress; plays immediately otherwise.
+
+function triggerPull({ user, isPremium = false }) {
+  if (_pullActive) {
+    _pullQueue.push({ user, isPremium });
+    log.info(`[gacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+    return;
+  }
+  _executePull({ user, isPremium });
 }
 
 // ─── Redeem / bits / sub titles ───────────────────────────────────────────────
@@ -201,37 +213,37 @@ function init(context) {
     log.warn('[gacha] context.queue.onRedeem not available — redeem triggers disabled');
   }
 
-  // ── Bits ─────────────────────────────────────────────────────────────────
-  // 100 bits = 1 standard pull. 300 bits = 3 pulls queued back-to-back.
-  if (typeof q.onBits === 'function') {
-    q.onBits(event => {
-      const bits  = event.bits ?? event.amount ?? 0;
-      const user  = event.user ?? event.username ?? 'someone';
-      const pulls = Math.floor(bits / BITS_PER_PULL);
-      if (pulls < 1) return;
+  // ── Bits & Subs via onDonation ───────────────────────────────────────────
+  // queue.js routes bits, subs, resubs, and subgifts through onDonation.
+  // type: 'bits'                → standard pull (100 bits = 1 pull)
+  // type: 'sub' | 'resub'      → 1 premium pull for the subscriber
+  // type: 'subgift'            → 1 premium pull per sub gifted (credit gifter)
+  if (typeof q.onDonation === 'function') {
+    q.onDonation(event => {
+      const type = event.type;
 
-      log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} pull(s)`);
-      for (let i = 0; i < pulls; i++) {
-        setTimeout(() => triggerPull({ user, isPremium: false }), i * 15000);
+      if (type === 'bits') {
+        const bits  = event.amount ?? 0;
+        const user  = event.username ?? 'someone';
+        const pulls = Math.floor(bits / BITS_PER_PULL);
+        if (pulls < 1) return;
+        log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
+        for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: false });
+
+      } else if (type === 'sub' || type === 'resub') {
+        const user = event.username ?? 'someone';
+        log.info(`[gacha] ${type} from ${user} → 1 premium pull`);
+        triggerPull({ user, isPremium: true });
+
+      } else if (type === 'subgift') {
+        const user  = event.username ?? 'someone'; // gifter
+        const count = event.quantity ?? 1;
+        log.info(`[gacha] ${user} gifted ${count} sub(s) → ${count} premium pull(s)`);
+        for (let i = 0; i < count; i++) triggerPull({ user, isPremium: true });
       }
     });
   } else {
-    log.warn('[gacha] context.queue.onBits not available — bits triggers disabled');
-  }
-
-  // ── Subs (any tier, gifted or self) ──────────────────────────────────────
-  // Any sub = 1 premium pull. Bulk gift subs give one pull per sub gifted.
-  if (typeof q.onSub === 'function') {
-    q.onSub(event => {
-      const user  = event.gifter ?? event.user ?? event.username ?? 'someone';
-      const count = event.giftCount ?? 1;
-      log.info(`[gacha] Sub event from ${user} (x${count}) → ${count} premium pull(s)`);
-      for (let i = 0; i < count; i++) {
-        setTimeout(() => triggerPull({ user, isPremium: true }), i * 15000);
-      }
-    });
-  } else {
-    log.warn('[gacha] context.queue.onSub not available — sub triggers disabled');
+    log.warn('[gacha] context.queue.onDonation not available — bits/sub triggers disabled');
   }
 
   // ── Gacha overlay route ──────────────────────────────────────────────────
