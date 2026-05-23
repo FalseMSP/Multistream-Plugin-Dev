@@ -788,6 +788,29 @@ async function setRewardEnabled(rewardName, enabled) {
   }
 }
 
+/**
+ * Update the Twitch stream title for the broadcaster's channel.
+ * Requires the broadcaster's user OAuth token with the
+ * `channel:manage:broadcast` scope.
+ *
+ * The token is the same one stored in .twitch-tokens.json by twitch-auth.js.
+ * If that file is missing or the scope was not granted, this will throw.
+ *
+ * @param {string} title  New stream title (max 140 chars)
+ * @returns {Promise<void>}
+ */
+async function updateStreamTitle(title) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+ 
+  await helixUserRequest(
+    'PATCH',
+    `/channels?broadcaster_id=${broadcasterId}`,
+    { title: String(title).slice(0, 140) }
+  );
+  log.info(`[Twitch] Stream title updated: "${title}"`);
+}
+
 module.exports = {
   say,
   startTwitch,
@@ -797,6 +820,7 @@ module.exports = {
   setRewardEnabled,
   helixUserRequest,
   getBroadcasterId,
+  updateStreamTitle,
   modHandlers: {
     ban:     twitchBan,
     timeout: twitchTimeout,

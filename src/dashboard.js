@@ -176,6 +176,24 @@ function _broadcast(payload) {
 /** Handlers registered by plugins to perform actual mod actions */
 const _modHandlers = [];
 
+/** Handlers registered by plugins for named dashboard actions */
+const _actionHandlers = new Map();
+
+/**
+ * Register a handler for a named action dispatched from a dashboard widget.
+ *
+ * The handler receives the full parsed request body and should return
+ * a plain object; that object is JSON-serialised and sent back to the
+ * browser as the response.
+ *
+ * @param {string}   name     Action name (e.g. 'set-title')
+ * @param {Function} handler  async (body) => object
+ */
+function registerAction(name, handler) {
+  _actionHandlers.set(name, handler);
+  log.info(`[dashboard] Action registered: ${name}`);
+}
+
 /**
  * Register a handler for moderation actions dispatched from the dashboard.
  * @param {{ ban: Function, timeout: Function }} handlers
@@ -1935,6 +1953,38 @@ async function handleRequest(req, res) {
     return true;
   }
 
+  // ── POST /dashboard/action ────────────────────────────────────────────────
+  if (method === 'POST' && url === '/dashboard/action') {
+    const raw = await _readBody(req);
+    let body;
+    try { body = JSON.parse(raw); } catch { body = {}; }
+ 
+    const { action } = body;
+    let result;
+ 
+    if (!action) {
+      result = { ok: false, error: 'Missing required field: action' };
+    } else {
+      const handler = _actionHandlers.get(action);
+      if (!handler) {
+        result = { ok: false, error: `No handler registered for action: ${action}` };
+        log.warn(`[dashboard] /action — unknown action: ${action}`);
+      } else {
+        try {
+          result = await handler(body);
+          log.info(`[dashboard] /action "${action}" → ok`);
+        } catch (err) {
+          result = { ok: false, error: err.message };
+          log.error(`[dashboard] /action "${action}" threw:`, err.message);
+        }
+      }
+    }
+ 
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result ?? { ok: true }));
+    return true;
+  }
+
   return false;
 }
 
@@ -1951,7 +2001,7 @@ async function handleRequest(req, res) {
  * @param {{ addRoute: Function }} overlayModule
  */
 function mountOnOverlayServer(overlayModule) {
-  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state', '/dashboard/moderate', '/dashboard/command']) {
+  for (const route of ['/dashboard', '/dashboard/login', '/dashboard/logout', '/dashboard/sse', '/dashboard/state', '/dashboard/moderate', '/dashboard/command', '/dashboard/action']) {
     overlayModule.addRoute(route, (req, res) => {
       handleRequest(req, res).then(handled => {
         if (!handled) { res.writeHead(404); res.end('Not found'); }
@@ -1973,4 +2023,5 @@ module.exports = {
   handleRequest,
   mountOnOverlayServer,
   onModerate,
+  registerAction,
 };

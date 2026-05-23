@@ -831,10 +831,56 @@ function triggerVideo(videoId, queue) {
   _startSession(videoId, queue);
 }
 
+/**
+ * Update the title of the currently active live video (or YT_VIDEO_ID if set).
+ *
+ * Requires the channel owner's OAuth token (.youtube-tokens.json, written by
+ * youtube-auth.js) with the youtube.force-ssl scope.
+ *
+ * YouTube's videos.update API requires you to re-supply the full snippet
+ * (categoryId + title + description + tags), so we fetch the existing snippet
+ * first and patch only the title field.
+ *
+ * @param {string} title  New video title (max 100 chars per YouTube's limit)
+ * @returns {Promise<void>}
+ */
+async function updateVideoTitle(title) {
+  const youtube = _getYoutubeClient();
+ 
+  // Resolve which video ID to update: prefer active session, fall back to env var
+  const videoId = (() => {
+    // Grab the first active session's video ID
+    for (const [id] of _activeSessions) return id;
+    return YT_VIDEO_ID || null;
+  })();
+ 
+  if (!videoId) throw new Error('No active YouTube video ID — stream may not be live');
+ 
+  // Fetch the existing snippet so we don't clobber description/tags/categoryId
+  const existing = await youtube.videos.list({
+    part: ['snippet'],
+    id:   [videoId],
+  });
+ 
+  const snippet = existing?.data?.items?.[0]?.snippet;
+  if (!snippet) throw new Error(`Could not fetch snippet for video ${videoId}`);
+ 
+  // Apply the new title (YouTube enforces a 100-char limit)
+  snippet.title = String(title).slice(0, 100);
+ 
+  await youtube.videos.update({
+    part: ['snippet'],
+    requestBody: { id: videoId, snippet },
+  });
+ 
+  log.info(`[YouTube] Video title updated for ${videoId}: "${title}"`);
+}
+
 module.exports = {
   say,
   startYouTube,
   triggerVideo,
+  updateVideoTitle,
   stopSubscriberPoller() {
     if (_subPollerTimer) { clearInterval(_subPollerTimer); _subPollerTimer = null; }
     _lastKnownSubCount = null;
