@@ -1,9 +1,9 @@
 'use strict';
 /**
- * Plugin: commands
+ * Plugin: add-commands
  * ────────────────────
- * Lets mods add/remove/list custom chat commands via Discord slash commands.
- * Any registered command is then usable in Twitch and YouTube chat.
+ * Handles !<trigger> chat responses and the /command Discord slash command.
+ * Delegates all storage and registry management to commands-list.
  *
  * Discord slash commands (mods only):
  *   /command add <trigger> <response>  — add or overwrite a command
@@ -12,43 +12,14 @@
  *
  * Chat usage (Twitch + YouTube):
  *   !<trigger>  — bot replies with the saved response text
- *
- * Example:
- *   /command add ip  theiptojoin.net
- *   → user types !ip → bot says "theiptojoin.net"
  */
 
-const fs   = require('fs');
-const path = require('path');
-const log  = require('../../logger');
+const log      = require('../../logger');
+const registry = require('../commands-list');
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-
-// ── Persistence ───────────────────────────────────────────────────────────────
-
-const STATE_FILE = path.join(__dirname, 'state.json');
-
-function loadState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    // Default: ship with the classic !rank command so nothing breaks
-    return { commands: { rank: 'Unranked' } };
-  }
-}
-
-function saveState(state) {
-  try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-  } catch (e) {
-    log.error('[commands] Failed to save state:', e.message);
-  }
-}
-
-let _state = loadState();
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
 
-// Matches !<word>  (optionally followed by whitespace, nothing else)
 const CMD_RE = /^!([A-Za-z0-9_]+)\s*$/;
 
 let _chatReply = { twitch: null, youtube: null };
@@ -65,16 +36,17 @@ async function processMessage(msg) {
   if (!match) return { message: msg };
 
   const trigger = match[1].toLowerCase();
-  const response = _state.commands[trigger];
-  if (!response) return { message: msg }; // unknown command — pass through
+  const cmds    = registry.getCommands();
+  const entry   = cmds.find(c => c.trigger === trigger);
+  if (!entry) return { message: msg };
 
   const send = _chatReply[msg.platform];
   if (send) {
-    send(response)
+    send(entry.response)
       .catch(e => log.error(`[commands] chat reply error for !${trigger}:`, e.message));
   }
 
-  return { message: null }; // suppress from #stream-chat
+  return { message: null };
 }
 
 // ── Discord slash command ─────────────────────────────────────────────────────
@@ -85,12 +57,11 @@ const command = new SlashCommandBuilder()
   .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
 
   .addSubcommand(sub =>
-    sub
-      .setName('add')
+    sub.setName('add')
       .setDescription('Add or overwrite a chat command')
       .addStringOption(o =>
         o.setName('trigger')
-          .setDescription('The trigger word — users type !trigger (no ! needed here)')
+          .setDescription('Trigger word — users type !trigger (no ! needed here)')
           .setRequired(true))
       .addStringOption(o =>
         o.setName('response')
@@ -98,17 +69,15 @@ const command = new SlashCommandBuilder()
           .setRequired(true)))
 
   .addSubcommand(sub =>
-    sub
-      .setName('remove')
+    sub.setName('remove')
       .setDescription('Remove a chat command')
       .addStringOption(o =>
         o.setName('trigger')
-          .setDescription('The trigger word to remove (no ! needed)')
+          .setDescription('Trigger word to remove (no ! needed)')
           .setRequired(true)))
 
   .addSubcommand(sub =>
-    sub
-      .setName('list')
+    sub.setName('list')
       .setDescription('List all registered chat commands'));
 
 async function handleInteraction(interaction) {
@@ -118,18 +87,17 @@ async function handleInteraction(interaction) {
 
   // ── /command add ──────────────────────────────────────────────────────────
   if (sub === 'add') {
-    const trigger   = interaction.options.getString('trigger').trim().toLowerCase().replace(/^!/, '');
-    const response  = interaction.options.getString('response').trim();
+    const trigger  = interaction.options.getString('trigger').trim().toLowerCase().replace(/^!/, '');
+    const response = interaction.options.getString('response').trim();
 
     if (!/^[A-Za-z0-9_]+$/.test(trigger)) {
       return interaction.editReply('⚠️ Trigger can only contain letters, numbers, and underscores.');
     }
 
-    const isUpdate = Boolean(_state.commands[trigger]);
-    _state.commands[trigger] = response;
-    saveState(_state);
+    const isUpdate = registry.getCommands().some(c => c.trigger === trigger);
+    registry.registerCommand(trigger, response);
 
-    log.info(`[commands] !${trigger} ${isUpdate ? 'updated' : 'added'} by ${interaction.user.tag}: "${response}"`);
+    log.info(`[commands] !${trigger} ${isUpdate ? 'updated' : 'added'} by ${interaction.user.tag}`);
     return interaction.editReply(
       `${isUpdate ? '✏️ Updated' : '✅ Added'} **!${trigger}** → ${response}`
     );
@@ -138,31 +106,25 @@ async function handleInteraction(interaction) {
   // ── /command remove ───────────────────────────────────────────────────────
   if (sub === 'remove') {
     const trigger = interaction.options.getString('trigger').trim().toLowerCase().replace(/^!/, '');
+    const exists  = registry.getCommands().some(c => c.trigger === trigger);
 
-    if (!_state.commands[trigger]) {
+    if (!exists) {
       return interaction.editReply(`⚠️ No command **!${trigger}** found.`);
     }
 
-    delete _state.commands[trigger];
-    saveState(_state);
-
+    registry.removeCommand(trigger);
     log.info(`[commands] !${trigger} removed by ${interaction.user.tag}`);
     return interaction.editReply(`🗑️ Removed **!${trigger}**.`);
   }
 
   // ── /command list ─────────────────────────────────────────────────────────
   if (sub === 'list') {
-    const entries = Object.entries(_state.commands);
-
-    if (entries.length === 0) {
+    const cmds = registry.getCommands();
+    if (!cmds.length) {
       return interaction.editReply('No commands registered yet. Use `/command add` to create one.');
     }
-
-    const lines = entries
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([trigger, response]) => `**!${trigger}** → ${response}`);
-
-    return interaction.editReply(`**Registered commands (${entries.length}):**\n${lines.join('\n')}`);
+    const lines = cmds.map(c => `**!${c.trigger}** → ${c.response}`);
+    return interaction.editReply(`**Registered commands (${cmds.length}):**\n${lines.join('\n')}`);
   }
 
   return interaction.editReply('⚠️ Unknown subcommand.');
