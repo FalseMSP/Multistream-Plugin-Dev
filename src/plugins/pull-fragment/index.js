@@ -96,7 +96,15 @@ let _chatReply = { twitch: null, youtube: null };
 
 function _send(platform, text) {
   const fn = _chatReply[platform];
-  if (fn) fn(text).catch(e => log.error('[pull-fragment] chat reply error:', e.message));
+  if (!fn) return;
+  try {
+    const result = fn(text);
+    if (result && typeof result.catch === 'function') {
+      result.catch(e => log.error('[pull-fragment] chat reply error:', e.message));
+    }
+  } catch (e) {
+    log.error('[pull-fragment] chat reply error:', e.message);
+  }
 }
 
 function onChatReady(chatReply) {
