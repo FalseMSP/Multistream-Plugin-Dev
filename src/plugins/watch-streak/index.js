@@ -196,7 +196,7 @@ async function _awardStreakPoints(username, platform, streak) {
   const reason = `Watch streak day ${streak} bonus`;
   log.info(`[watch-streak] Awarding ${points} points to ${platform}/${username} (streak ${streak}).`);
   try {
-    await _pointsPlugin.awardPoints(username, platform, points, reason);
+    await _pointsPlugin.awardPoints(username, points, reason);
   } catch (e) {
     log.error(`[watch-streak] Failed to award points to ${platform}/${username}:`, e.message);
   }

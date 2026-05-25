@@ -72,6 +72,19 @@ function initPlugins(context) {
       catch (err) { log.error(`[Plugins] Init error in ${plugin.id}:`, err.message); }
     }
   }
+
+  // Wire up points bridge — give any plugin with onPointsReady a reference to yt-points
+  const pointsPlugin = _plugins.find(p => p.id === 'yt-points');
+  if (pointsPlugin) {
+    for (const plugin of _plugins) {
+      if (typeof plugin.onPointsReady === 'function') {
+        try { plugin.onPointsReady(pointsPlugin); }
+        catch (err) { log.error(`[Plugins] onPointsReady error in ${plugin.id}:`, err.message); }
+      }
+    }
+  } else {
+    log.warn('[Plugins] yt-points plugin not found — streak points will not be awarded.');
+  }
 }
 
 /**
