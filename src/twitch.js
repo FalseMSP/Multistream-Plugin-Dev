@@ -431,16 +431,18 @@ function handleEventSubNotification(type, event, queue) {
       break;
 
     case 'channel.subscription.gift':
-      queue.pushDonation({
-        platform:  'twitch',
-        type:      'subgift',
-        username:  event.user_name ?? 'anonymous',
-        recipient: null,
-        tier:      event.tier,
-        quantity:  event.total,
-        cumulative: event.cumulative_total ?? null,
-        timestamp: new Date(),
-      });
+      for (let i = 0; i < event.total; i++) {
+        queue.pushDonation({
+          platform:   'twitch',
+          type:       'subgift',
+          username:   event.user_name ?? 'anonymous',
+          recipient:  null,
+          tier:       event.tier,
+          quantity:   1,
+          cumulative: event.cumulative_total ?? null,
+          timestamp:  new Date(),
+        });
+      }
       log.info(`[Twitch] Sub gift: ${event.user_name} gifted ${event.total} subs`);
       break;
 
