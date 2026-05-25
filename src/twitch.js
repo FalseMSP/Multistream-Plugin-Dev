@@ -590,76 +590,10 @@ async function startTwitch(queue) {
     });
   });
 
-  // ── IRC fallback for bits (fires while live even without EventSub) ──────
-  client.on('cheer', (channel, tags, message) => {
-    const username = tags['display-name'] ?? tags.username ?? 'anonymous';
-    const bits     = Number(tags.bits ?? 0);
-    queue.pushDonation({
-      platform:  'twitch',
-      type:      'bits',
-      username,
-      amount:    bits,
-      message:   message || null,
-      timestamp: new Date(),
-    });
-    log.info(`[Twitch] Cheer (IRC): ${username} cheered ${bits} bits`);
-  });
-
-  // ── IRC fallback for subs ─────────────────────────────────────────────
-  client.on('subscription', (channel, username, method, message, tags) => {
-    queue.pushDonation({
-      platform:  'twitch',
-      type:      'sub',
-      username:  tags['display-name'] ?? username,
-      tier:      method?.prime ? 'prime' : (method?.plan ?? '1000'),
-      gifted:    false,
-      message:   message || null,
-      timestamp: new Date(),
-    });
-    log.info(`[Twitch] Sub (IRC): ${username} (${method?.prime ? 'Prime' : method?.plan})`);
-  });
-
-  client.on('resub', (channel, username, months, message, tags, methods) => {
-    queue.pushDonation({
-      platform:  'twitch',
-      type:      'resub',
-      username:  tags['display-name'] ?? username,
-      tier:      methods?.prime ? 'prime' : (methods?.plan ?? '1000'),
-      months,
-      streak:    tags['msg-param-streak-months'] ? Number(tags['msg-param-streak-months']) : null,
-      message:   message || null,
-      timestamp: new Date(),
-    });
-    log.info(`[Twitch] Resub (IRC): ${username} (${months} months)`);
-  });
-
-  client.on('subgift', (channel, gifter, streakMonths, recipient, methods, tags) => {
-    queue.pushDonation({
-      platform:   'twitch',
-      type:       'subgift',
-      username:   tags['display-name'] ?? gifter,
-      recipient,
-      tier:       methods?.plan ?? '1000',
-      quantity:   1,
-      cumulative: tags['msg-param-sender-count'] ? Number(tags['msg-param-sender-count']) : null,
-      timestamp:  new Date(),
-    });
-    log.info(`[Twitch] Sub gift (IRC): ${gifter} → ${recipient}`);
-  });
-
-  client.on('submysterygift', (channel, gifter, numbOfSubs, methods, tags) => {
-    queue.pushDonation({
-      platform:   'twitch',
-      type:       'subgift',
-      username:   tags['display-name'] ?? gifter,
-      recipient:  null,
-      tier:       methods?.plan ?? '1000',
-      quantity:   numbOfSubs,
-      cumulative: tags['msg-param-sender-count'] ? Number(tags['msg-param-sender-count']) : null,
-      timestamp:  new Date(),
-    });
-    log.info(`[Twitch] Mystery gift (IRC): ${gifter} gifted ${numbOfSubs} subs`);
-  });
+  // Bits and sub events are handled exclusively via EventSub webhooks
+  // (channel.cheer, channel.subscribe, channel.subscription.gift,
+  //  channel.subscription.message). IRC fallbacks removed to prevent
+  //  duplicate notifications.
 
   // ── Raids ─────────────────────────────────────────────────────────────
   client.on('raided', (channel, username, viewers) => {
