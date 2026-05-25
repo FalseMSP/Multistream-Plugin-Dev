@@ -246,7 +246,7 @@ function init(context) {
         const pulls = Math.floor(bits / BITS_PER_PULL);
         if (pulls < 1) return;
         log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
-        for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: false });
+        for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
 
       } else if (type === 'sub' || type === 'resub') {
         const user = event.username ?? 'someone';
