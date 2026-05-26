@@ -254,6 +254,19 @@ function _parseFormBody(raw) {
   );
 }
 
+// Normalise a Discord reply payload to a plain string for dashboard display.
+// Plugins pass either a plain string or a { content, embeds, … } object.
+function _resolveContent(payload) {
+  if (!payload) return '';
+  if (typeof payload === 'string') return payload;
+  if (typeof payload.content === 'string') return payload.content;
+  if (Array.isArray(payload.embeds) && payload.embeds.length) {
+    const e = payload.embeds[0];
+    return [e.title, e.description].filter(Boolean).join(' — ');
+  }
+  return JSON.stringify(payload);
+}
+
 // ── HTML builders ──────────────────────────────────────────────────────────
 
 function _buildLoginPage(errorMsg = '') {
@@ -1923,7 +1936,59 @@ async function handleRequest(req, res) {
     } else {
       try {
         const discord = require('./discord');
-        results = await discord.dispatchCommand(name, { _raw: optionValues });
+
+        // ── Build a fully-faked Discord interaction ──────────────────────────
+        const replies = [];
+        const interaction = {
+          // Identity — plugins log interaction.user.tag
+          user: {
+            tag:      'dashboard#0000',
+            id:       '0',
+            username: 'dashboard',
+            bot:      false,
+          },
+          member: null,
+          guild:  null,
+
+          // Options — covers getString / getInteger / getBoolean / getUser /
+          //           getRole / getChannel / getNumber / getMentionable
+          options: {
+            _values: optionValues,
+            getString(name, _required)      { return optionValues[name] ?? null; },
+            getInteger(name, _required)     { const v = optionValues[name]; return v != null ? parseInt(v, 10)   : null; },
+            getNumber(name, _required)      { const v = optionValues[name]; return v != null ? parseFloat(v)     : null; },
+            getBoolean(name, _required)     { const v = optionValues[name]; return v != null ? v === true || v === 'true' : null; },
+            getUser(name, _required)        { return optionValues[name] ?? null; },
+            getRole(name, _required)        { return optionValues[name] ?? null; },
+            getChannel(name, _required)     { return optionValues[name] ?? null; },
+            getMentionable(name, _required) { return optionValues[name] ?? null; },
+            get(name, _required)            { return optionValues[name] ?? null; },
+            // Subcommand support
+            getSubcommand(_required)        { return optionValues._subcommand ?? null; },
+            getSubcommandGroup(_required)   { return optionValues._subcommandGroup ?? null; },
+          },
+
+          // Reply lifecycle — collect everything into `replies`
+          deferred: false,
+          replied:  false,
+          async deferReply(_opts)    { this.deferred = true; },
+          async deferUpdate(_opts)   { this.deferred = true; },
+          async reply(payload)       { this.replied = true; replies.push(_resolveContent(payload)); },
+          async editReply(payload)   { replies.push(_resolveContent(payload)); },
+          async followUp(payload)    { replies.push(_resolveContent(payload)); },
+          async deleteReply()        { /* no-op */ },
+
+          // Misc surface that plugins sometimes touch
+          channelId:   null,
+          guildId:     null,
+          commandName: name,
+          isCommand()    { return true; },
+          isRepliable()  { return true; },
+          inGuild()      { return false; },
+        };
+
+        await discord.dispatchCommand(name, interaction);
+        results = replies.length ? replies : ['✅ Command completed (no reply)'];
         log.info(`[dashboard] /command /${name}: ${results.join(' | ')}`);
       } catch (err) {
         results = ['❌ Command dispatch error: ' + err.message];
