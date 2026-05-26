@@ -47,8 +47,8 @@ async function main() {
   startOverlayServer(2999);
 
   // 2. Wire queue → Discord embeds.
-  //    Use late-binding lambdas so any plugin wrappers applied during
-  //    initPlugins() are always called — not the original bare functions.
+  //    By the time onMessage fires, queue.pushMessage has already run the plugin
+  //    pipeline — msg is the filtered finalMsg, suppressed messages never arrive.
   queue.onMessage(async (msg) => {
     // Subscribe/membership events have no chat text — build a simple announcement.
     if (msg.type === 'subscribe') {
@@ -67,17 +67,9 @@ async function main() {
       return;
     }
 
-    const { finalMsg, sideEffects } = await plugins.runPipeline(msg);
-    for (const fn of sideEffects) {
-      fn().catch(err => log.error('[main] sideEffect error:', err.message));
-    }
-    if (finalMsg) {
-      discord.sendChat(finalMsg);
-      dashboard.pushChatMessage(finalMsg);
-    } else {
-      // Suppressed by pipeline — still push to dashboard so nothing is invisible
-      dashboard.pushChatMessage({ ...msg, dashboardSuppress: true });
-    }
+    // Pipeline has already run in queue.pushMessage — msg is the filtered finalMsg.
+    discord.sendChat(msg);
+    dashboard.pushChatMessage(msg);
   });
   queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
   queue.onDonation((donation)  => discord.sendDonation(donation));
