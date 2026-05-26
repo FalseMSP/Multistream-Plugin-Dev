@@ -36,6 +36,7 @@ const SFX_MAP = {
   'Chicken Scream':   '/sfx/chicken-scream.mp3',
   'Fah':              '/sfx/fah.mp3',
   'Quack':           '/sfx/quack.mp3',
+  'Alex':             '/sfx/alex.mp3',
 };
 
 const MASTER_VOLUME  = parseFloat(process.env.SFX_VOLUME       ?? '1.0');
