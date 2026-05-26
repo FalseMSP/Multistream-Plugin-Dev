@@ -23,6 +23,13 @@
  */
 
 const log = require('./logger');
+// Lazy-required to avoid circular dependency (plugins → queue → plugins).
+// Safe because pushMessage is only called after all modules have loaded.
+let _runPipeline = null;
+function _getPipeline() {
+  if (!_runPipeline) _runPipeline = require('./plugins').runPipeline;
+  return _runPipeline;
+}
 
 // ── Internal handler registries ───────────────────────────────────────────
 
@@ -87,11 +94,26 @@ function _dispatch(handlers, payload, label) {
 
 /**
  * Push a chat message from a platform into the queue.
+ * Runs the message through the plugin pipeline first — suppressed messages
+ * are dropped here and never reach any consumer (Discord, overlay, etc.).
  * @param {{ platform: 'twitch'|'youtube', username: string, message: string }} msg
  */
-function pushMessage(msg) {
+async function pushMessage(msg) {
   log.debug(`[queue] message | ${msg.platform} | ${msg.username}: ${msg.message}`);
-  _dispatch(_messageHandlers, msg, 'message');
+
+  const { finalMsg, sideEffects } = await _getPipeline()(msg);
+
+  for (const fn of sideEffects) {
+    try { await fn(); }
+    catch (err) { log.error('[queue] sideEffect error:', err?.message ?? err); }
+  }
+
+  if (finalMsg === null) {
+    log.debug(`[queue] message suppressed | ${msg.platform} | ${msg.username}`);
+    return;
+  }
+
+  _dispatch(_messageHandlers, finalMsg, 'message');
 }
 
 /**
