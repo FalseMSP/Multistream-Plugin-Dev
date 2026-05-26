@@ -324,36 +324,40 @@ async function startDiscordBot() {
 
 /**
  * Dispatch a slash command by name from a non-Discord caller (e.g. the dashboard).
- * Returns an array of result strings, one per platform action taken.
+ * Accepts a fully-faked interaction object built by dashboard.js.
  *
- * @param {string} name     Command name: 'ban' | 'vip' | 'unvip'
- * @param {{ user: string, platform?: string, reason?: string }} options
+ * @param {string} name        Command name: 'ban' | 'vip' | 'unvip' | <plugin>
+ * @param {object} interaction Fake interaction object with .options, .user, .deferReply, etc.
  * @returns {Promise<string[]>}
  */
-async function dispatchCommand(name, options = {}) {
-  const raw      = options._raw ?? options;
-  const user     = raw.user     ?? '';
-  const platform = options.platform ?? raw.platform ?? 'both';
-  const reason   = raw.reason   ?? 'No reason provided';
-
-  const results = [];
-
-  // Plugin commands don't use user/platform/reason — dispatch immediately
+async function dispatchCommand(name, interaction) {
+  // ── Plugin commands — pass the full interaction straight through ──────────
   if (name !== 'ban' && name !== 'vip' && name !== 'unvip') {
-    const { dispatchPluginCommand } = require('./plugins/index');
-    return await dispatchPluginCommand(name, raw);
+    const { handlePluginInteraction } = require('./plugins/index');
+    await handlePluginInteraction(interaction);
+    return; // replies collected by interaction.editReply inside the plugin
   }
 
-  if (!user) return ['⚠️ No username provided'];
+  // ── Core mod commands ─────────────────────────────────────────────────────
+  const user     = interaction.options.getString('user')     ?? '';
+  const platform = interaction.options.getString('platform') ?? 'both';
+  const reason   = interaction.options.getString('reason')   ?? 'No reason provided';
+
+  if (!user) {
+    await interaction.editReply('⚠️ No username provided');
+    return;
+  }
+
+  await interaction.deferReply({ ephemeral: true });
 
   async function run(platformKey, action) {
     const handler = _modHandlers[action];
-    if (!handler) { results.push(`⚠️ No ${platformKey} handler for /${action}`); return; }
+    if (!handler) { await interaction.followUp(`⚠️ No ${platformKey} handler for /${action}`); return; }
     try {
       await handler(platformKey, user, reason);
-      results.push(`✅ /${action} applied to **${user}** on ${platformKey}`);
+      await interaction.followUp(`✅ /${action} applied to **${user}** on ${platformKey}`);
     } catch (err) {
-      results.push(`❌ ${platformKey} error: ${err.message}`);
+      await interaction.followUp(`❌ ${platformKey} error: ${err.message}`);
       log.error(`/dashboard command /${action} ${platformKey} error:`, err);
     }
   }
@@ -363,8 +367,6 @@ async function dispatchCommand(name, options = {}) {
   if      (name === 'ban')   for (const p of platforms) await run(p, 'ban');
   else if (name === 'vip')   for (const p of platforms) await run(p, 'vip');
   else if (name === 'unvip') for (const p of platforms) await run(p, 'unvip');
-
-  return results;
 }
 
 
