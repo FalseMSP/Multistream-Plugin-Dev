@@ -807,3 +807,11 @@ module.exports = {
     unvip:   twitchUnvip,
   },
 };
+
+// Register mod action handlers with the dashboard so that timeout/ban buttons
+// dispatched from the UI are forwarded to the Twitch platform functions.
+const dashboard = require('./dashboard');
+dashboard.onModerate({
+  ban:     twitchBan,
+  timeout: twitchTimeout,
+});

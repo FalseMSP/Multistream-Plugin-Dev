@@ -112,7 +112,15 @@ async function processMessage(msg) {
     ? 'Commands: ' + cmds.map(c => `!${c.trigger}`).join(' | ')
     : 'No commands registered yet.';
 
-  const send = _chatReply[msg.platform];
+  let send;
+  if (msg.platform === 'youtube' && msg.videoId && _chatReply._youtubeSession) {
+    // Reply only to the stream this command came from
+    const videoId = msg.videoId;
+    send = (text) => _chatReply._youtubeSession(videoId, text);
+  } else {
+    send = _chatReply[msg.platform];
+  }
+
   if (send) {
     send(reply).catch(e => log.error('[commands-list] chat reply error:', e.message));
   }
@@ -148,6 +156,17 @@ async function handleInteraction(interaction) {
 }
 
 // ── Export ────────────────────────────────────────────────────────────────────
+
+/**
+ * When wiring up chat replies, pass `_youtubeSession: youtube.sayTo` so that
+ * YouTube commands reply only to the stream they came from:
+ *
+ *   plugin.onChatReady({
+ *     twitch:          (text) => twitch.say(text),
+ *     youtube:         (text) => youtube.say(text),   // broadcast fallback (unused by this plugin)
+ *     _youtubeSession: (videoId, text) => youtube.sayTo(videoId, text),
+ *   });
+ */
 
 module.exports = {
   id: 'commands-list',

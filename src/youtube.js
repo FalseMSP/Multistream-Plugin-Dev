@@ -274,7 +274,7 @@ async function _runFetchLane(laneId, session, queue, isFirstLane) {
 
         if (!id || _isDuplicate(session, id) || !message) continue;
         const ytEmotes = _extractYtEmotes(action.message);
-        queue.pushMessage({ platform: 'youtube', username: displayName, message, ytEmotes: ytEmotes.length ? ytEmotes : undefined });
+        queue.pushMessage({ platform: 'youtube', videoId, username: displayName, message, ytEmotes: ytEmotes.length ? ytEmotes : undefined });
       }
     } else {
       for (const action of result?.actions ?? []) {
@@ -676,6 +676,52 @@ async function say(text) {
   }
 }
 
+/**
+ * Send a message to one specific YouTube live chat by videoId.
+ * Used by plugins that want to reply only to the stream the command came from.
+ *
+ * @param {string} videoId  The video / session to target
+ * @param {string} text     Text to send (auto-chunked to 200 chars)
+ */
+async function sayTo(videoId, text) {
+  let youtube;
+  try {
+    youtube = _getYoutubeClient();
+  } catch (err) {
+    log.warn('[YouTube] sayTo() — OAuth not configured:', err.message);
+    return;
+  }
+
+  const session = _activeSessions.get(videoId);
+  if (!session) {
+    log.warn(`[YouTube] sayTo() — no active session for videoId=${videoId}`);
+    return;
+  }
+  if (!session.liveChatId) {
+    log.warn(`[YouTube] sayTo() — session has no liveChatId (videoId=${videoId})`);
+    return;
+  }
+
+  const chunks = _chunkText(text, SAY_CHUNK_SIZE);
+  for (const chunk of chunks) {
+    try {
+      await youtube.liveChatMessages.insert({
+        part: ['snippet'],
+        requestBody: {
+          snippet: {
+            liveChatId: session.liveChatId,
+            type: 'textMessageEvent',
+            textMessageDetails: { messageText: chunk },
+          },
+        },
+      });
+      log.debug(`[YouTube] sayTo(${videoId}) in ${session.liveChatId}:`, chunk);
+    } catch (err) {
+      log.error(`[YouTube] sayTo() error for chat ${session.liveChatId}:`, err.message);
+    }
+  }
+}
+
 // ── Subscriber count poller ───────────────────────────────────────────────
 
 let _lastKnownSubCount = null;
@@ -899,6 +945,7 @@ async function updateVideoInfo({ title, tags, categoryId } = {}) {
 
 module.exports = {
   say,
+  sayTo,
   startYouTube,
   triggerVideo,
   updateVideoInfo,
@@ -916,6 +963,14 @@ module.exports = {
       session.lastKnownLikeCount = null;
     }
   },
+  stopSession(videoId) {
+    const session = _activeSessions.get(videoId);
+    if (!session) return false;
+    session.stopSignal.stopped = true;
+    if (session.likePollerTimer) clearInterval(session.likePollerTimer);
+    _activeSessions.delete(videoId);
+    return true;
+  },
   modHandlers: {
     ban:     ytBan,
     timeout: ytTimeout,
@@ -923,3 +978,11 @@ module.exports = {
     unvip:   ytUnvip,
   },
 };
+
+// Register mod action handlers with the dashboard so that timeout/ban buttons
+// dispatched from the UI are forwarded to the YouTube platform functions.
+const dashboard = require('./dashboard');
+dashboard.onModerate({
+  ban:     ytBan,
+  timeout: ytTimeout,
+});

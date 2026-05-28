@@ -115,6 +115,7 @@ async function main() {
   plugins.setChatReply({
     twitch:  (text) => twitchModule.say(text),
     youtube: (text) => ytModule.say(text),
+    _youtubeSession: (videoId, text) => youtube.sayTo(videoId, text),
   });
 
   // 9. Register Discord slash commands (idempotent guild deploy)
