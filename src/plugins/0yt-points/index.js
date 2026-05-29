@@ -73,9 +73,9 @@ const commandsList = require('../commands-list');
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const PASSIVE_COOLDOWN_MS  = 30  * 1000;      // 30 s between passive +1 awards
-const CHECKIN_WINDOW_MS    = 5   * 60 * 1000; // each 5-min block since last msg = +10 pts
-const CHECKIN_PTS_PER_TICK = 10;              // points per completed 5-min window
-const CHECKIN_MAX_PTS      = 60;              // cap: max bonus per message
+const CHECKIN_WINDOW_MS    = 5   * 60 * 1000; // each 5-min block since last msg = +20 pts
+const CHECKIN_PTS_PER_TICK = 20;              // points per completed 5-min window
+const CHECKIN_MAX_PTS      = 120;              // cap: max bonus per message
 
 const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
 const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
