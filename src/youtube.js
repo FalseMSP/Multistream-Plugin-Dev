@@ -57,11 +57,40 @@ const QUOTA_PER_SCAN_CALL = 5;
 const QUOTA_DAILY_LIMIT   = parseInt(process.env.YT_QUOTA_LIMIT ?? '100000', 10);
 
 function _nextMidnightPacific() {
-  const offsetMs = 8 * 60 * 60 * 1000;
-  const ptNow    = new Date(Date.now() - offsetMs);
-  const midnight = new Date(ptNow);
-  midnight.setUTCHours(24, 0, 0, 0);
-  return midnight.getTime() + offsetMs;
+  // Use Intl to get the current wall-clock time in America/Los_Angeles so that
+  // DST is handled correctly (UTC-8 in PST, UTC-7 in PDT).
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(now);
+  const y = parseInt(parts.find(p => p.type === 'year').value, 10);
+  const m = parseInt(parts.find(p => p.type === 'month').value, 10) - 1;
+  const d = parseInt(parts.find(p => p.type === 'day').value, 10);
+  // Midnight of the *next* day in Pacific time, expressed as a UTC timestamp
+  const nextMidnightPT = new Date(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/Los_Angeles',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).format(new Date(Date.UTC(y, m, d + 1, 8, 0, 0))) // noon UTC as a safe seed
+  );
+  // Build midnight Pacific as a real UTC ms value via a known offset-aware string
+  const seed = new Date(Date.UTC(y, m, d + 1, 12, 0, 0)); // noon UTC next day (always unambiguous)
+  const ptString = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(seed); // "YYYY-MM-DD HH:MM:SS" in Pacific
+  const ptMidnight = ptString.slice(0, 10) + ' 00:00:00';
+  // Convert that Pacific midnight string back to UTC by finding the offset
+  const utcGuess = new Date(ptMidnight + 'Z'); // wrong — treats as UTC, gives us the number to correct
+  const actualPtOffset = (seed.getTime() - new Date(
+    new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Los_Angeles',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(seed) + 'Z'
+  ).getTime());
+  return utcGuess.getTime() + actualPtOffset;
 }
 
 let _quotaUsed    = 0;
@@ -191,7 +220,7 @@ const MIN_FETCH_MS     = 500;
 const MAX_FETCH_MS     = 4_000;
 const PHASE_OFFSET_MS  = 2_000;
 
-async function _runFetchLane(laneId, session, queue, isFirstLane) {
+async function _runFetchLane(laneId, videoId, session, queue, isFirstLane) {
   let continuation = undefined;
   if (!isFirstLane) await new Promise(r => setTimeout(r, PHASE_OFFSET_MS));
 
@@ -367,8 +396,8 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
   log.info(`[YouTube] Starting dual-lane pipelined chat reader`);
   _startLikePoller(videoId, session, queue);
 
-  const laneA = _runFetchLane('A', session, queue, true);
-  const laneB = _runFetchLane('B', session, queue, false);
+  const laneA = _runFetchLane('A', videoId, session, queue, true);
+  const laneB = _runFetchLane('B', videoId, session, queue, false);
 
   mc.on('end', () => {
     log.info(`[YouTube] Stream ended for ${videoId}`);
@@ -396,7 +425,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
 
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
-    setTimeout(() => _startMasterchatSession(videoId, queue, nextDelay), nextDelay);
+    setTimeout(() => _startMasterchat(videoId, queue, nextDelay), nextDelay);
   });
 
   Promise.all([laneA, laneB]).catch((err) => {
@@ -820,7 +849,7 @@ async function _pollLikeCount(videoId, session, queue) {
 
   log.info(`[YouTube] Like delta +${delta} for ${videoId} — total: ${count.toLocaleString()}`);
   for (let i = 0; i < delta; i++) {
-    queue.pushMessage({ platform: 'youtube', type: 'like' });
+    queue.pushMessage({ platform: 'youtube', type: 'like', username: null, message: null });
   }
 
   session.lastKnownLikeCount = count;
