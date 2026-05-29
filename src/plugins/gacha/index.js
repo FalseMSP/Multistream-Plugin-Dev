@@ -23,7 +23,7 @@ const LOOT_TABLE = [
   { id: 'metal-pipe',       label: 'Metal Pipe',                    rarity: 'common',    icon: 'metal-pipe',       odds: 10.00, premiumOdds: 4.00, redeem: 'Metal Pipe'            },
   // Uncommon
   { id: 'fah',              label: 'Fahhhhh',                       rarity: 'uncommon',  icon: 'fah',              odds:  5.00, premiumOdds: 5.00, redeem: 'Fah'                   },
-  { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'uncommon',  icon: 'screaming-chicken',odds:  5.00, premiumOdds: 5.00, redeem: 'Screaming Chicken'     },
+  { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'uncommon',  icon: 'screaming-chicken',odds:  5.00, premiumOdds: 5.00, redeem: 'Chicken Scream'        },
   { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  5.00, premiumOdds: 9.00, redeem: 'Vip'                   },
   { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  5.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
   { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  5.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
