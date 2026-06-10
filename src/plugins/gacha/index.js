@@ -283,7 +283,7 @@ function init(context) {
 
 async function processMessage(msg) {
   // Manual mod trigger: !gacha @user [premium]
-  const manualMatch = msg.message.trim().match(/^!gacha(?:\s+@?(\S+))?(\s+premium)?$/i);
+  const manualMatch = false; // msg.text.match(/^!gacha\s+@?(\w+)?\s*(premium)?/i);
   if (manualMatch) {
     const user = manualMatch[1] || msg.username;
     const isPremium = !!manualMatch[2];
