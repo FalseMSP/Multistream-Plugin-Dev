@@ -100,11 +100,11 @@ function _dispatch(handlers, payload, label) {
  */
 async function pushMessage(msg) {
   log.debug(`[queue] message | ${msg.platform} | ${msg.username}: ${msg.message}`);
-  log.debug(`[queue] pre-pipeline videoId=${msg.videoId}`);
+  if (msg.platform === 'youtube') {
+    log.info(`[queue] DEBUG youtube msg = ${JSON.stringify(msg)}`);
+  }
 
   const { finalMsg, sideEffects } = await _getPipeline()(msg);
-
-  log.debug(`[queue] post-pipeline videoId=${finalMsg && finalMsg.videoId}`);
 
   for (const fn of sideEffects) {
     try { await fn(); }
