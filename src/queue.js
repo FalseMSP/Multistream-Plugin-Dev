@@ -100,9 +100,6 @@ function _dispatch(handlers, payload, label) {
  */
 async function pushMessage(msg) {
   log.debug(`[queue] message | ${msg.platform} | ${msg.username}: ${msg.message}`);
-  if (msg.platform === 'youtube') {
-    log.info(`[queue] DEBUG youtube msg = ${JSON.stringify(msg)}`);
-  }
 
   const { finalMsg, sideEffects } = await _getPipeline()(msg);
 

@@ -70,7 +70,13 @@ const path = require('path');
 const log  = require('../../logger');
 const commandsList = require('../commands-list');
 let _youtube = null;
-try { _youtube = require('../youtube'); } catch { log.warn('[yt-points] Could not require youtube module — sayTo unavailable.'); }
+function _getYoutube() {
+  if (!_youtube) {
+    try { _youtube = require('../youtube'); }
+    catch (err) { log.warn('[yt-points] Could not require youtube module:', err.message); }
+  }
+  return _youtube;
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -528,8 +534,9 @@ async function processMessage(msg) {
   const username = (msg.username ?? msg.author ?? 'unknown').toLowerCase();
   const text     = (msg.message ?? '').trim();
   const videoId  = msg.videoId;
-  const send     = (videoId && _youtube?.sayTo)
-    ? (replyText) => _youtube.sayTo(videoId, replyText)
+  const yt       = _getYoutube();
+  const send     = (videoId && yt?.sayTo)
+    ? (replyText) => yt.sayTo(videoId, replyText)
     : (() => {
         log.warn(`[yt-points] No videoId on message — skipping reply to avoid broadcasting to all chats. username=${username}`);
         return Promise.resolve();
