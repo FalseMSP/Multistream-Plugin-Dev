@@ -528,9 +528,12 @@ async function processMessage(msg) {
   const username = (msg.username ?? msg.author ?? 'unknown').toLowerCase();
   const text     = (msg.message ?? '').trim();
   const videoId  = msg.videoId;
-  const send     = _youtube?.sayTo && videoId
+  const send     = (videoId && _youtube?.sayTo)
     ? (replyText) => _youtube.sayTo(videoId, replyText)
-    : _chatReply.youtube;
+    : (() => {
+        log.warn(`[yt-points] No videoId on message — skipping reply to avoid broadcasting to all chats. username=${username}`);
+        return Promise.resolve();
+      });
   const now      = Date.now();
 
   // ── Passive earn (1 pt per message, cooldown-gated) ──────────────────────
