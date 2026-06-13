@@ -243,6 +243,8 @@ async function _runFetchLane(laneId, videoId, session, queue, isFirstLane) {
       ) {
         log.info(`[YouTube] Lane ${laneId}: stream ended (${err.message}) — stopping lane`);
         session.stopSignal.stopped = true;
+        if (session.likePollerTimer) clearInterval(session.likePollerTimer);
+        if (_activeSessions.get(videoId) === session) _activeSessions.delete(videoId);
         return;
       }
 
@@ -303,7 +305,7 @@ async function _runFetchLane(laneId, videoId, session, queue, isFirstLane) {
 
         if (!id || _isDuplicate(session, id) || !message) continue;
         const ytEmotes = _extractYtEmotes(action.message);
-        queue.pushMessage({ platform: 'youtube', videoId, username: displayName, message, ytEmotes: ytEmotes.length ? ytEmotes : undefined });
+        queue.pushMessage({ platform: 'youtube', videoId, username: displayName, channelId, message, ytEmotes: ytEmotes.length ? ytEmotes : undefined });
       }
     } else {
       for (const action of result?.actions ?? []) {

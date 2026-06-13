@@ -69,6 +69,8 @@ const fs   = require('fs');
 const path = require('path');
 const log  = require('../../logger');
 const commandsList = require('../commands-list');
+let _youtube = null;
+try { _youtube = require('../youtube'); } catch { log.warn('[yt-points] Could not require youtube module — sayTo unavailable.'); }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -525,7 +527,10 @@ async function processMessage(msg) {
 
   const username = (msg.username ?? msg.author ?? 'unknown').toLowerCase();
   const text     = (msg.message ?? '').trim();
-  const send     = _chatReply.youtube;
+  const videoId  = msg.videoId;
+  const send     = _youtube?.sayTo && videoId
+    ? (replyText) => _youtube.sayTo(videoId, replyText)
+    : _chatReply.youtube;
   const now      = Date.now();
 
   // ── Passive earn (1 pt per message, cooldown-gated) ──────────────────────
