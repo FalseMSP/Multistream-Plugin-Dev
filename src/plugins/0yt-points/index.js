@@ -72,7 +72,7 @@ const commandsList = require('../commands-list');
 let _youtube = null;
 function _getYoutube() {
   if (!_youtube) {
-    try { _youtube = require('../youtube'); }
+    try { _youtube = require('../../youtube'); }
     catch (err) { log.warn('[yt-points] Could not require youtube module:', err.message); }
   }
   return _youtube;
