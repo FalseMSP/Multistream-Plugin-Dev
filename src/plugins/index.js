@@ -178,7 +178,7 @@ async function runPipeline(msg) {
     }
 
     if (result.message) {
-      current = result.message;
+      current = { ...current, ...result.message };
     }
   }
 
