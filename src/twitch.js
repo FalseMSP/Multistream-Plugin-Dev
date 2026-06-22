@@ -461,6 +461,12 @@ function handleEventSubNotification(type, event, queue) {
       break;
 
     case 'channel.follow':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'follow',
+        username:  event.user_name,
+        timestamp: new Date(event.followed_at ?? Date.now()),
+      });
       log.info(`[Twitch] Follow: ${event.user_name}`);
       break;
 
