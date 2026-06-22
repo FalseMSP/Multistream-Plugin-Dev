@@ -3,9 +3,8 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Gacha Overlay</title>
+<title>Budget Gacha Overlay</title>
 <style>
-  /* ── Reset & base ─────────────────────────────────────── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
   html, body {
@@ -15,7 +14,6 @@
     font-family: 'Segoe UI', sans-serif;
   }
 
-  /* ── Root container ───────────────────────────────────── */
   #gacha-root {
     position: relative;
     width: 100%; height: 100%;
@@ -25,7 +23,6 @@
     pointer-events: none;
   }
 
-  /* ── Backdrop (dark vignette that fades in) ───────────── */
   #backdrop {
     position: absolute;
     inset: 0;
@@ -36,7 +33,6 @@
   }
   #backdrop.visible { opacity: 1; }
 
-  /* ── Video player ─────────────────────────────────────── */
   #gacha-video {
     position: absolute;
     inset: 0;
@@ -48,7 +44,6 @@
   }
   #gacha-video.visible { opacity: 1; }
 
-  /* ── Icon reveal ──────────────────────────────────────── */
   #icon-wrap {
     position: absolute;
     display: flex;
@@ -72,10 +67,9 @@
     height: 260px;
     object-fit: contain;
     filter: drop-shadow(0 0 40px var(--rarity-glow, rgba(255,255,255,0.6)));
-    image-rendering: pixelated; /* good for pixel art icons */
+    image-rendering: pixelated;
   }
 
-  /* ── Rarity label ─────────────────────────────────────── */
   #rarity-badge {
     font-size: 22px;
     font-weight: 900;
@@ -107,7 +101,6 @@
     text-shadow: 0 1px 4px rgba(0,0,0,0.8);
   }
 
-  /* ── Rarity colour themes ─────────────────────────────── */
   .rarity-common    { --rarity-color: #aaaaaa; --rarity-glow: rgba(170,170,170,0.7); }
   .rarity-uncommon  { --rarity-color: #4cff82; --rarity-glow: rgba(76,255,130,0.7); }
   .rarity-rare      { --rarity-color: #4ab4ff; --rarity-glow: rgba(74,180,255,0.8); }
@@ -117,7 +110,6 @@
   .rarity-oneofone  { --rarity-color: #ff4ef7; --rarity-glow: rgba(255,78,247,1.0); }
   .rarity-dud       { --rarity-color: #888888; --rarity-glow: rgba(136,136,136,0.5); }
 
-  /* ── Legendary+ shimmer effect ────────────────────────── */
   @keyframes shimmer {
     0%   { filter: drop-shadow(0 0 40px var(--rarity-glow)) brightness(1); }
     50%  { filter: drop-shadow(0 0 80px var(--rarity-glow)) brightness(1.3); }
@@ -125,7 +117,6 @@
   }
   .shimmer #item-icon { animation: shimmer 1.4s ease-in-out infinite; }
 
-  /* ── Mythic particle burst (CSS-only rings) ───────────── */
   @keyframes ring-expand {
     0%   { transform: scale(0.2); opacity: 0.9; }
     100% { transform: scale(3.5); opacity: 0; }
@@ -148,7 +139,6 @@
   <video id="gacha-video" autoplay playsinline></video>
 
   <div id="icon-wrap">
-    <!-- Particle rings (shown for mythic/oneofone) -->
     <div id="rings" style="position:absolute; display:none;">
       <div class="ring"></div>
       <div class="ring"></div>
@@ -163,26 +153,25 @@
 </div>
 
 <script>
-// ── Frame counter for the 150-frame icon reveal ───────────────────────────────
 const ICON_REVEAL_FRAMES = 150;
-const FPS = 24; // assumed video FPS
-const ICON_REVEAL_MS = (ICON_REVEAL_FRAMES / FPS) * 1000; // ≈ 6250 ms
+const FPS = 24;
+const ICON_REVEAL_MS = (ICON_REVEAL_FRAMES / FPS) * 1000;
 
-const backdrop   = document.getElementById('backdrop');
-const video      = document.getElementById('gacha-video');
-const iconWrap   = document.getElementById('icon-wrap');
-const itemIcon   = document.getElementById('item-icon');
-const rarityBadge= document.getElementById('rarity-badge');
-const itemLabel  = document.getElementById('item-label');
-const pullUser   = document.getElementById('pull-user');
-const rings      = document.getElementById('rings');
-const root       = document.getElementById('gacha-root');
+const backdrop    = document.getElementById('backdrop');
+const video       = document.getElementById('gacha-video');
+const iconWrap    = document.getElementById('icon-wrap');
+const itemIcon    = document.getElementById('item-icon');
+const rarityBadge = document.getElementById('rarity-badge');
+const itemLabel   = document.getElementById('item-label');
+const pullUser    = document.getElementById('pull-user');
+const rings       = document.getElementById('rings');
+const root        = document.getElementById('gacha-root');
 
 let iconTimer = null;
 let hideTimer = null;
 
-const SHIMMER_RARITIES  = new Set(['legendary', 'mythic', 'oneofone']);
-const RINGS_RARITIES    = new Set(['mythic', 'oneofone']);
+const SHIMMER_RARITIES = new Set(['legendary', 'mythic', 'oneofone']);
+const RINGS_RARITIES   = new Set(['mythic', 'oneofone']);
 
 function resetTimers() {
   clearTimeout(iconTimer);
@@ -204,28 +193,23 @@ function hideAll() {
 function handlePull(data) {
   resetTimers();
 
-  // Set rarity theme
   const rarityClass = 'rarity-' + data.rarity;
   root.className = rarityClass;
   iconWrap.className = rarityClass;
   if (SHIMMER_RARITIES.has(data.rarity)) iconWrap.classList.add('shimmer');
-  if (RINGS_RARITIES.has(data.rarity))   rings.style.display = 'block';
-  else                                    rings.style.display = 'none';
+  rings.style.display = RINGS_RARITIES.has(data.rarity) ? 'block' : 'none';
 
-  // Set text
   rarityBadge.textContent = data.rarity === 'oneofone' ? 'One of One' :
     data.rarity.charAt(0).toUpperCase() + data.rarity.slice(1);
-  itemLabel.textContent  = data.label  || '';
-  pullUser.textContent   = 'for ' + (data.user || 'someone');
+  itemLabel.textContent = data.label  || '';
+  pullUser.textContent  = 'for ' + (data.user || 'someone');
 
-  // Show backdrop + video
   backdrop.classList.add('visible');
   video.src = data.videoFile;
   video.load();
   video.play().catch(() => {});
   video.classList.add('visible');
 
-  // Schedule icon reveal
   if (!data.isDud && data.iconPath) {
     itemIcon.src = data.iconPath;
     iconTimer = setTimeout(() => {
@@ -233,20 +217,16 @@ function handlePull(data) {
     }, ICON_REVEAL_MS);
   }
 
-  // Hide everything after 13.5 s (plugin resets at 14 s)
   hideTimer = setTimeout(hideAll, 13500);
 }
 
-// ── SSE connection to overlay-server ─────────────────────────────────────────
-// The overlay-server broadcasts: { type: 'section', id: 'gacha', data: { state, ... } }
-// via the standard /sse endpoint — no named events, just onmessage.
 function connect() {
   const es = new EventSource('/sse');
 
   es.onmessage = function(e) {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type !== 'section' || msg.id !== 'gacha') return;
+      if (msg.type !== 'section' || msg.id !== 'budgetgacha') return;
       const data = msg.data;
       if (!data) return;
       if (data.state === 'pulling') {
@@ -255,13 +235,13 @@ function connect() {
         hideAll();
       }
     } catch(err) {
-      console.error('[gacha overlay] parse error', err);
+      console.error('[budgetgacha overlay] parse error', err);
     }
   };
 
   es.onerror = function() {
     es.close();
-    setTimeout(connect, 3000); // reconnect
+    setTimeout(connect, 3000);
   };
 }
 

@@ -17,16 +17,16 @@ const LOOT_TABLE = [
   // Common
   // redeem: exact Twitch reward title to fire when this item is revealed.
   // null = no automatic redeem (handled manually, or not applicable).
-  { id: 'play-gd-level',    label: 'Play your GD Level',            rarity: 'common',    icon: 'play-gd-level',    odds: 10.00, premiumOdds: 2.00, redeem: 'Play your GD Level'    },
+  { id: 'play-gd-level',    label: 'Play your GD Level',            rarity: 'common',    icon: 'play-gd-level',    odds: 0.00, premiumOdds: 0.00, redeem: 'Play your GD Level'    },
   { id: 'read-your-name',   label: 'Read your name',                rarity: 'common',    icon: 'read-your-name',   odds: 10.00, premiumOdds: 0.00, redeem: 'Read your name'        },
-  { id: 'vine-boom',        label: 'Vine Boom',                     rarity: 'common',    icon: 'vine-boom',        odds: 10.00, premiumOdds: 4.00, redeem: 'Vine Boom'             },
-  { id: 'metal-pipe',       label: 'Metal Pipe',                    rarity: 'common',    icon: 'metal-pipe',       odds: 10.00, premiumOdds: 4.00, redeem: 'Metal Pipe'            },
+  { id: 'vine-boom',        label: 'Vine Boom',                     rarity: 'common',    icon: 'vine-boom',        odds: 5.00, premiumOdds: 4.00, redeem: 'Vine Boom'             },
+  { id: 'metal-pipe',       label: 'Metal Pipe',                    rarity: 'common',    icon: 'metal-pipe',       odds: 5.00, premiumOdds: 4.00, redeem: 'Metal Pipe'            },
   // Uncommon
-  { id: 'fah',              label: 'Fahhhhh',                       rarity: 'uncommon',  icon: 'fah',              odds:  5.00, premiumOdds: 5.00, redeem: 'Fah'                   },
-  { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'uncommon',  icon: 'screaming-chicken',odds:  5.00, premiumOdds: 5.00, redeem: 'Chicken Scream'        },
-  { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  5.00, premiumOdds: 9.00, redeem: 'Vip'                   },
-  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  5.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
-  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  5.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
+  { id: 'fah',              label: 'Fahhhhh',                       rarity: 'epic',  icon: 'fah',              odds:  1.00, premiumOdds: 5.00, redeem: 'Fah'                   },
+  { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'epic',  icon: 'screaming-chicken',odds:  1.00, premiumOdds: 5.00, redeem: 'Chicken Scream'        },
+  { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  0.00, premiumOdds: 0.00, redeem: 'Vip'                   },
+  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  1.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
+  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  0.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
   // Rare (disabled)
   { id: 'premium-roll',     label: '1x Premium Roll',               rarity: 'rare',      icon: 'premium-roll',     odds:  0.00, premiumOdds: 0.00, redeem: '1x Premium Roll'       },
   { id: '50pt-discount',    label: '50 Point Discount',             rarity: 'rare',      icon: '50pt-discount',    odds:  0.00, premiumOdds: 0.00, redeem: '50 Point Discount'     },
@@ -46,7 +46,7 @@ const LOOT_TABLE = [
   // One of One (disabled)
   { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.00, premiumOdds: 0.00, redeem: 'Literally Nothing (Rare)'},
   // Dud (virtual — handled separately)
-  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 15.88, premiumOdds: 1.99, redeem: 'Dud'                   },
+  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 0.00, premiumOdds: 0.00, redeem: 'Dud'                   },
 ];
 
 const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
