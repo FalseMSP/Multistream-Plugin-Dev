@@ -25,8 +25,8 @@ const LOOT_TABLE = [
   { id: 'fah',              label: 'Fahhhhh',                       rarity: 'uncommon',  icon: 'fah',              odds:  5.00, premiumOdds: 5.00, redeem: 'Fah'                   },
   { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'uncommon',  icon: 'screaming-chicken',odds:  5.00, premiumOdds: 5.00, redeem: 'Chicken Scream'        },
   { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  0.00, premiumOdds: 0.00, redeem: 'Vip'                   },
-  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  5.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
-  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  5.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
+  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  0.00, premiumOdds: 0.00, redeem: 'Pull Fragment'         },
+  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  0.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
   // Rare (disabled)
   { id: 'premium-roll',     label: '1x Premium Roll',               rarity: 'rare',      icon: 'premium-roll',     odds:  0.00, premiumOdds: 0.00, redeem: '1x Premium Roll'       },
   { id: '50pt-discount',    label: '50 Point Discount',             rarity: 'rare',      icon: '50pt-discount',    odds:  0.00, premiumOdds: 0.00, redeem: '50 Point Discount'     },
@@ -46,7 +46,7 @@ const LOOT_TABLE = [
   // One of One (disabled)
   { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.00, premiumOdds: 0.00, redeem: 'Literally Nothing (Rare)'},
   // Dud (virtual — handled separately)
-  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 0,     premiumOdds: 0,    redeem: 'Dud'                   },
+  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 0.00, premiumOdds: 0.00, redeem: 'Dud'                   },
 ];
 
 const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
@@ -67,8 +67,8 @@ function roll(isPremium) {
 
 // ─── Overlay registration ─────────────────────────────────────────────────────
 
-registerSection('gacha', {
-  title: 'Gacha',
+registerSection('budgetgacha', {
+  title: 'Budget Gacha',
   order: 5,
   icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
     <circle cx="12" cy="12" r="10"/>
@@ -94,13 +94,26 @@ registerSection('gacha', {
   }).toString(),
 });
 
+// ─── Overlay route ────────────────────────────────────────────────────────────
+
+addRoute('/budgetgacha', (req, res) => {
+  try {
+    const html = fs.readFileSync(GACHA_HTML, 'utf8');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  } catch (e) {
+    log.error('[budgetgacha] Could not read overlay.html:', e.message);
+    res.writeHead(500); res.end('Gacha overlay not found');
+  }
+});
+
 // ─── State helpers ────────────────────────────────────────────────────────────
 
 let _pullActive = false;
 const _pullQueue = []; // { user, isPremium }
 
 function pushState(state, extra = {}) {
-  updateSection('gacha', { state, ...extra });
+  updateSection('budgetgacha', { state, ...extra });
 }
 
 // ─── Internal: play one pull immediately ─────────────────────────────────────
@@ -117,7 +130,7 @@ function _executePull({ user, isPremium }) {
   // Icon path (null for duds)
   const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
 
-  log.info(`[gacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
+  log.info(`[budgetgacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
 
   pushState('pulling', {
     user,
@@ -136,7 +149,7 @@ function _executePull({ user, isPremium }) {
     // Fire the item's associated redeem as soon as the icon is revealed,
     // so plugins like sfx pick it up at the right moment.
     if (!isDud && item.redeem) {
-      log.info(`[gacha] Dispatching redeem "${item.redeem}" for ${user}`);
+      log.info(`[budgetgacha] Dispatching redeem "${item.redeem}" for ${user}`);
       queue.pushRedeem({
         username:  user,
         title:     item.redeem,
@@ -154,7 +167,7 @@ function _executePull({ user, isPremium }) {
     // Start the next queued pull after a short breath between animations
     if (_pullQueue.length > 0) {
       const next = _pullQueue.shift();
-      log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
+      log.info(`[budgetgacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
       setTimeout(() => _executePull(next), 1500);
     }
   }, 14000);
@@ -166,7 +179,7 @@ function _executePull({ user, isPremium }) {
 function triggerPull({ user, isPremium = false }) {
   if (_pullActive) {
     _pullQueue.push({ user, isPremium });
-    log.info(`[gacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+    log.info(`[budgetgacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
     return;
   }
   _executePull({ user, isPremium });
@@ -176,10 +189,10 @@ function triggerPull({ user, isPremium = false }) {
 
 // Channel Point reward title(s) that trigger a standard pull.
 // Case-insensitive. Add alternates if you name it differently on YT.
-const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha'];
+const STANDARD_REDEEM_TITLES = ['budget gacha pull', 'budget gacha'];
 
 // Channel Point reward title(s) that trigger a premium pull.
-const PREMIUM_REDEEM_TITLES  = ['gacha premium pull', 'gacha premium'];
+const PREMIUM_REDEEM_TITLES  = ['budget gacha premium pull', 'budget gacha premium'];
 
 // Bits threshold for one pull (100 bits = 1 standard pull, NOT premium)
 const BITS_PER_PULL = 100;
@@ -190,8 +203,8 @@ let _chatReply = { twitch: null, youtube: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  commandsList.registerCommand('!gacha', 'Spend 1000 channel points to pull from the gacha!');
-  log.info('[gacha] ready.');
+  commandsList.registerCommand('!budgetgacha', 'Spend 1000 channel points to pull from the gacha!');
+  log.info('[budgetgacha] ready.');
 }
 
 function _normaliseTitle(raw) {
@@ -207,22 +220,22 @@ function init(context) {
     q.onRedeem(redeem => {
       const raw = redeem.title ?? redeem.reward?.title;
       if (!raw) {
-        log.warn('[gacha] Redeem missing title — skipping. Keys:', Object.keys(redeem).join(', '));
+        log.warn('[budgetgacha] Redeem missing title — skipping. Keys:', Object.keys(redeem).join(', '));
         return;
       }
       const title = _normaliseTitle(raw);
       const user  = redeem.user ?? redeem.username ?? 'someone';
 
       if (STANDARD_REDEEM_TITLES.includes(title)) {
-        log.info(`[gacha] Standard pull via redeem for ${user}`);
+        log.info(`[budgetgacha] Standard pull via redeem for ${user}`);
         triggerPull({ user, isPremium: false });
       } else if (PREMIUM_REDEEM_TITLES.includes(title)) {
-        log.info(`[gacha] Premium pull via redeem for ${user}`);
+        log.info(`[budgetgacha] Premium pull via redeem for ${user}`);
         triggerPull({ user, isPremium: true });
       }
     });
   } else {
-    log.warn('[gacha] context.queue.onRedeem not available — redeem triggers disabled');
+    log.warn('[budgetgacha] context.queue.onRedeem not available — redeem triggers disabled');
   }
 
   // ── Bits & Subs via onDonation ───────────────────────────────────────────
@@ -239,40 +252,30 @@ function init(context) {
         const user  = event.username ?? 'someone';
         const pulls = Math.floor(bits / BITS_PER_PULL);
         if (pulls < 1) return;
-        log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
+        log.info(`[budgetgacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
         for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
 
       } else if (type === 'sub' || type === 'resub') {
         const user = event.username ?? 'someone';
-        log.info(`[gacha] ${type} from ${user} → 1 premium pull`);
+        log.info(`[budgetgacha] ${type} from ${user} → 1 premium pull`);
         triggerPull({ user, isPremium: true });
 
       } else if (type === 'subgift') {
         const user  = event.username ?? 'someone'; // gifter
         const count = event.quantity ?? 1;
-        log.info(`[gacha] ${user} gifted ${count} sub(s) → ${count} premium pull(s)`);
+        log.info(`[budgetgacha] ${user} gifted ${count} sub(s) → ${count} premium pull(s)`);
         for (let i = 0; i < count; i++) triggerPull({ user, isPremium: true });
       }
     });
   } else {
-    log.warn('[gacha] context.queue.onDonation not available — bits/sub triggers disabled');
+    log.warn('[budgetgacha] context.queue.onDonation not available — bits/sub triggers disabled');
   }
 
-  // ── Gacha overlay route ──────────────────────────────────────────────────
-  addRoute('/budgetgacha', (req, res) => {
-    try {
-      const html = fs.readFileSync(GACHA_HTML, 'utf8');
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(html);
-    } catch (e) {
-      log.error('[gacha] Could not read overlay.html:', e.message);
-      res.writeHead(500); res.end('Gacha overlay not found');
-    }
-  });
 
-  log.info('[gacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
-  log.info('[gacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
-  log.info(`[gacha] Bits per pull: ${BITS_PER_PULL} | Subs → premium pull`);
+
+  log.info('[budgetgacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
+  log.info('[budgetgacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
+  log.info(`[budgetgacha] Bits per pull: ${BITS_PER_PULL} | Subs → premium pull`);
 }
 
 async function processMessage(msg) {
@@ -288,7 +291,7 @@ async function processMessage(msg) {
 }
 
 module.exports = {
-  id: 'gacha',
+  id: 'budgetgacha',
   init,
   onChatReady,
   processMessage,
