@@ -51,14 +51,13 @@ const LOOT_TABLE = [
 
 const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
 
-// ─── Sub/follow dedup window ──────────────────────────────────────────────
-// When a subgift storm fires many individual 'sub' events in rapid succession
-// (e.g. 10x community gift → 10 channel.subscribe notifications), we want
-// only ONE gacha pull to trigger rather than ten.  We batch all sub events
-// that arrive within SUB_BATCH_MS of each other into a single pull.
-const SUB_BATCH_MS = 2000; // ms to wait before firing the batched pull
-let _subBatchTimer  = null;
-let _subBatchUser   = null; // username of first sub in the batch (or gifter if known)
+// ─── YouTube subscribe dedup ──────────────────────────────────────────────
+// The YT subscriber poller fires one pushMessage({ type: 'subscribe' }) per
+// new sub detected each poll cycle.  If 10 people subscribe between polls,
+// that's 10 events at once.  We batch them into a single pull.
+const YT_SUB_BATCH_MS = 2000;
+let _ytSubBatchTimer = null;
+let _ytSubBatchUser  = null;
 
 // ─── Pull logic ──────────────────────────────────────────────────────────────
 
@@ -247,69 +246,54 @@ function init(context) {
     log.warn('[budgetgacha] context.queue.onRedeem not available — redeem triggers disabled');
   }
 
-  // ── Bits, Subs, & Follows via onDonation ────────────────────────────────
-  // queue.js routes bits, subs, resubs, subgifts, and follows through onDonation.
-  // type: 'bits'                → 1 premium pull per BITS_PER_PULL bits cheered
-  // type: 'sub' | 'resub'      → 1 premium pull, debounced (see SUB_BATCH_MS)
-  //                              Multiple sub events arriving close together
-  //                              (e.g. from a subgift storm) only fire ONE pull.
-  // type: 'subgift'            → 1 premium pull per sub gifted (credit gifter)
-  // type: 'follow'             → 1 standard pull
+  // ── Twitch follows via onDonation ────────────────────────────────────────
+  // type: 'follow' → 1 standard pull (Twitch only; routed here from twitch.js)
   if (typeof q.onDonation === 'function') {
     q.onDonation(event => {
-      const type = event.type;
-
-      if (type === 'bits') {
-        const bits  = event.amount ?? 0;
-        const user  = event.username ?? 'someone';
-        const pulls = Math.floor(bits / BITS_PER_PULL);
-        if (pulls < 1) return;
-        log.info(`[budgetgacha] ${user} cheered ${bits} bits → ${pulls} premium pull(s)`);
-        for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
-
-      } else if (type === 'sub' || type === 'resub') {
-        // Debounce: collapse a rapid burst of sub events into a single pull.
-        // This handles the case where a subgift of N subs fires N individual
-        // channel.subscribe notifications alongside one channel.subscription.gift.
+      if (event.type === 'follow' && event.platform === 'twitch') {
         const user = event.username ?? 'someone';
-        if (_subBatchTimer) {
-          // Already waiting — just extend the window; do NOT queue another pull.
-          log.info(`[budgetgacha] ${type} from ${user} — absorbed into active sub batch (no extra pull)`);
-          return;
-        }
-        _subBatchUser  = user;
-        _subBatchTimer = setTimeout(() => {
-          _subBatchTimer = null;
-          log.info(`[budgetgacha] Sub batch fired → 1 premium pull for ${_subBatchUser}`);
-          triggerPull({ user: _subBatchUser, isPremium: true });
-          _subBatchUser = null;
-        }, SUB_BATCH_MS);
-        log.info(`[budgetgacha] ${type} from ${user} → batching for ${SUB_BATCH_MS}ms before pull`);
-
-      } else if (type === 'subgift') {
-        const user  = event.username ?? 'someone'; // gifter
-        const count = event.quantity ?? 1;
-        log.info(`[budgetgacha] ${user} gifted ${count} sub(s) → ${count} premium pull(s)`);
-        for (let i = 0; i < count; i++) triggerPull({ user, isPremium: true });
-
-      } else if (type === 'follow') {
-        const user = event.username ?? 'someone';
-        log.info(`[budgetgacha] Follow from ${user} → 1 standard pull`);
+        log.info(`[budgetgacha] Twitch follow from ${user} → 1 standard pull`);
         triggerPull({ user, isPremium: false });
       }
     });
   } else {
-    log.warn('[budgetgacha] context.queue.onDonation not available — bits/sub/follow triggers disabled');
+    log.warn('[budgetgacha] context.queue.onDonation not available — Twitch follow triggers disabled');
   }
 
 
 
   log.info('[budgetgacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
   log.info('[budgetgacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
-  log.info(`[budgetgacha] Bits per pull: ${BITS_PER_PULL} | Subs → premium pull`);
+  log.info('[budgetgacha] Triggers: Twitch follow → standard pull | YouTube subscribe → standard pull (batched)');
 }
 
 async function processMessage(msg) {
+  // YouTube like events (type: 'like' injected by youtube.js like poller)
+  if (msg.platform === 'youtube' && msg.type === 'like') {
+    log.info('[budgetgacha] YT like → 1 standard pull');
+    triggerPull({ user: 'a viewer', isPremium: false });
+    return { message: null };
+  }
+
+  // YouTube subscriber events (type: 'subscribe' injected by youtube.js poller)
+  if (msg.platform === 'youtube' && msg.type === 'subscribe') {
+    const user = msg.username ?? 'someone';
+    if (_ytSubBatchTimer) {
+      // Absorb burst — don't queue another pull
+      log.info(`[budgetgacha] YT subscribe from ${user ?? 'anonymous'} — absorbed into active batch`);
+    } else {
+      _ytSubBatchUser  = user;
+      _ytSubBatchTimer = setTimeout(() => {
+        _ytSubBatchTimer = null;
+        log.info(`[budgetgacha] YT sub batch fired → 1 standard pull for ${_ytSubBatchUser ?? 'anonymous'}`);
+        triggerPull({ user: _ytSubBatchUser ?? 'someone', isPremium: false });
+        _ytSubBatchUser = null;
+      }, YT_SUB_BATCH_MS);
+      log.info(`[budgetgacha] YT subscribe from ${user ?? 'anonymous'} → batching for ${YT_SUB_BATCH_MS}ms`);
+    }
+    return { message: null }; // suppress from chat feed
+  }
+
   // Manual mod trigger: !gacha @user [premium]
   const manualMatch = false; // disable manual trigger for now
   if (manualMatch) {

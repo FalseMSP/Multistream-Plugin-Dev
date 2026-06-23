@@ -1,313 +1,823 @@
 'use strict';
+/**
+ * Twitch module
+ * ─────────────
+ * • Connects via tmi.js IRC WebSocket
+ * • Mirrors chat messages → queue.pushMessage()
+ * • Registers EventSub webhook for channel point redeems (works offline too)
+ * • Registers ban/vip/unvip mod action handlers
+ * • Logs bits (cheers) and subscription events
+ */
+const tmi = require('tmi.js');
+const log = require('./logger');
+// ── Config ────────────────────────────────────────────────────────────────
+const TOKEN       = process.env.TWITCH_TOKEN              ?? '';
+const CLIENT_ID   = process.env.TWITCH_CLIENT_ID          ?? '';
+const BOT_NICK    = process.env.TWITCH_BOT_NICK           ?? '';
+const CHANNELS    = (process.env.TWITCH_CHANNELS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+const BROADCASTER = (process.env.TWITCH_BROADCASTER_LOGIN ?? CHANNELS[0] ?? '').trim();
+// ── Third-party emotes (BTTV / FFZ / 7TV) ────────────────────────────────
+//
+// Fetched once at startup (global + channel-specific) and refreshed every hour.
+// Stored as a flat { emoteName: imageUrl } map passed into every pushMessage().
 
-const log = require('../../logger');
-const commandsList = require('../commands-list');
-const { registerSection, updateSection, addRoute } = require('../../overlay-server');
-const queue = require('../../queue');
-const fs   = require('fs');
-const path = require('path');
+/** @type {Record<string, string>} */
+let _thirdPartyEmotes = {};
 
-const GACHA_HTML = path.resolve(__dirname, 'overlay.html');
+async function _fetchThirdPartyEmotes(channelLogin) {
+  const { default: fetch } = await import('node-fetch');
+  const map = {};
 
-// ─── Loot Table ─────────────────────────────────────────────────────────────
-// Each entry: { id, label, rarity, icon (folder name under gachaicons/) }
-// odds: standard pull weight  premiumOdds: premium pull weight
+  // Strip any leading '#' that tmi.js channel names may have
+  const login = channelLogin ? channelLogin.replace(/^#/, '').toLowerCase() : null;
+  log.info(`[Twitch] Fetching third-party emotes. channelLogin=${JSON.stringify(channelLogin)} → login=${JSON.stringify(login)}`);
+  if (!login) log.warn('[Twitch] No channel login — set TWITCH_BROADCASTER_LOGIN in env to load channel emotes');
 
-const LOOT_TABLE = [
-  // Common
-  // redeem: exact Twitch reward title to fire when this item is revealed.
-  // null = no automatic redeem (handled manually, or not applicable).
-  { id: 'play-gd-level',    label: 'Play your GD Level',            rarity: 'common',    icon: 'play-gd-level',    odds: 0.00, premiumOdds: 0.00, redeem: 'Play your GD Level'    },
-  { id: 'read-your-name',   label: 'Read your name',                rarity: 'common',    icon: 'read-your-name',   odds: 10.00, premiumOdds: 0.00, redeem: 'Read your name'        },
-  { id: 'vine-boom',        label: 'Vine Boom',                     rarity: 'common',    icon: 'vine-boom',        odds: 5.00, premiumOdds: 4.00, redeem: 'Vine Boom'             },
-  { id: 'metal-pipe',       label: 'Metal Pipe',                    rarity: 'common',    icon: 'metal-pipe',       odds: 5.00, premiumOdds: 4.00, redeem: 'Metal Pipe'            },
-  // Uncommon
-  { id: 'fah',              label: 'Fahhhhh',                       rarity: 'epic',  icon: 'fah',              odds:  1.00, premiumOdds: 5.00, redeem: 'Fah'                   },
-  { id: 'screaming-chicken',label: 'Screaming Chicken',             rarity: 'epic',  icon: 'screaming-chicken',odds:  1.00, premiumOdds: 5.00, redeem: 'Chicken Scream'        },
-  { id: 'vip',              label: 'VIP',                           rarity: 'uncommon',  icon: 'vip',              odds:  0.00, premiumOdds: 0.00, redeem: 'Vip'                   },
-  { id: 'pull-fragment',    label: 'Pull Fragment',                 rarity: 'uncommon',  icon: 'pull-fragment',    odds:  1.00, premiumOdds: 2.00, redeem: 'Pull Fragment'         },
-  { id: '1000-points',      label: '1000 Channel Points',           rarity: 'uncommon',  icon: '1000-points',      odds:  0.00, premiumOdds: 0.00, redeem: '1000 Channel Points'   },
-  // Rare (disabled)
-  { id: 'premium-roll',     label: '1x Premium Roll',               rarity: 'rare',      icon: 'premium-roll',     odds:  0.00, premiumOdds: 0.00, redeem: '1x Premium Roll'       },
-  { id: '50pt-discount',    label: '50 Point Discount',             rarity: 'rare',      icon: '50pt-discount',    odds:  0.00, premiumOdds: 0.00, redeem: '50 Point Discount'     },
-  // Epic (disabled)
-  { id: 'say-phrase',       label: 'Say a Phrase',                  rarity: 'epic',      icon: 'say-phrase',       odds:  0.00, premiumOdds: 0.00, redeem: 'Say a Phrase'          },
-  { id: 'turn-model-180',   label: 'Turn Model 180°',               rarity: 'epic',      icon: 'turn-model-180',   odds:  0.00, premiumOdds: 0.00, redeem: 'Turn Model 180'        },
-  { id: 'custom-sfx',       label: 'Add Custom SFX',                rarity: 'epic',      icon: 'custom-sfx',       odds:  0.00, premiumOdds: 0.00, redeem: 'Add Custom SFX'        },
-  { id: '1v1',              label: '1v1',                           rarity: 'epic',      icon: '1v1',              odds:  0.00, premiumOdds: 0.00, redeem: '1v1'                   },
-  // Legendary (disabled)
-  { id: 'choose-game',      label: 'Choose Game to Stream Tomorrow',rarity: 'legendary', icon: 'choose-game',      odds:  0.00, premiumOdds: 0.00, redeem: 'Choose Game to Stream Tomorrow' },
-  { id: 'free-art',         label: 'Free Art',                      rarity: 'legendary', icon: 'free-art',         odds:  0.00, premiumOdds: 0.00, redeem: 'Free Art'              },
-  { id: 'free-art-3d',      label: 'Free Art (3D)',                 rarity: 'legendary', icon: 'free-art-3d',      odds:  0.00, premiumOdds: 0.00, redeem: 'Free Art (3D)'         },
-  { id: 'mod',              label: 'Mod',                           rarity: 'legendary', icon: 'mod',              odds:  0.00, premiumOdds: 0.00, redeem: 'Mod'                   },
-  // Mythic (disabled)
-  { id: 'custom-mc-mod',    label: 'Custom Minecraft Mod',          rarity: 'mythic',    icon: 'custom-mc-mod',    odds:  0.00, premiumOdds: 0.00, redeem: 'Custom Minecraft Mod'  },
-  { id: 'shower-stream',    label: 'Shower Stream',                 rarity: 'mythic',    icon: 'shower-stream',    odds:  0.00, premiumOdds: 0.00, redeem: 'Shower Stream'         },
-  // One of One (disabled)
-  { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.00, premiumOdds: 0.00, redeem: 'Literally Nothing (Rare)'},
-  // Dud (virtual — handled separately)
-  { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 0.00, premiumOdds: 0.00, redeem: 'Dud'                   },
-];
-
-const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
-
-// ─── YouTube subscribe dedup ──────────────────────────────────────────────
-// The YT subscriber poller fires one pushMessage({ type: 'subscribe' }) per
-// new sub detected each poll cycle.  If 10 people subscribe between polls,
-// that's 10 events at once.  We batch them into a single pull.
-const YT_SUB_BATCH_MS = 2000;
-let _ytSubBatchTimer = null;
-let _ytSubBatchUser  = null;
-
-// ─── Pull logic ──────────────────────────────────────────────────────────────
-
-function roll(isPremium) {
-  const weightKey = isPremium ? 'premiumOdds' : 'odds';
-  const pool = LOOT_TABLE.filter(e => e[weightKey] > 0);
-  const total = pool.reduce((s, e) => s + e[weightKey], 0);
-  let r = Math.random() * total;
-  for (const entry of pool) {
-    r -= entry[weightKey];
-    if (r <= 0) return entry;
-  }
-  return pool[pool.length - 1];
-}
-
-// ─── Overlay registration ─────────────────────────────────────────────────────
-
-registerSection('budgetgacha', {
-  title: 'Budget Gacha',
-  order: 5,
-  icon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-    <circle cx="12" cy="12" r="10"/>
-    <path d="M12 8v8M8 12h8"/>
-  </svg>`,
-
-  render: (function render(data, el, esc) {
-    if (!data || !data.state || data.state === 'idle') {
-      el.innerHTML = '';
-      return;
-    }
-    if (data.state === 'pulling') {
-      el.innerHTML = '<div style="color:var(--accent,#fff)">🎰 Pull in progress…</div>';
-    } else if (data.state === 'result') {
-      const r = data.result;
-      el.innerHTML =
-        '<div style="display:flex;flex-direction:column;gap:4px">' +
-          '<span style="font-size:0.75em;opacity:0.6;text-transform:uppercase">' + esc(r.rarity) + '</span>' +
-          '<span style="font-weight:600">' + esc(r.label) + '</span>' +
-          '<span style="font-size:0.75em;opacity:0.5">for ' + esc(r.user) + '</span>' +
-        '</div>';
-    }
-  }).toString(),
-});
-
-// ─── Overlay route ────────────────────────────────────────────────────────────
-
-addRoute('/budgetgacha', (req, res) => {
+  // ── BTTV global ──────────────────────────────────────────────────────────
   try {
-    const html = fs.readFileSync(GACHA_HTML, 'utf8');
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(html);
-  } catch (e) {
-    log.error('[budgetgacha] Could not read overlay.html:', e.message);
-    res.writeHead(500); res.end('Gacha overlay not found');
+    const r = await fetch('https://api.betterttv.net/3/cached/emotes/global');
+    if (r.ok) {
+      const d = await r.json();
+      if (Array.isArray(d)) {
+        for (const e of d) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+      }
+    }
+  } catch (err) { log.warn('[Twitch] BTTV global fetch failed:', err.message); }
+
+  // ── BTTV channel ─────────────────────────────────────────────────────────
+  if (login) {
+    try {
+      const userId = await _resolveUserId(login);
+      if (userId) {
+        const r = await fetch(`https://api.betterttv.net/3/cached/users/twitch/${userId}`);
+        if (r.ok) {
+          const d = await r.json();
+          const emotes = [...(d.channelEmotes ?? []), ...(d.sharedEmotes ?? [])];
+          for (const e of emotes) map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+          log.info(`[Twitch] BTTV channel: loaded ${emotes.length} emotes for ${login}`);
+        } else {
+          log.warn(`[Twitch] BTTV channel fetch returned ${r.status} for ${login} (id: ${userId})`);
+        }
+      }
+    } catch (err) { log.warn('[Twitch] BTTV channel fetch failed:', err.message); }
   }
-});
 
-// ─── State helpers ────────────────────────────────────────────────────────────
+  // ── FFZ global ───────────────────────────────────────────────────────────
+  try {
+    const r = await fetch('https://api.frankerfacez.com/v1/set/global');
+    if (r.ok) {
+      const d = await r.json();
+      for (const set of Object.values(d.sets ?? {})) {
+        for (const e of (set.emoticons ?? [])) {
+          const url = e.urls?.['2'] ?? e.urls?.['1'];
+          if (url) map[e.name] = url.startsWith('//') ? 'https:' + url : url;
+        }
+      }
+    }
+  } catch (err) { log.warn('[Twitch] FFZ global fetch failed:', err.message); }
 
-let _pullActive = false;
-const _pullQueue = []; // { user, isPremium }
+  // ── FFZ channel ──────────────────────────────────────────────────────────
+  if (login) {
+    try {
+      const r = await fetch(`https://api.frankerfacez.com/v1/room/${login}`);
+      if (r.ok) {
+        const d = await r.json();
+        let count = 0;
+        for (const set of Object.values(d.sets ?? {})) {
+          for (const e of (set.emoticons ?? [])) {
+            const url = e.urls?.['2'] ?? e.urls?.['1'];
+            if (url) { map[e.name] = url.startsWith('//') ? 'https:' + url : url; count++; }
+          }
+        }
+        log.info(`[Twitch] FFZ channel: loaded ${count} emotes for ${login}`);
+      }
+    } catch (err) { log.warn('[Twitch] FFZ channel fetch failed:', err.message); }
+  }
 
-function pushState(state, extra = {}) {
-  updateSection('budgetgacha', { state, ...extra });
+  // ── 7TV global ───────────────────────────────────────────────────────────
+  try {
+    const r = await fetch('https://7tv.io/v3/emote-sets/global');
+    if (r.ok) {
+      const d = await r.json();
+      for (const e of (d.emotes ?? [])) {
+        const host = e.data?.host;
+        if (!host) continue;
+        const file = host.files?.find(f => f.name === '2x.webp') ?? host.files?.find(f => f.name === '2x.avif') ?? host.files?.[0];
+        if (file) map[e.name] = `https:${host.url}/${file.name}`;
+      }
+    }
+  } catch (err) { log.warn('[Twitch] 7TV global fetch failed:', err.message); }
+
+  // ── 7TV channel ──────────────────────────────────────────────────────────
+  // The v3 endpoint is GET /v3/users/twitch/:twitch_user_id
+  // Response: { emote_set: { emotes: [{ name, data: { host: { url, files } } }] } }
+  if (login) {
+    try {
+      const userId = await _resolveUserId(login);
+      if (userId) {
+        const r = await fetch(`https://7tv.io/v3/users/twitch/${userId}`);
+        if (r.ok) {
+          const d = await r.json();
+          const emotes = d.emote_set?.emotes ?? [];
+          let count = 0;
+          for (const e of emotes) {
+            const host = e.data?.host;
+            if (!host) continue;
+            const file = host.files?.find(f => f.name === '2x.webp') ?? host.files?.find(f => f.name === '2x.avif') ?? host.files?.[0];
+            if (file) { map[e.name] = `https:${host.url}/${file.name}`; count++; }
+          }
+          log.info(`[Twitch] 7TV channel: loaded ${count} emotes for ${login}`);
+        } else {
+          log.warn(`[Twitch] 7TV channel fetch returned ${r.status} for ${login}`);
+        }
+      }
+    } catch (err) { log.warn('[Twitch] 7TV channel fetch failed:', err.message); }
+  }
+
+  const count = Object.keys(map).length;
+  log.info(`[Twitch] Third-party emotes loaded: ${count} total (BTTV + FFZ + 7TV)`);
+  _thirdPartyEmotes = map;
 }
 
-// ─── Internal: play one pull immediately ─────────────────────────────────────
+/** Resolve Twitch login → numeric user ID.
+ *  Tries Helix first; falls back to ivr.fi (no auth required) if Helix fails. */
+let _broadcasterUserId = null;
+async function _resolveUserId(login) {
+  if (_broadcasterUserId) return _broadcasterUserId;
+  const { default: fetch } = await import('node-fetch');
 
-function _executePull({ user, isPremium }) {
-  _pullActive = true;
+  // Primary: Helix API (needs CLIENT_ID + app token)
+  try {
+    const data = await helixRequest('GET', `/users?login=${login}`);
+    _broadcasterUserId = data?.data?.[0]?.id ?? null;
+  } catch (err) {
+    log.warn(`[Twitch] _resolveUserId Helix failed for ${login}:`, err.message);
+  }
 
-  const item = roll(isPremium);
-  const isDud = item.rarity === 'dud';
+  // Fallback: ivr.fi — public proxy, no auth needed
+  if (!_broadcasterUserId) {
+    try {
+      const r = await fetch(`https://api.ivr.fi/v2/twitch/user?login=${encodeURIComponent(login)}`);
+      if (r.ok) {
+        const d = await r.json();
+        _broadcasterUserId = d?.[0]?.id ?? null;
+      }
+    } catch (err) {
+      log.warn(`[Twitch] _resolveUserId ivr.fi fallback failed for ${login}:`, err.message);
+    }
+  }
 
-  // All pulls use the same video
-  const videoFile = `/gachavids/gacha-at-home.mp4`;
+  if (_broadcasterUserId) log.info(`[Twitch] Resolved user ID for ${login}: ${_broadcasterUserId}`);
+  else log.warn(`[Twitch] Could not resolve user ID for ${login} — channel emotes (BTTV/7TV) will be skipped`);
+  return _broadcasterUserId;
+}
 
-  // Icon path (null for duds)
-  const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
-
-  log.info(`[budgetgacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
-
-  pushState('pulling', {
-    user,
-    videoFile,
-    iconPath,
-    rarity: item.rarity,
-    label: item.label,
-    isDud,
+// ── Helix API helper ──────────────────────────────────────────────────────
+let _appToken       = null;
+let _appTokenExpiry = 0;
+async function getAppToken() {
+  if (_appToken && Date.now() < _appTokenExpiry) return _appToken;
+  const { default: fetch } = await import('node-fetch');
+  const res  = await fetch(
+    `https://id.twitch.tv/oauth2/token?client_id=${CLIENT_ID}&client_secret=${process.env.TWITCH_CLIENT_SECRET}&grant_type=client_credentials`,
+    { method: 'POST' }
+  );
+  const data = await res.json();
+  if (!data.access_token) throw new Error(`Failed to get app token: ${JSON.stringify(data)}`);
+  _appToken       = data.access_token;
+  _appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  log.info('[Twitch] App access token obtained');
+  return _appToken;
+}
+async function helixRequest(method, path, body) {
+  const { default: fetch } = await import('node-fetch');
+  const appToken = await getAppToken();
+  const res = await fetch(`https://api.twitch.tv/helix${path}`, {
+    method,
+    headers: {
+      'Client-ID':     CLIENT_ID,
+      'Authorization': `Bearer ${appToken}`,
+      'Content-Type':  'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
   });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Twitch API ${res.status}: ${text}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
+async function getBroadcasterId() {
+  const data = await helixRequest('GET', `/users?login=${BROADCASTER}`);
+  return data?.data?.[0]?.id ?? null;
+}
+// ── User token (broadcaster OAuth) ───────────────────────────────────────
+// Required for EventSub subscriptions that need broadcaster-level scopes:
+//   bits:read, channel:read:subscriptions, channel:manage:redemptions
+// Loaded from .twitch-tokens.json written by twitch-auth.js.
+// The token is refreshed automatically when it expires.
 
-  setTimeout(() => {
-    pushState('result', {
-      result: { rarity: item.rarity, label: item.label, user },
-    });
+const fs        = require('fs');
+const TOKEN_FILE = require('path').resolve('.twitch-tokens.json');
 
-    // Fire the item's associated redeem as soon as the icon is revealed,
-    // so plugins like sfx pick it up at the right moment.
-    if (!isDud && item.redeem) {
-      log.info(`[budgetgacha] Dispatching redeem "${item.redeem}" for ${user}`);
-      queue.pushRedeem({
-        username:  user,
-        title:     item.redeem,
-        cost:      0,
-        input:     null,
-        timestamp: new Date(),
-        _fromGacha: true, // flag so other plugins can tell it's synthetic
+let _userTokenCache = null;
+
+async function getUserToken() {
+  // Load from disk if not in memory
+  if (!_userTokenCache) {
+    if (!fs.existsSync(TOKEN_FILE)) return null;
+    try {
+      _userTokenCache = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+    } catch {
+      log.warn('[Twitch] Could not read .twitch-tokens.json');
+      return null;
+    }
+  }
+
+  // Refresh if expired (or within 60 s of expiry)
+  if (Date.now() >= (_userTokenCache.expires_at ?? 0)) {
+    log.info('[Twitch] User token expired — refreshing…');
+    try {
+      const { default: fetch } = await import('node-fetch');
+      const res  = await fetch('https://id.twitch.tv/oauth2/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type:    'refresh_token',
+          refresh_token: _userTokenCache.refresh_token,
+          client_id:     CLIENT_ID,
+          client_secret: process.env.TWITCH_CLIENT_SECRET,
+        }),
       });
-    }
-  }, 8000);
+      const data = await res.json();
+      if (!data.access_token) throw new Error(JSON.stringify(data));
 
-  setTimeout(() => {
-    pushState('idle');
-    _pullActive = false;
-    // Start the next queued pull after a short breath between animations
-    if (_pullQueue.length > 0) {
-      const next = _pullQueue.shift();
-      log.info(`[budgetgacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
-      setTimeout(() => _executePull(next), 1500);
+      _userTokenCache = {
+        access_token:  data.access_token,
+        refresh_token: data.refresh_token ?? _userTokenCache.refresh_token,
+        expires_at:    Date.now() + (data.expires_in - 60) * 1000,
+        scopes:        data.scope ?? _userTokenCache.scopes,
+      };
+      fs.writeFileSync(TOKEN_FILE, JSON.stringify(_userTokenCache, null, 2));
+      log.info('[Twitch] User token refreshed and saved.');
+    } catch (err) {
+      log.error('[Twitch] User token refresh failed:', err.message);
+      _userTokenCache = null;
+      return null;
     }
-  }, 14000);
+  }
+
+  return _userTokenCache.access_token;
 }
 
-// ─── Main pull trigger ────────────────────────────────────────────────────────
-// Queues the pull if one is already in progress; plays immediately otherwise.
+/**
+ * Like helixRequest but authenticates with the broadcaster's user OAuth token
+ * instead of the app token. Required for endpoints that need user-level scopes
+ * (e.g. channel:manage:redemptions for PATCH custom_rewards).
+ */
+async function helixUserRequest(method, path, body) {
+  const { default: fetch } = await import('node-fetch');
+  const userToken = await getUserToken();
+  if (!userToken) throw new Error('Missing User OAUTH Token — run twitch-auth.js');
+  const res = await fetch(`https://api.twitch.tv/helix${path}`, {
+    method,
+    headers: {
+      'Client-ID':     CLIENT_ID,
+      'Authorization': `Bearer ${userToken}`,
+      'Content-Type':  'application/json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Twitch API ${res.status}: ${text}`);
+  }
+  return res.status === 204 ? null : res.json();
+}
 
-function triggerPull({ user, isPremium = false }) {
-  if (_pullActive) {
-    _pullQueue.push({ user, isPremium });
-    log.info(`[budgetgacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+
+// ── EventSub — channel point redeems + bits + subs ───────────────────────
+//
+// Webhook EventSub subscriptions ALWAYS use the app access token to create
+// them — using a user token here is a 400 error. However, subscription types
+// like channel.cheer and channel.subscribe require the broadcaster to have
+// previously granted the relevant scopes (bits:read, channel:read:subscriptions)
+// to your client ID via OAuth. Run twitch-auth.js once to perform that grant;
+// after that the app token carries the necessary permissions automatically.
+
+async function subscribeEventSub(broadcasterId, callbackUrl, secret, type, version, condition) {
+  const existing = await helixRequest('GET', `/eventsub/subscriptions?type=${type}`);
+
+  // Bug 2 fix: also check that the callback URL matches the current public URL.
+  // A sub can be 'enabled' but pointing at a stale tunnel URL from a previous
+  // run — in that case Twitch is sending events to a dead endpoint. We must
+  // delete it and create a fresh one with the correct callback URL.
+  const activeMatch = existing?.data?.find(
+    s => s.condition?.broadcaster_user_id === broadcasterId
+      && s.status === 'enabled'
+      && s.transport?.callback === callbackUrl
+  );
+  if (activeMatch) {
+    log.info(`[Twitch] EventSub subscription already active: ${type}`);
     return;
   }
-  _executePull({ user, isPremium });
-}
 
-// ─── Redeem / bits / sub titles ───────────────────────────────────────────────
-
-// Channel Point reward title(s) that trigger a standard pull.
-// Case-insensitive. Add alternates if you name it differently on YT.
-const STANDARD_REDEEM_TITLES = ['budget gacha pull', 'budget gacha'];
-
-// Channel Point reward title(s) that trigger a premium pull.
-const PREMIUM_REDEEM_TITLES  = ['budget gacha premium pull', 'budget gacha premium'];
-
-// Bits threshold for one pull (100 bits = 1 standard pull, NOT premium)
-const BITS_PER_PULL = 100;
-
-// ─── Chat / redeem integration ────────────────────────────────────────────────
-
-let _chatReply = { twitch: null, youtube: null };
-
-function onChatReady(chatReply) {
-  _chatReply = chatReply;
-  commandsList.registerCommand('!budgetgacha', 'Spend 1000 channel points to pull from the gacha!');
-  log.info('[budgetgacha] ready.');
-}
-
-function _normaliseTitle(raw) {
-  // Strip "[YT]" suffix appended by yt-points when mirroring YouTube redeems
-  return raw.replace(/\s*\[YT\]\s*$/i, '').trim().toLowerCase();
-}
-
-function init(context) {
-  const q = context.queue ?? context;
-
-  // ── Channel Point redeems ────────────────────────────────────────────────
-  if (typeof q.onRedeem === 'function') {
-    q.onRedeem(redeem => {
-      const raw = redeem.title ?? redeem.reward?.title;
-      if (!raw) {
-        log.warn('[budgetgacha] Redeem missing title — skipping. Keys:', Object.keys(redeem).join(', '));
-        return;
-      }
-      const title = _normaliseTitle(raw);
-      const user  = redeem.user ?? redeem.username ?? 'someone';
-
-      if (STANDARD_REDEEM_TITLES.includes(title)) {
-        log.info(`[budgetgacha] Standard pull via redeem for ${user}`);
-        triggerPull({ user, isPremium: false });
-      } else if (PREMIUM_REDEEM_TITLES.includes(title)) {
-        log.info(`[budgetgacha] Premium pull via redeem for ${user}`);
-        triggerPull({ user, isPremium: true });
-      }
-    });
-  } else {
-    log.warn('[budgetgacha] context.queue.onRedeem not available — redeem triggers disabled');
-  }
-
-  // ── Twitch follows via onDonation ────────────────────────────────────────
-  // type: 'follow' → 1 standard pull (Twitch only; routed here from twitch.js)
-  if (typeof q.onDonation === 'function') {
-    q.onDonation(event => {
-      if (event.type === 'follow' && event.platform === 'twitch') {
-        const user = event.username ?? 'someone';
-        log.info(`[budgetgacha] Twitch follow from ${user} → 1 standard pull`);
-        triggerPull({ user, isPremium: false });
-      }
-    });
-  } else {
-    log.warn('[budgetgacha] context.queue.onDonation not available — Twitch follow triggers disabled');
-  }
-
-
-
-  log.info('[budgetgacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
-  log.info('[budgetgacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
-  log.info('[budgetgacha] Triggers: Twitch follow → standard pull | YouTube subscribe → standard pull (batched)');
-}
-
-async function processMessage(msg) {
-  // YouTube like events (type: 'like' injected by youtube.js like poller)
-  if (msg.platform === 'youtube' && msg.type === 'like') {
-    log.info('[budgetgacha] YT like → 1 standard pull');
-    triggerPull({ user: 'a viewer', isPremium: false });
-    return { message: null };
-  }
-
-  // YouTube subscriber events (type: 'subscribe' injected by youtube.js poller)
-  if (msg.platform === 'youtube' && msg.type === 'subscribe') {
-    const user = msg.username ?? 'someone';
-    if (_ytSubBatchTimer) {
-      // Absorb burst — don't queue another pull
-      log.info(`[budgetgacha] YT subscribe from ${user ?? 'anonymous'} — absorbed into active batch`);
-    } else {
-      _ytSubBatchUser  = user;
-      _ytSubBatchTimer = setTimeout(() => {
-        _ytSubBatchTimer = null;
-        log.info(`[budgetgacha] YT sub batch fired → 1 standard pull for ${_ytSubBatchUser ?? 'anonymous'}`);
-        triggerPull({ user: _ytSubBatchUser ?? 'someone', isPremium: false });
-        _ytSubBatchUser = null;
-      }, YT_SUB_BATCH_MS);
-      log.info(`[budgetgacha] YT subscribe from ${user ?? 'anonymous'} → batching for ${YT_SUB_BATCH_MS}ms`);
+  // Delete any enabled subs for this type that point at the wrong URL so
+  // we don't accumulate orphaned subscriptions.
+  const staleEnabled = existing?.data?.filter(
+    s => s.condition?.broadcaster_user_id === broadcasterId
+      && s.status === 'enabled'
+      && s.transport?.callback !== callbackUrl
+  ) ?? [];
+  for (const sub of staleEnabled) {
+    try {
+      await helixRequest('DELETE', `/eventsub/subscriptions?id=${sub.id}`);
+      log.info(`[Twitch] Deleted stale enabled sub ${sub.id} (old callback: ${sub.transport?.callback})`);
+    } catch (err) {
+      log.warn(`[Twitch] Could not delete stale sub ${sub.id}:`, err.message);
     }
-    return { message: null }; // suppress from chat feed
   }
 
-  // Manual mod trigger: !gacha @user [premium]
-  const manualMatch = false; // disable manual trigger for now
-  if (manualMatch) {
-    const user = manualMatch[1] || msg.username;
-    triggerPull({ user, isPremium: false });
-    return { message: null };
+  await helixRequest('POST', '/eventsub/subscriptions', {
+    type,
+    version,
+    condition: condition ?? { broadcaster_user_id: broadcasterId },
+    transport: { method: 'webhook', callback: callbackUrl, secret },
+  });
+  log.info(`[Twitch] EventSub subscription created: ${type}`);
+}
+
+async function setupEventSub(callbackUrl, secret) {
+  if (!callbackUrl) {
+    log.warn('[Twitch] No PUBLIC_URL set — EventSub disabled. Redeems only work while live via IRC tags.');
+    return;
   }
-  return { message: msg };
+  if (!CLIENT_ID || !process.env.TWITCH_CLIENT_SECRET) {
+    log.warn('[Twitch] CLIENT_ID or CLIENT_SECRET missing — EventSub disabled.');
+    return;
+  }
+
+  const hasUserToken = await getUserToken().then(t => !!t).catch(() => false);
+  if (!hasUserToken) {
+    log.warn('[Twitch] No broadcaster OAuth token found (.twitch-tokens.json missing or invalid).');
+    log.warn('[Twitch] Run: node twitch-auth.js — this grants bits:read and channel:read:subscriptions');
+    log.warn('[Twitch] to your client ID. Without it, cheer/sub EventSub subscriptions will 403.');
+  }
+  try {
+    const broadcasterId = await getBroadcasterId();
+    if (!broadcasterId) { log.warn('[Twitch] Could not resolve broadcaster ID'); return; }
+
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.channel_points_custom_reward_redemption.add', '1');
+
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.cheer', '1');
+
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.subscribe', '1');
+
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.subscription.gift', '1');
+
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.subscription.message', '1');
+
+    // channel.follow v2 requires moderator_user_id in addition to broadcaster_user_id.
+    // Using the broadcaster as their own moderator is always valid.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.follow', '2',
+      { broadcaster_user_id: broadcasterId, moderator_user_id: broadcasterId });
+
+  } catch (err) {
+    log.warn('[Twitch] EventSub setup failed:', err.message);
+  }
+}
+// ── EventSub event handlers (called from your webhook router) ─────────────
+function handleEventSubNotification(type, event, queue) {
+  switch (type) {
+    case 'channel.channel_points_custom_reward_redemption.add':
+      queue.pushRedeem({
+        username:  event.user_name,
+        title:     event.reward.title,
+        cost:      event.reward.cost,
+        input:     event.user_input || null,
+        timestamp: new Date(event.redeemed_at),
+      });
+      log.info(`[Twitch] Redeem: ${event.user_name} → "${event.reward.title}" (${event.reward.cost} pts)`);
+      break;
+
+    case 'channel.cheer':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'bits',
+        username:  event.user_name ?? 'anonymous',
+        amount:    event.bits,
+        message:   event.message || null,
+        timestamp: new Date(event.broadcasted_at ?? Date.now()),
+      });
+      log.info(`[Twitch] Cheer: ${event.user_name} cheered ${event.bits} bits`);
+      break;
+
+    case 'channel.subscribe':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'sub',
+        username:  event.user_name,
+        tier:      event.tier,
+        gifted:    event.is_gift,
+        timestamp: new Date(),
+      });
+      log.info(`[Twitch] Sub: ${event.user_name} (Tier ${event.tier})`);
+      break;
+
+    case 'channel.subscription.gift':
+      for (let i = 0; i < event.total; i++) {
+        queue.pushDonation({
+          platform:   'twitch',
+          type:       'subgift',
+          username:   event.user_name ?? 'anonymous',
+          recipient:  null,
+          tier:       event.tier,
+          quantity:   1,
+          cumulative: event.cumulative_total ?? null,
+          timestamp:  new Date(),
+        });
+      }
+      log.info(`[Twitch] Sub gift: ${event.user_name} gifted ${event.total} subs`);
+      break;
+
+    case 'channel.subscription.message':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'resub',
+        username:  event.user_name,
+        tier:      event.tier,
+        months:    event.cumulative_months,
+        streak:    event.streak_months ?? null,
+        message:   event.message?.text || null,
+        timestamp: new Date(),
+      });
+      log.info(`[Twitch] Resub: ${event.user_name} (${event.cumulative_months} months)`);
+      break;
+
+    case 'channel.follow':
+      queue.pushDonation({
+        platform:  'twitch',
+        type:      'follow',
+        username:  event.user_name,
+        timestamp: new Date(event.followed_at ?? Date.now()),
+      });
+      log.info(`[Twitch] Follow: ${event.user_name}`);
+      break;
+
+    default:
+      log.warn('[Twitch] Unhandled EventSub type:', type);
+  }
+}
+
+// ── Mod actions ───────────────────────────────────────────────────────────
+
+async function twitchBan(platform, username, reason) {
+  const broadcasterId = await getBroadcasterId();
+  // Resolve target user ID
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  // Ban endpoint requires broadcaster/moderator user OAuth token, not app token
+  await helixUserRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
+    data: { user_id: userId, reason: reason ?? '' },
+  });
+  log.info(`[Twitch] Banned: ${username}`);
+}
+
+async function twitchTimeout(platform, username, duration, reason) {
+  const broadcasterId = await getBroadcasterId();
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  // Timeout is the same ban endpoint but with duration set
+  await helixUserRequest('POST', `/moderation/bans?broadcaster_id=${broadcasterId}&moderator_id=${broadcasterId}`, {
+    data: { user_id: userId, duration: Number(duration), reason: reason ?? '' },
+  });
+  log.info(`[Twitch] Timed out: ${username} for ${duration}s`);
+}
+
+async function twitchVip(platform, username) {
+  const broadcasterId = await getBroadcasterId();
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  await helixRequest('POST', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
+}
+
+async function twitchUnvip(platform, username) {
+  const broadcasterId = await getBroadcasterId();
+  const userData = await helixRequest('GET', `/users?login=${username}`);
+  const userId   = userData?.data?.[0]?.id;
+  if (!userId) throw new Error(`User not found: ${username}`);
+  await helixRequest('DELETE', `/channels/vips?broadcaster_id=${broadcasterId}&user_id=${userId}`);
+}
+
+// ── IRC client ────────────────────────────────────────────────────────────
+
+let _tmiClient = null;
+
+function say(text) {
+  if (!_tmiClient || !CHANNELS.length) return;
+  _tmiClient.say(CHANNELS[0], text).catch(err => log.error('[Twitch] say() error:', err.message));
+}
+
+async function startTwitch(queue) {
+  if (!TOKEN || !BOT_NICK || !CHANNELS.length) {
+    log.warn('[Twitch] IRC credentials incomplete — chat mirroring disabled.');
+    return null;
+  }
+
+  const client = new tmi.Client({
+    options:    { debug: false },
+    identity:   { username: BOT_NICK, password: TOKEN },
+    channels:   CHANNELS,
+    connection: { reconnect: true, secure: true },
+  });
+
+  // Fetch BTTV/FFZ/7TV emotes now, then refresh every hour
+  _fetchThirdPartyEmotes(BROADCASTER).catch(err => log.warn('[Twitch] Third-party emote fetch error:', err.message));
+  setInterval(() => {
+    _fetchThirdPartyEmotes(BROADCASTER).catch(err => log.warn('[Twitch] Third-party emote refresh error:', err.message));
+  }, 60 * 60 * 1000);
+
+  client.on('message', (channel, tags, message, self) => {
+    if (self) return;
+    const username = tags['display-name'] ?? tags.username ?? 'unknown';
+
+    // IRC tag fallback for redeems (only fires while live, cost not available)
+    if (tags['custom-reward-id']) {
+      log.debug('[Twitch] Redeem via IRC tag (no cost):', username);
+      queue.pushRedeem({
+        username,
+        title:     tags['msg-id'] ?? 'Custom Reward',
+        cost:      0,
+        input:     message || null,
+        timestamp: new Date(),
+      });
+      return;
+    }
+    log.debug(`[Twitch] Chat [${channel}] ${username}: ${message}`);
+    queue.pushMessage({
+      platform: 'twitch',
+      username,
+      message,
+      color:           tags['color'] ?? '',
+      emotes:          tags['emotes-raw'] ?? '',   // raw string e.g. "302856228:0-6,8-14/emotesv2_abc:16-22"
+      thirdPartyEmotes: _thirdPartyEmotes,
+    });
+  });
+
+  // ── Twitch watch-streak share (USERNOTICE msg-id=viewermilestone) ────────
+  // Fires when a viewer clicks "Share Watch Streak" in the Twitch UI.
+  // Tags of interest:
+  //   msg-id            = 'viewermilestone'
+  //   msg-param-value   = streak length in consecutive streams (string)
+  //   display-name      = viewer's display name
+  client.on('raw_message', (messageData) => {
+    if (messageData?.command !== 'USERNOTICE') return;
+    const tags = messageData.tags ?? {};
+    if (tags['msg-id'] !== 'viewermilestone') return;
+
+    const username    = tags['display-name'] ?? tags.login ?? 'unknown';
+    const streakCount = parseInt(tags['msg-param-value'] ?? '0', 10);
+    if (!streakCount || streakCount < 1) return;
+
+    log.info(`[Twitch] Watch streak share: ${username} — ${streakCount} stream(s)`);
+    queue.pushMessage({
+      platform: 'twitch',
+      username,
+      message:  tags['system-msg'] ?? `${username} has watched ${streakCount} streams in a row!`,
+      type:     'watch-streak',
+      streak:   streakCount,
+    });
+  });
+
+  // Bits and sub events are handled exclusively via EventSub webhooks
+  // (channel.cheer, channel.subscribe, channel.subscription.gift,
+  //  channel.subscription.message). IRC fallbacks removed to prevent
+  //  duplicate notifications.
+
+  // ── Raids ─────────────────────────────────────────────────────────────
+  client.on('raided', (channel, username, viewers) => {
+    log.info(`[Twitch] Raid: ${username} raided ${channel} with ${viewers} viewers`);
+  });
+
+  // ── Mod / channel actions ─────────────────────────────────────────────
+  client.on('ban', (channel, username, reason, tags) => {
+    log.info(`[Twitch] Ban: ${username} banned in ${channel}${reason ? ` (reason: ${reason})` : ''}`);
+  });
+
+  client.on('timeout', (channel, username, reason, duration, tags) => {
+    log.info(`[Twitch] Timeout: ${username} timed out for ${duration}s in ${channel}${reason ? ` (reason: ${reason})` : ''}`);
+  });
+
+  client.on('messagedeleted', (channel, username, deletedMessage, tags) => {
+    log.info(`[Twitch] Message deleted: [${channel}] ${username}: "${deletedMessage}"`);
+  });
+
+  client.on('clearchat', (channel) => {
+    log.info(`[Twitch] Chat cleared in ${channel}`);
+  });
+
+  // ── Mod list changes ──────────────────────────────────────────────────
+  client.on('mod', (channel, username) => {
+    log.info(`[Twitch] Modded: ${username} in ${channel}`);
+  });
+
+  client.on('unmod', (channel, username) => {
+    log.info(`[Twitch] Unmodded: ${username} in ${channel}`);
+  });
+
+  // ── Channel state changes ─────────────────────────────────────────────
+  client.on('slowmode', (channel, enabled, length) => {
+    log.info(`[Twitch] Slow mode ${enabled ? `enabled (${length}s)` : 'disabled'} in ${channel}`);
+  });
+
+  client.on('subscribers', (channel, enabled) => {
+    log.info(`[Twitch] Subscribers-only mode ${enabled ? 'enabled' : 'disabled'} in ${channel}`);
+  });
+
+  client.on('emoteonly', (channel, enabled) => {
+    log.info(`[Twitch] Emote-only mode ${enabled ? 'enabled' : 'disabled'} in ${channel}`);
+  });
+
+  client.on('followersonly', (channel, enabled, length) => {
+    log.info(`[Twitch] Followers-only mode ${enabled ? `enabled (${length}m)` : 'disabled'} in ${channel}`);
+  });
+
+  client.on('r9kbeta', (channel, enabled) => {
+    log.info(`[Twitch] Unique-chat (r9k) mode ${enabled ? 'enabled' : 'disabled'} in ${channel}`);
+  });
+
+  // ── Hosting (legacy, still fires on some accounts) ────────────────────
+  client.on('hosting', (channel, target, viewers) => {
+    log.info(`[Twitch] Hosting: ${channel} is hosting ${target} (${viewers} viewers)`);
+  });
+
+  client.on('unhost', (channel, viewers) => {
+    log.info(`[Twitch] Unhost: ${channel} stopped hosting`);
+  });
+
+  // ── Connection lifecycle ──────────────────────────────────────────────
+  client.on('join', (channel, username, self) => {
+    if (self) log.info(`[Twitch] Joined channel: ${channel}`);
+  });
+
+  client.on('part', (channel, username, self) => {
+    if (self) log.info(`[Twitch] Left channel: ${channel}`);
+  });
+
+  client.on('reconnect', () => {
+    log.info('[Twitch] Reconnecting…');
+  });
+
+  client.on('disconnected', (reason) => {
+    log.warn('[Twitch] Disconnected:', reason);
+    setTimeout(() => client.connect().catch(log.error), 5000);
+  });
+  await client.connect();
+  log.info('[Twitch] tmi.js client ready');
+  _tmiClient = client;
+  return client;
+}
+// ── Channel point reward management ──────────────────────────────────────
+
+/**
+ * Enable or disable a custom channel point reward by name.
+ * Uses the broadcaster's user OAuth token (helixUserRequest) so it works on
+ * manually-created rewards too, not just ones created by this app's client ID.
+ *
+ * @param {string}  rewardName  Exact display name of the reward
+ * @param {boolean} enabled
+ * @returns {Promise<boolean>}  true if the reward was found and updated
+ */
+async function setRewardEnabled(rewardName, enabled) {
+  try {
+    const broadcasterId = await getBroadcasterId();
+    if (!broadcasterId) {
+      log.warn('[Twitch] setRewardEnabled: could not resolve broadcaster ID');
+      return false;
+    }
+
+    const data = await helixUserRequest(
+      'GET',
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}`
+    );
+    const rewards = data?.data ?? [];
+    const reward  = rewards.find(r => r.title === rewardName);
+
+    if (!reward) {
+      log.warn(`[Twitch] setRewardEnabled: reward not found — "${rewardName}"`);
+      return false;
+    }
+
+    await helixUserRequest(
+      'PATCH',
+      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${reward.id}`,
+      { is_enabled: enabled }
+    );
+    log.info(`[Twitch] Reward "${rewardName}" ${enabled ? 'enabled' : 'disabled'}`);
+    return true;
+  } catch (err) {
+    log.error(`[Twitch] setRewardEnabled("${rewardName}", ${enabled}) failed:`, err.message);
+    return false;
+  }
+}
+
+// ── Stream info update (title, category, tags) ────────────────────────────
+ 
+/**
+ * Update any combination of stream title, category (game), and tags
+ * for the broadcaster's Twitch channel.
+ *
+ * All fields are optional — only the fields you supply will be changed.
+ * Omitting a field leaves it unchanged on Twitch's side because PATCH
+ * /channels ignores missing keys.
+ *
+ * Requires the broadcaster user OAuth token with channel:manage:broadcast.
+ * The token must be in .twitch-tokens.json (written by twitch-auth.js).
+ *
+ * @param {{ title?: string, category?: string, tags?: string[] }} opts
+ *   title    — Stream title (max 140 chars)
+ *   category — Game/category name (e.g. "Just Chatting"). Resolved to a
+ *              game_id via GET /helix/games before the PATCH.
+ *   tags     — Array of free-form tag strings (max 10, each max 25 chars).
+ *              Pass an empty array [] to clear all tags.
+ */
+async function updateStreamInfo({ title, category, tags } = {}) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+ 
+  const body = {};
+ 
+  if (title !== undefined && title !== null) {
+    body.title = String(title).slice(0, 140);
+  }
+ 
+  if (category !== undefined && category !== null && category !== '') {
+    // Resolve category name → game_id
+    const gamesData = await helixRequest('GET', `/games?name=${encodeURIComponent(category)}`);
+    const game = gamesData?.data?.[0];
+    if (!game) throw new Error(`Twitch category not found: "${category}"`);
+    body.game_id = game.id;
+    log.info(`[Twitch] Resolved category "${category}" → game_id ${game.id}`);
+  }
+ 
+  if (tags !== undefined && tags !== null) {
+    // Sanitise: max 10 tags, each trimmed to 25 chars, no empty strings
+    body.tags = tags
+      .map(t => String(t).trim().slice(0, 25))
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+ 
+  if (Object.keys(body).length === 0) {
+    log.warn('[Twitch] updateStreamInfo called with no fields to update');
+    return;
+  }
+ 
+  await helixUserRequest(
+    'PATCH',
+    `/channels?broadcaster_id=${broadcasterId}`,
+    body
+  );
+ 
+  const parts = [
+    body.title    !== undefined ? `title="${body.title}"`          : null,
+    body.game_id  !== undefined ? `category="${category}"`         : null,
+    body.tags     !== undefined ? `tags=[${body.tags.join(', ')}]` : null,
+  ].filter(Boolean);
+  log.info(`[Twitch] Stream info updated: ${parts.join(', ')}`);
 }
 
 module.exports = {
-  id: 'budgetgacha',
-  init,
-  onChatReady,
-  processMessage,
-  triggerPull,
+  say,
+  startTwitch,
+  setupEventSub,
+  getAppToken,
+  handleEventSubNotification,
+  setRewardEnabled,
+  helixUserRequest,
+  getBroadcasterId,
+  updateStreamInfo,
+  modHandlers: {
+    ban:     twitchBan,
+    timeout: twitchTimeout,
+    vip:     twitchVip,
+    unvip:   twitchUnvip,
+  },
 };
+
+// Register mod action handlers with the dashboard so that timeout/ban buttons
+// dispatched from the UI are forwarded to the Twitch platform functions.
+const dashboard = require('./dashboard');
+dashboard.onModerate({
+  ban:     twitchBan,
+  timeout: twitchTimeout,
+});
