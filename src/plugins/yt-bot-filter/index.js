@@ -9,12 +9,12 @@ const log = require('../../logger');
  * don't echo back into #stream-chat.
  *
  * Configured via environment variable:
- *   YT_BOT_USERNAME  — YouTube display name to suppress (default: RedTalksGames)
+ *   YT_BOT_USERNAME  — YouTube display name to suppress (default: RedLifeBot)
  *
  * Only applies to platform === 'youtube'. Twitch messages are unaffected.
  */
 
-const SUPPRESSED = (process.env.YT_BOT_USERNAME ?? 'RedTalksGames').toLowerCase().replace(/^@/, '');
+const SUPPRESSED = (process.env.YT_BOT_USERNAME ?? 'RedLifeBot').toLowerCase().replace(/^@/, '');
 
 async function processMessage(msg) {
   if (msg.platform === 'youtube') {
