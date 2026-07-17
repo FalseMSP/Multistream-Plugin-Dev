@@ -59,8 +59,6 @@ const {
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const DEFAULT_DURATION_MS = 5 * 60 * 1000; // 00:05:00
-const TICK_INTERVAL_MS    = 250;            // server-side tick (only for state
-                                            // sanity + widget fallback)
 
 // ── State ──────────────────────────────────────────────────────────────────
 //
@@ -314,6 +312,18 @@ dashboard.registerWidget('timer', {
       'color:var(--text);font-size:12px;padding:5px 8px;outline:none;font-family:var(--mono);' +
       'box-sizing:border-box;';
 
+    // ── Preserve input across re-renders ────────────────────────────────
+    // The dashboard re-renders this widget on every state push (start / /
+    // pause / reset / set). If the operator is mid-typing a new duration
+    // when one of those pushes arrives, we'd clobber their input. Capture
+    // the current value + selection before innerHTML wipes it, then
+    // restore afterwards.
+    var prevInput     = document.getElementById('timer-set-input');
+    var hadFocus      = !!(prevInput && document.activeElement === prevInput);
+    var prevVal       = prevInput ? prevInput.value       : '';
+    var prevSelStart  = prevInput ? prevInput.selectionStart : 0;
+    var prevSelEnd    = prevInput ? prevInput.selectionEnd   : 0;
+
     el.innerHTML =
       // Big readout
       '<div id="timer-readout" style="font-family:var(--mono);font-weight:700;font-size:38px;' +
@@ -339,6 +349,19 @@ dashboard.registerWidget('timer', {
         ) +
         '<button id="timer-reset-btn" style="' + BTN_BASE + ';flex:1">↺ Reset</button>' +
       '</div>';
+
+    // Restore input value + focus if the operator was typing when the
+    // re-render fired. We deliberately keep their typed text — even if it
+    // differs from the server's current durationMs — because clicking
+    // Start/Pause/Reset shouldn't blow away an unsubmitted Set input.
+    if (hadFocus) {
+      var newInput = document.getElementById('timer-set-input');
+      if (newInput) {
+        newInput.value = prevVal;
+        newInput.focus();
+        try { newInput.setSelectionRange(prevSelStart, prevSelEnd); } catch (_) {}
+      }
+    }
 
     // ── Live ticker ───────────────────────────────────────────────────────
     // The server only pushes state on mutation; the readout needs to tick
@@ -538,19 +561,9 @@ function buildTimerOverlayHtml() {
     -webkit-font-smoothing: antialiased;
   }
 
-  /* Card chrome — same dark, slightly-red-tinted background as the
-     poll/gd-queue overlays so the timer reads as part of the same
-     visual system when layered on the same scene. */
-  .timer-card {
-    display: inline-block;
-    background: rgba(10, 8, 8, 0.82);
-    border: 1px solid rgba(229, 57, 53, 0.30);
-    border-radius: 6px;
-    padding: 14px 28px;
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
-  }
-
+  /* Bare digits on a transparent canvas. No card, no border, no chrome —
+     just a subtle red glow so the timer reads as part of the same overlay
+     system as the combined chat feed. */
   .timer-display {
     font-family: 'Inter', sans-serif;
     font-weight: 700;
@@ -558,58 +571,34 @@ function buildTimerOverlayHtml() {
     letter-spacing: 0.06em;
     color: #f0e0e0;
     text-shadow:
-      0 0 14px rgba(229, 57, 53, 0.30),
-      0 1px 3px rgba(0, 0, 0, 0.9);
+      0 0 14px rgba(229, 57, 53, 0.35),
+      0 0 28px rgba(229, 57, 53, 0.18);
     font-variant-numeric: tabular-nums;
     line-height: 1;
     transition: color 0.3s ease, text-shadow 0.3s ease;
+    display: inline-block;
   }
 
-  /* When the timer is paused, dim + desaturate slightly. */
-  .timer-card.paused .timer-display {
-    color: #8a7a7a;
+  /* Paused — dim and desaturate the glow. */
+  .timer-display.paused {
+    color: #9a8a8a;
     text-shadow:
-      0 0 8px rgba(229, 57, 53, 0.10),
-      0 1px 3px rgba(0, 0, 0, 0.9);
+      0 0 8px rgba(229, 57, 53, 0.12),
+      0 0 18px rgba(229, 57, 53, 0.06);
   }
 
-  /* When the timer has counted past zero, switch to a warmer red and
-     pulse so the operator notices. */
-  .timer-card.over .timer-display {
+  /* Over — warmer red and pulse so the operator notices. */
+  .timer-display.over {
     color: #ff6b6b;
     text-shadow:
       0 0 18px rgba(255, 107, 107, 0.55),
-      0 1px 3px rgba(0, 0, 0, 0.9);
+      0 0 36px rgba(255, 107, 107, 0.28);
     animation: pulseOver 1s ease-in-out infinite;
   }
 
   @keyframes pulseOver {
     0%, 100% { opacity: 1; }
     50%      { opacity: 0.75; }
-  }
-
-  /* Thin progress bar under the digits — fills from full to empty as the
-     countdown progresses, then turns red and stays full when over. */
-  .timer-bar-track {
-    margin-top: 10px;
-    height: 3px;
-    width: 100%;
-    background: rgba(229, 57, 53, 0.15);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-  .timer-bar-fill {
-    height: 100%;
-    background: #e53935;
-    border-radius: 2px;
-    transition: width 0.25s linear, background 0.3s ease;
-  }
-  .timer-card.over .timer-bar-fill {
-    background: #ff6b6b;
-    width: 100% !important;
-  }
-  .timer-card.paused .timer-bar-fill {
-    background: #5a4a4a;
   }
 
   .msg-reconnecting {
@@ -627,17 +616,12 @@ function buildTimerOverlayHtml() {
 </style>
 </head>
 <body>
-<div class="timer-card paused" id="card">
-  <div class="timer-display" id="display">00:00:00</div>
-  <div class="timer-bar-track"><div class="timer-bar-fill" id="bar"></div></div>
-  <div class="msg-reconnecting" id="reconn">⚠ RECONNECTING…</div>
-</div>
+<div class="timer-display paused" id="display">00:00:00</div>
+<div class="msg-reconnecting" id="reconn">⚠ RECONNECTING…</div>
 
 <script>
 (function () {
-  var card    = document.getElementById('card');
   var display = document.getElementById('display');
-  var bar     = document.getElementById('bar');
   var reconn  = document.getElementById('reconn');
 
   // Latest snapshot from the server.
@@ -670,19 +654,8 @@ function buildTimerOverlayHtml() {
     var over = rem < 0;
     var running = !!(latest && latest.running);
 
-    card.classList.toggle('over',   over);
-    card.classList.toggle('paused', !running);
-
-    // Progress bar: 100% → 0% as time elapses; clamped at 0% when over.
-    if (latest && latest.durationMs > 0) {
-      var pct;
-      if (over) {
-        pct = 100;
-      } else {
-        pct = Math.max(0, Math.min(100, (rem / latest.durationMs) * 100));
-      }
-      bar.style.width = pct + '%';
-    }
+    display.classList.toggle('over',   over);
+    display.classList.toggle('paused', !running);
   }
 
   function tick() { render(); requestAnimationFrame(tick); }
@@ -717,18 +690,15 @@ addRoute('/timer', (_req, res) => {
   res.end(buildTimerOverlayHtml());
 });
 
-// ── Periodic re-broadcast ──────────────────────────────────────────────────
+// ── No periodic re-broadcast ───────────────────────────────────────────────
 //
-// The overlay computes its own tick client-side (no server round-trip per
-// second), but we re-push the snapshot every TICK_INTERVAL_MS anyway. This
-// keeps the dashboard widget's badge text ("RUNNING" / "PAUSED") in sync
-// even if a state mutation happens to race an SSE flush, and it lets the
-// server-side _snapshot()'s remainingMs field stay fresh for any
-// dashboard client that just connected.
-//
-// Rate-limited to 4Hz so it doesn't dominate the SSE stream.
-
-setInterval(_notify, TICK_INTERVAL_MS);
+// The overlay and dashboard widget both tick CLIENT-SIDE from the latest
+// cached snapshot (no server round-trip per second), so we deliberately do
+// NOT re-push state on a timer. State is only pushed on actual mutations
+// (set / start / pause / resume / reset). This prevents the dashboard
+// widget's input field from being clobbered every 250ms while the operator
+// is typing a new duration — see the input-preservation block in
+// registerWidget('timer').render for the second half of that fix.
 
 // ── Plugin export ──────────────────────────────────────────────────────────
 
