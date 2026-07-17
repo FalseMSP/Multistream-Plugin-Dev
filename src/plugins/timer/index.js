@@ -562,35 +562,50 @@ function buildTimerOverlayHtml() {
   }
 
   /* Bare digits on a transparent canvas. No card, no border, no chrome —
-     just a subtle red glow so the timer reads as part of the same overlay
-     system as the combined chat feed. */
+     just a subtle red glow on top of a faint dark contrast layer so the
+     text stays readable on any background (bright gameplay scene or
+     dark menu). */
   .timer-display {
     font-family: 'Inter', sans-serif;
     font-weight: 700;
     font-size: 64px;
     letter-spacing: 0.06em;
-    color: #f0e0e0;
+    color: #ffffff;
     text-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.95),
+      0 0 6px rgba(0, 0, 0, 0.55),
       0 0 14px rgba(229, 57, 53, 0.35),
       0 0 28px rgba(229, 57, 53, 0.18);
     font-variant-numeric: tabular-nums;
     line-height: 1;
     transition: color 0.3s ease, text-shadow 0.3s ease;
-    display: inline-block;
+    /* Pin to top-left of the OBS browser source so it always renders
+       inside the visible canvas regardless of how the operator sizes
+       the source. The operator can still transform-position the whole
+       source from inside OBS. */
+    position: absolute;
+    top: 0;
+    left: 0;
+    white-space: nowrap;
   }
 
-  /* Paused — dim and desaturate the glow. */
+  /* Paused — dim the digits but keep the contrast shadow so it stays
+     readable. */
   .timer-display.paused {
-    color: #9a8a8a;
+    color: #c8b8b8;
     text-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.95),
+      0 0 6px rgba(0, 0, 0, 0.55),
       0 0 8px rgba(229, 57, 53, 0.12),
       0 0 18px rgba(229, 57, 53, 0.06);
   }
 
   /* Over — warmer red and pulse so the operator notices. */
   .timer-display.over {
-    color: #ff6b6b;
+    color: #ff8a8a;
     text-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.95),
+      0 0 6px rgba(0, 0, 0, 0.55),
       0 0 18px rgba(255, 107, 107, 0.55),
       0 0 36px rgba(255, 107, 107, 0.28);
     animation: pulseOver 1s ease-in-out infinite;
@@ -690,15 +705,25 @@ addRoute('/timer', (_req, res) => {
   res.end(buildTimerOverlayHtml());
 });
 
-// ── No periodic re-broadcast ───────────────────────────────────────────────
+// ── Slow heartbeat re-broadcast ───────────────────────────────────────────
 //
 // The overlay and dashboard widget both tick CLIENT-SIDE from the latest
-// cached snapshot (no server round-trip per second), so we deliberately do
-// NOT re-push state on a timer. State is only pushed on actual mutations
-// (set / start / pause / resume / reset). This prevents the dashboard
-// widget's input field from being clobbered every 250ms while the operator
-// is typing a new duration — see the input-preservation block in
-// registerWidget('timer').render for the second half of that fix.
+// cached snapshot (no server round-trip per second), so we don't need a
+// high-frequency push. We DO re-broadcast every 2 seconds as a heartbeat
+// so that:
+//   • a freshly-loaded OBS browser source picks up the current state
+//     quickly (the SSE handler also sends initial state on connect, but
+//     a missed first frame would otherwise leave the overlay stuck at
+//     00:00:00 until the next operator action)
+//   • the dashboard widget's RUNNING / PAUSED badge stays in sync even
+//     if a state-mutation SSE message is dropped on the wire
+//
+// 2 seconds is slow enough that the input-preservation logic in the
+// dashboard widget's render() function easily absorbs the re-renders
+// without clobbering the operator's in-progress duration input.
+
+const HEARTBEAT_INTERVAL_MS = 2000;
+setInterval(_notify, HEARTBEAT_INTERVAL_MS);
 
 // ── Plugin export ──────────────────────────────────────────────────────────
 
