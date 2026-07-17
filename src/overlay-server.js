@@ -131,6 +131,130 @@ function updatePollOverlay(data) {
   _broadcast({ type: 'poll', data });
 }
 
+// ── External chat/redeem API ──────────────────────────────────────────────
+//
+// External integrations (e.g. the ViewersHateMe Minecraft mod) need a
+// pull-based way to consume chat messages + redeems that have already
+// passed through the plugin pipeline. SSE works for browsers but is
+// awkward from a Java HTTP client, so we expose simple JSON polling
+// endpoints with a monotonic id cursor.
+//
+//   GET /api/chat?since=<id>&limit=<n>     → newest chat messages
+//   GET /api/redeems?since=<id>&limit=<n>  → newest redeems
+//   GET /api/state                         → server uptime + buffer sizes
+//
+// Messages are buffered in a small ring (default 1000 entries) so brief
+// poll gaps don't lose data. Producers call pushExternalChatMessage() /
+// pushExternalRedeem() — wired up from queue.onMessage / queue.onRedeem
+// in index.js.
+
+const EXTERNAL_BUFFER_MAX = 1000;
+
+/** @type {Array<{ id: number, platform: string, username: string, message: string, timestamp: number }>} */
+const _externalChatBuffer = [];
+/** @type {Array<{ id: number, platform: string, username: string, title: string, cost: number, input: string|null, timestamp: number }>} */
+const _externalRedeemBuffer = [];
+
+let _externalSeq = 0;
+const _externalStartedAt = Date.now();
+
+/**
+ * Append a chat message to the external API ring buffer.
+ * Producers (queue.onMessage) call this with the post-pipeline message.
+ *
+ * @param {{ platform: string, username: string, message: string }} msg
+ */
+function pushExternalChatMessage(msg) {
+  const entry = {
+    id:        ++_externalSeq,
+    platform:  String(msg.platform ?? ''),
+    username:  String(msg.username ?? ''),
+    message:   String(msg.message ?? ''),
+    timestamp: Date.now(),
+  };
+  _externalChatBuffer.push(entry);
+  if (_externalChatBuffer.length > EXTERNAL_BUFFER_MAX) {
+    _externalChatBuffer.splice(0, _externalChatBuffer.length - EXTERNAL_BUFFER_MAX);
+  }
+  return entry.id;
+}
+
+/**
+ * Append a redeem to the external API ring buffer.
+ * Producers (queue.onRedeem) call this. Redeems from the YouTube sync
+ * plugin arrive with a "[YT]" suffix on the title and no platform field,
+ * so we normalise: platform = 'youtube' if the title ends with [YT],
+ * otherwise 'twitch'.
+ *
+ * @param {{ username: string, title: string, cost?: number, input?: string|null, platform?: string }} redeem
+ */
+function pushExternalRedeem(redeem) {
+  let platform = redeem.platform;
+  let title    = String(redeem.title ?? '');
+  if (!platform) {
+    const m = title.match(/\s*\[YT\]\s*$/i);
+    if (m) {
+      platform = 'youtube';
+      title = title.slice(0, m.index);
+    } else {
+      platform = 'twitch';
+    }
+  }
+  const entry = {
+    id:        ++_externalSeq,
+    platform:  String(platform),
+    username:  String(redeem.username ?? ''),
+    title:     title.trim(),
+    cost:      Number(redeem.cost ?? 0),
+    input:     redeem.input ?? null,
+    timestamp: Date.now(),
+  };
+  _externalRedeemBuffer.push(entry);
+  if (_externalRedeemBuffer.length > EXTERNAL_BUFFER_MAX) {
+    _externalRedeemBuffer.splice(0, _externalRedeemBuffer.length - EXTERNAL_BUFFER_MAX);
+  }
+  return entry.id;
+}
+
+/**
+ * Drain entries from a buffer with id > since, capped at limit.
+ * Returns the entries in ascending id order (oldest first).
+ * @template T
+ * @param {T[]} buffer
+ * @param {number} since
+ * @param {number} limit
+ * @returns {T[]}
+ */
+function _drainSince(buffer, since, limit) {
+  const start = since > 0 ? since : 0;
+  // Linear scan is fine — buffer is capped at EXTERNAL_BUFFER_MAX.
+  const out = [];
+  for (const entry of buffer) {
+    if (entry.id <= start) continue;
+    out.push(entry);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
+ * Parse the `since` and `limit` query params from a request URL.
+ * Defaults: since = 0 (all buffered), limit = 100.
+ * @param {string} fullUrl
+ * @returns {{ since: number, limit: number }}
+ */
+function _parseCursor(fullUrl) {
+  try {
+    const q = fullUrl.split('?')[1] ?? '';
+    const params = new URLSearchParams(q);
+    const since  = Math.max(0, parseInt(params.get('since') ?? '0', 10) || 0);
+    const limit  = Math.min(500, Math.max(1, parseInt(params.get('limit') ?? '100', 10) || 100));
+    return { since, limit };
+  } catch {
+    return { since: 0, limit: 100 };
+  }
+}
+
 // ── Poll overlay HTML ─────────────────────────────────────────────────────
 
 function _buildPollHtml() {
@@ -691,6 +815,67 @@ function startOverlayServer(port = 2999) {
       return;
     }
 
+    // ── External chat/redeem API ─────────────────────────────────────────
+    // Pull-based JSON endpoints for out-of-process consumers (e.g. the
+    // ViewersHateMe Minecraft Fabric mod). See pushExternalChatMessage /
+    // pushExternalRedeem above for the producer side.
+    if (req.method === 'GET' && url === '/api/chat') {
+      const { since, limit } = _parseCursor(req.url);
+      const messages = _drainSince(_externalChatBuffer, since, limit);
+      const lastId   = messages.length ? messages[messages.length - 1].id : since;
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        since,
+        lastId,
+        count: messages.length,
+        messages,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/api/redeems') {
+      const { since, limit } = _parseCursor(req.url);
+      const redeems = _drainSince(_externalRedeemBuffer, since, limit);
+      const lastId  = redeems.length ? redeems[redeems.length - 1].id : since;
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        since,
+        lastId,
+        count: redeems.length,
+        redeems,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/api/state') {
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        startedAt:        _externalStartedAt,
+        uptimeMs:         Date.now() - _externalStartedAt,
+        lastSeq:          _externalSeq,
+        chatBuffered:     _externalChatBuffer.length,
+        redeemBuffered:   _externalRedeemBuffer.length,
+        chatBufferMax:    EXTERNAL_BUFFER_MAX,
+        redeemBufferMax:  EXTERNAL_BUFFER_MAX,
+      }));
+      return;
+    }
+
     // Plugin-registered extra routes
     const extraHandler = _extraRoutes.get(url);
     if (extraHandler) {
@@ -860,6 +1045,12 @@ module.exports = {
   // Public helper — plugins that need a standalone OBS page for their
   // section should use this instead of reaching into _getSectionMeta/_Data.
   buildStandaloneSectionPage,
+  // External chat/redeem API — producers (queue.onMessage / queue.onRedeem
+  // wired in index.js) call these to feed the JSON polling endpoints
+  // (/api/chat, /api/redeems, /api/state) that out-of-process clients
+  // (e.g. the ViewersHateMe Minecraft mod) consume.
+  pushExternalChatMessage,
+  pushExternalRedeem,
   // Legacy private helpers — kept for backward compat, prefer
   // buildStandaloneSectionPage() for new code.
   _getSectionMeta,

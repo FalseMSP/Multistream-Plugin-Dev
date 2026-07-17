@@ -23,6 +23,10 @@ const log                 = require('./src/logger');
 const plugins             = require('./src/plugins/index');
 
 const { startOverlayServer } = require('./src/overlay-server');
+const {
+  pushExternalChatMessage,
+  pushExternalRedeem,
+} = require('./src/overlay-server');
 const dashboard = require('./src/dashboard');
 
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
@@ -65,6 +69,12 @@ async function main() {
   //    plugin pipeline — msg is the filtered finalMsg, suppressed messages
   //    never arrive.
   queue.onMessage(async (msg) => {
+    // Feed the external pull API (GET /api/chat) so out-of-process
+    // consumers (e.g. the ViewersHateMe Minecraft mod) can poll for new
+    // chat messages with a monotonic id cursor. We push BEFORE routing
+    // to Discord/dashboard so the API never lags behind the embeds.
+    try { pushExternalChatMessage(msg); } catch (e) { log.error('[external-api] pushExternalChatMessage:', e.message); }
+
     // Subscribe/membership events have no chat text — build a simple announcement.
     if (msg.type === 'subscribe') {
       const name = msg.username ?? 'Someone';
@@ -86,7 +96,11 @@ async function main() {
     discord.sendChat(msg);
     dashboard.pushChatMessage(msg);
   });
-  queue.onRedeem((redeem)    => discord.sendRedeem(redeem));
+  queue.onRedeem((redeem)    => {
+    // Mirror redeems into the external pull API (GET /api/redeems).
+    try { pushExternalRedeem(redeem); } catch (e) { log.error('[external-api] pushExternalRedeem:', e.message); }
+    discord.sendRedeem(redeem);
+  });
   queue.onDonation((donation) => discord.sendDonation(donation));
 
   // 4. Wire mod action handlers: Discord /ban /vip → Twitch & YouTube
