@@ -259,11 +259,12 @@ function onModAction(action, fn) {
 async function startDiscordBot() {
   const plugins = require('./plugins/index');
 
-  // Single shared object — plugins can wrap api.sendRedeem and the queue
-  // will always call the current (possibly wrapped) version at call-time.
+  // Public API surface plugins receive via init({ discord, ... }).
+  // Note: we no longer call plugins.initPlugins() here — index.js does that
+  // once, with the full runtime context (queue + twitch + youtube + this api).
+  // The `api` object is intentionally shared by reference so plugins that
+  // need the raw discord.js Client after login can read api.client.
   const api = { sendChat, sendRedeem, sendDonation, registerCommands, onModAction };
-
-  plugins.initPlugins(api);
 
   if (!BOT_TOKEN) {
     log.warn('DISCORD_BOT_TOKEN not set — slash commands disabled. Webhooks still active.');

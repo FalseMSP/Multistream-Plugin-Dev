@@ -113,10 +113,12 @@ async function processMessage(msg) {
     : 'No commands registered yet.';
 
   let send;
-  if (msg.platform === 'youtube' && msg.videoId && _chatReply._youtubeSession) {
-    // Reply only to the stream this command came from
+  if (msg.platform === 'youtube' && msg.videoId && _chatReply.youtubeSession) {
+    // Reply only to the stream this command came from — uses the documented
+    // chatReply.youtubeSession(videoId, text) contract instead of the old
+    // underscore-prefixed _youtubeSession backdoor.
     const videoId = msg.videoId;
-    send = (text) => _chatReply._youtubeSession(videoId, text);
+    send = (text) => _chatReply.youtubeSession(videoId, text);
   } else {
     send = _chatReply[msg.platform];
   }
@@ -158,14 +160,15 @@ async function handleInteraction(interaction) {
 // ── Export ────────────────────────────────────────────────────────────────────
 
 /**
- * When wiring up chat replies, pass `_youtubeSession: youtube.sayTo` so that
- * YouTube commands reply only to the stream they came from:
+ * The chatReply contract (set via onChatReady) is:
  *
- *   plugin.onChatReady({
- *     twitch:          (text) => twitch.say(text),
- *     youtube:         (text) => youtube.say(text),   // broadcast fallback (unused by this plugin)
- *     _youtubeSession: (videoId, text) => youtube.sayTo(videoId, text),
- *   });
+ *   {
+ *     twitch:         (text) => void,                  // broadcast to primary Twitch channel
+ *     youtube:        (text) => void,                  // broadcast to all live YT sessions
+ *     youtubeSession: (videoId, text) => void,         // target one specific YT live stream
+ *   }
+ *
+ * The youtubeSession field is set by index.js once the YouTube module is ready.
  */
 
 module.exports = {

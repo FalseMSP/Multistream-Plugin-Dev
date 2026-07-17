@@ -19,9 +19,9 @@
  * ── Twitch reward sync ────────────────────────────────────────────────────────
  *   Rewards are scraped from the Twitch Helix API on demand via:
  *     Discord slash command:  /sync-rewards
- *   Requires TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BROADCASTER_LOGIN,
- *   and a broadcaster OAuth token in .twitch-tokens.json (written by twitch-auth.js).
- *   The channel:read:redemptions scope must be granted — run twitch-auth.js if needed.
+ *   Uses the twitch module's listRewards() public API (no Helix plumbing in
+ *   this file). The broadcaster OAuth token in .twitch-tokens.json (written by
+ *   twitch-auth.js) must carry channel:read:redemptions scope.
  *
  *   When a YouTube viewer redeems a Twitch-sourced reward:
  *     1. Confirmed in YouTube chat: "✅ {user} redeemed {reward}!"
@@ -57,11 +57,10 @@
  *   /yt-rewards list|add|remove
  *
  * ── Required env vars ─────────────────────────────────────────────────────────
- *   TWITCH_CLIENT_ID
- *   TWITCH_CLIENT_SECRET
- *   TWITCH_BROADCASTER_LOGIN
- *   (broadcaster OAuth token in .twitch-tokens.json — run twitch-auth.js once
- *    with scope channel:read:redemptions to enable reward scraping)
+ *   (None directly. Twitch reward sync uses the shared twitch module, which
+ *    handles its own env vars. The broadcaster OAuth token must be in
+ *    .twitch-tokens.json — run twitch-auth.js once with scope
+ *    channel:read:redemptions to enable reward scraping.)
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
@@ -69,14 +68,6 @@ const fs   = require('fs');
 const path = require('path');
 const log  = require('../../logger');
 const commandsList = require('../commands-list');
-let _youtube = null;
-function _getYoutube() {
-  if (!_youtube) {
-    try { _youtube = require('../../youtube'); }
-    catch (err) { log.warn('[yt-points] Could not require youtube module:', err.message); }
-  }
-  return _youtube;
-}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -89,109 +80,19 @@ const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
 const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
 const CMD_REWARDS = /^!(rewards|shop)\s*$/i;
 
-// ─── Twitch Helix helpers ─────────────────────────────────────────────────────
-// Self-contained — we don't import twitch.js to avoid tight coupling.
+const POINTS_FILE = path.resolve('.yt-points.json');
 
-const TWITCH_CLIENT_ID     = process.env.TWITCH_CLIENT_ID     ?? '';
-const TWITCH_CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET ?? '';
-const TWITCH_BROADCASTER   = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
-const TOKEN_FILE           = path.resolve('.twitch-tokens.json');
-const POINTS_FILE          = path.resolve('.yt-points.json');
+// ─── Plugin context (set in init) ────────────────────────────────────────────
+//
+// We require the twitch + queue modules via the init(context) interface
+// rather than reaching into them directly. This is the documented way for
+// plugins to access shared main-module functionality. The previous version
+// reimplemented ~150 lines of Helix token + reward-list plumbing inline;
+// those have all been replaced by calls to twitch.listRewards() and
+// twitch.getBroadcasterId().
 
-let _appToken       = null;
-let _appTokenExpiry = 0;
-
-async function _getAppToken() {
-  if (_appToken && Date.now() < _appTokenExpiry) return _appToken;
-  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET) return null;
-
-  const res  = await fetch(
-    `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${TWITCH_CLIENT_SECRET}&grant_type=client_credentials`,
-    { method: 'POST' }
-  );
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Twitch app token failed: ${JSON.stringify(data)}`);
-  _appToken       = data.access_token;
-  _appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  return _appToken;
-}
-
-/**
- * Load (and auto-refresh) the broadcaster's user OAuth token from
- * .twitch-tokens.json. Requires channel:read:redemptions scope —
- * run twitch-auth.js once to grant it.
- */
-let _userTokenCache = null;
-
-async function _getUserToken() {
-  if (!_userTokenCache) {
-    if (!fs.existsSync(TOKEN_FILE)) return null;
-    try {
-      _userTokenCache = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-    } catch {
-      log.warn('[yt-points] Could not read .twitch-tokens.json');
-      return null;
-    }
-  }
-
-  if (Date.now() >= (_userTokenCache.expires_at ?? 0)) {
-    log.info('[yt-points] Broadcaster token expired — refreshing…');
-    try {
-      const res  = await fetch('https://id.twitch.tv/oauth2/token', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    new URLSearchParams({
-          grant_type:    'refresh_token',
-          refresh_token: _userTokenCache.refresh_token,
-          client_id:     TWITCH_CLIENT_ID,
-          client_secret: TWITCH_CLIENT_SECRET,
-        }),
-      });
-      const data = await res.json();
-      if (!data.access_token) throw new Error(JSON.stringify(data));
-      _userTokenCache = {
-        access_token:  data.access_token,
-        refresh_token: data.refresh_token ?? _userTokenCache.refresh_token,
-        expires_at:    Date.now() + (data.expires_in - 60) * 1000,
-        scopes:        data.scope ?? _userTokenCache.scopes,
-      };
-      fs.writeFileSync(TOKEN_FILE, JSON.stringify(_userTokenCache, null, 2));
-      log.info('[yt-points] Broadcaster token refreshed.');
-    } catch (err) {
-      log.error('[yt-points] Token refresh failed:', err.message);
-      _userTokenCache = null;
-      return null;
-    }
-  }
-
-  return _userTokenCache.access_token;
-}
-
-/**
- * @param {string}  pathAndQuery  e.g. '/channel_points/custom_rewards?broadcaster_id=...'
- * @param {boolean} useUserToken  true = broadcaster OAuth, false = app token
- */
-async function _helixGet(pathAndQuery, useUserToken = false) {
-  const token = useUserToken ? await _getUserToken() : await _getAppToken();
-  if (!token) throw new Error('No Twitch token available');
-
-  const res = await fetch(`https://api.twitch.tv/helix${pathAndQuery}`, {
-    headers: {
-      'Client-ID':     TWITCH_CLIENT_ID,
-      'Authorization': `Bearer ${token}`,
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Helix ${res.status}: ${text}`);
-  }
-  return res.json();
-}
-
-async function _getBroadcasterId() {
-  const data = await _helixGet(`/users?login=${TWITCH_BROADCASTER}`);
-  return data?.data?.[0]?.id ?? null;
-}
+let _twitch = null;
+let _queue  = null;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -234,7 +135,7 @@ let _streamActive = false;
 const _redeemedThisStream = new Set();
 
 let _chatReply = { twitch: null, youtube: null };
-let _queue     = null; // set in init()
+// _queue is declared above (with _twitch) — captured from init(context).
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -304,27 +205,19 @@ function _loadPoints() {
  *   2. Calls queue.pushRedeem() so it appears in #redeem-feed like a real
  *      Twitch redemption, with "[YT]" appended to the title.
  *
+ * Uses twitch.listRewards() from the main twitch module (exposed via
+ * init(context)) — no Helix token plumbing reimplemented locally.
+ *
  * @returns {Promise<number>} number of rewards synced
  */
 async function syncTwitchRewards() {
-  if (!TWITCH_CLIENT_ID || !TWITCH_CLIENT_SECRET || !TWITCH_BROADCASTER) {
-    throw new Error(
-      'TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, and TWITCH_BROADCASTER_LOGIN must all be set in .env'
-    );
+  if (!_twitch) {
+    throw new Error('twitch module not in init context — cannot sync rewards');
   }
 
-  const broadcasterId = await _getBroadcasterId();
-  if (!broadcasterId) {
-    throw new Error(`Could not resolve Twitch broadcaster ID for "${TWITCH_BROADCASTER}"`);
-  }
-
-  // channel:read:redemptions requires the broadcaster's user token, not the app token
-  let data;
+  let twitchRewards;
   try {
-    data = await _helixGet(
-      `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=false`,
-      true // useUserToken
-    );
+    twitchRewards = await _twitch.listRewards({ force: true });
   } catch (err) {
     if (err.message.includes('401') || err.message.includes('403')) {
       throw new Error(
@@ -334,8 +227,6 @@ async function syncTwitchRewards() {
     }
     throw err;
   }
-
-  const twitchRewards = data?.data ?? [];
 
   // Clear previously-synced Twitch rewards before importing fresh ones
   for (const [key, reward] of _rewards) {
@@ -496,20 +387,25 @@ function init(context) {
   // Load persisted balances before anything else
   _loadPoints();
 
-  // Capture queue so reward handlers can call pushRedeem()
-  try {
-    _queue = require('../../queue');
-  } catch {
-    log.warn('[yt-points] Could not require queue — pushRedeem will be unavailable.');
+  // Capture twitch + queue from the documented init(context) interface.
+  // Previously this plugin reached into '../../queue' directly and
+  // reimplemented Helix token plumbing inline — both are now gone.
+  _twitch = context.twitch ?? null;
+  _queue  = context.queue  ?? null;
+
+  if (!_queue) {
+    log.warn('[yt-points] queue not in init context — pushRedeem will be unavailable.');
+  }
+  if (!_twitch) {
+    log.warn('[yt-points] twitch not in init context — Twitch reward sync disabled.');
+    return;
   }
 
-  if (TWITCH_CLIENT_ID && TWITCH_CLIENT_SECRET && TWITCH_BROADCASTER) {
-    syncTwitchRewards()
-      .then(count => log.info(`[yt-points] Auto-synced ${count} Twitch reward(s) on startup.`))
-      .catch(err  => log.warn('[yt-points] Auto-sync failed:', err.message));
-  } else {
-    log.warn('[yt-points] Skipping auto-sync — Twitch env vars not set.');
-  }
+  // Auto-sync Twitch rewards on startup. The twitch module handles all the
+  // token / broadcaster-id resolution; we just consume the reward list.
+  syncTwitchRewards()
+    .then(count => log.info(`[yt-points] Auto-synced ${count} Twitch reward(s) on startup.`))
+    .catch(err  => log.warn('[yt-points] Auto-sync failed:', err.message));
 }
 
 // yt-points/index.js  —  onChatReady patch
@@ -534,13 +430,17 @@ async function processMessage(msg) {
   const username = (msg.username ?? msg.author ?? 'unknown').toLowerCase();
   const text     = (msg.message ?? '').trim();
   const videoId  = msg.videoId;
-  const yt       = _getYoutube();
-  const send     = (videoId && yt?.sayTo)
-    ? (replyText) => yt.sayTo(videoId, replyText)
-    : (() => {
-        log.warn(`[yt-points] No videoId on message — skipping reply to avoid broadcasting to all chats. username=${username}`);
-        return Promise.resolve();
-      });
+  // Use the documented per-session chat reply contract:
+  //   chatReply.youtubeSession(videoId, text)
+  // Falls back to no-op (with a warning) if the message doesn't carry a
+  // videoId or the contract isn't wired up yet.
+  const sessionSend = (videoId && _chatReply.youtubeSession)
+    ? (replyText) => _chatReply.youtubeSession(videoId, replyText)
+    : null;
+  const send = sessionSend ?? (() => {
+    log.warn(`[yt-points] No videoId on message — skipping reply to avoid broadcasting to all chats. username=${username}`);
+    return Promise.resolve();
+  });
   const now      = Date.now();
 
   // ── Passive earn (1 pt per message, cooldown-gated) ──────────────────────

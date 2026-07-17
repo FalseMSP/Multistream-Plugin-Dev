@@ -30,8 +30,10 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { addRoute, updateSection, registerSection } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
-const queue = require('../../queue');
 const log = require('../../logger');
+
+// queue is injected via init(context) — see init() below.
+let _queue = null;
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
@@ -296,11 +298,12 @@ async function handleInteraction(interaction) {
 
 // ─── Plugin entry point ───────────────────────────────────────────────────────
 
-function init(_context) {
-  if (!queue?.onDonation) {
-    log.warn('[tnt-tracker] queue.onDonation not available — Twitch events will not be tracked.');
+function init(context) {
+  _queue = context.queue;
+  if (!_queue?.onDonation) {
+    log.warn('[tnt-tracker] queue not in init context — Twitch events will not be tracked.');
   } else {
-    queue.onDonation(donation => {
+    _queue.onDonation(donation => {
       const { type, platform, username, quantity } = donation ?? {};
       if (platform !== 'twitch') return;
 
@@ -331,10 +334,10 @@ function init(_context) {
   // (direct subscriber event, if your youtube.js emits one), and logs the full
   // message shape the first time it sees an unrecognised YouTube event so you can
   // confirm the exact type string your youtube.js uses.
-  if (!queue?.onMessage) {
+  if (!_queue?.onMessage) {
     log.warn('[tnt-tracker] queue.onMessage not available — YouTube events will not be tracked.');
   } else {
-    queue.onMessage(msg => {
+    _queue.onMessage(msg => {
       const { type, platform, username } = msg ?? {};
       if (platform !== 'youtube') return;
 

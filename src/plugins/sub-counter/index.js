@@ -15,12 +15,9 @@
  * Updates are debounced: rapid bursts are coalesced into a single rename,
  * and a minimum interval is enforced between API calls per channel.
  *
- * Required env vars:
- *   YT_API_KEY            — YouTube Data API v3 key (shared with youtube.js)
- *   YT_CHANNEL_ID         — YouTube channel ID     (shared with youtube.js)
- *   TWITCH_CLIENT_ID      — Twitch app client ID   (shared with twitch.js)
- *   TWITCH_CLIENT_SECRET  — Twitch app secret      (shared with twitch.js)
- *   TWITCH_BROADCASTER_LOGIN — Twitch broadcaster login (shared with twitch.js)
+ * Uses the twitch and youtube modules' public APIs (getFollowerCount /
+ * getSubscriberCount) via init(context) — no Helix or YouTube Data API
+ * plumbing reimplemented locally.
  *
  * Voice channel IDs:
  *   YouTube subs:    1503249335884841060  →  "📊 Subs: 1,234"
@@ -193,28 +190,12 @@ function _scheduleRename(channelId, count) {
 // ── YouTube ───────────────────────────────────────────────────────────────────
 
 async function _fetchYtSubCount() {
-  const apiKey    = process.env.YT_API_KEY;
-  const channelId = process.env.YT_CHANNEL_ID;
-
-  if (!apiKey || !channelId) {
-    log.warn('[sub-counter] YT_API_KEY or YT_CHANNEL_ID not set — cannot fetch initial count');
+  if (!_youtube) {
+    log.warn('[sub-counter] youtube module not in init context — cannot fetch YT sub count');
     return null;
   }
-
   try {
-    const url = `https://www.googleapis.com/youtube/v3/channels?part=statistics&id=${channelId}&key=${apiKey}`;
-    const res  = await fetch(url);
-    if (!res.ok) {
-      log.warn(`[sub-counter] YouTube API error ${res.status} fetching subscriber count`);
-      return null;
-    }
-    const data = await res.json();
-    const raw  = data?.items?.[0]?.statistics?.subscriberCount;
-    if (raw == null) {
-      log.warn('[sub-counter] Subscriber count missing from API response');
-      return null;
-    }
-    return parseInt(raw, 10);
+    return await _youtube.getSubscriberCount();
   } catch (err) {
     log.error('[sub-counter] Failed to fetch YouTube subscriber count:', err.message);
     return null;
@@ -223,79 +204,13 @@ async function _fetchYtSubCount() {
 
 // ── Twitch ────────────────────────────────────────────────────────────────────
 
-/**
- * Fetch a Twitch app access token (client credentials).
- * We get our own here rather than importing from twitch.js to keep this
- * plugin self-contained.
- */
-let _twAppToken       = null;
-let _twAppTokenExpiry = 0;
-
-async function _getTwitchAppToken() {
-  if (_twAppToken && Date.now() < _twAppTokenExpiry) return _twAppToken;
-
-  const clientId     = process.env.TWITCH_CLIENT_ID;
-  const clientSecret = process.env.TWITCH_CLIENT_SECRET;
-  if (!clientId || !clientSecret) return null;
-
-  try {
-    const res  = await fetch(
-      `https://id.twitch.tv/oauth2/token?client_id=${clientId}&client_secret=${clientSecret}&grant_type=client_credentials`,
-      { method: 'POST' }
-    );
-    const data = await res.json();
-    if (!data.access_token) throw new Error(JSON.stringify(data));
-    _twAppToken       = data.access_token;
-    _twAppTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-    return _twAppToken;
-  } catch (err) {
-    log.error('[sub-counter] Failed to get Twitch app token:', err.message);
-    return null;
-  }
-}
-
 async function _fetchTwitchFollowerCount() {
-  const clientId   = process.env.TWITCH_CLIENT_ID;
-  const broadcaster = (process.env.TWITCH_BROADCASTER_LOGIN ?? '').trim();
-
-  if (!clientId || !broadcaster) {
-    log.warn('[sub-counter] TWITCH_CLIENT_ID or TWITCH_BROADCASTER_LOGIN not set — cannot fetch follower count');
+  if (!_twitch) {
+    log.warn('[sub-counter] twitch module not in init context — cannot fetch follower count');
     return null;
   }
-
   try {
-    const appToken = await _getTwitchAppToken();
-    if (!appToken) return null;
-
-    // First resolve broadcaster login → ID
-    const userRes  = await fetch(
-      `https://api.twitch.tv/helix/users?login=${broadcaster}`,
-      { headers: { 'Client-ID': clientId, 'Authorization': `Bearer ${appToken}` } }
-    );
-    const userData = await userRes.json();
-    const broadcasterId = userData?.data?.[0]?.id;
-    if (!broadcasterId) {
-      log.warn('[sub-counter] Could not resolve Twitch broadcaster ID');
-      return null;
-    }
-
-    // /channels/followers returns total in the pagination object
-    const res  = await fetch(
-      `https://api.twitch.tv/helix/channels/followers?broadcaster_id=${broadcasterId}&first=1`,
-      { headers: { 'Client-ID': clientId, 'Authorization': `Bearer ${appToken}` } }
-    );
-    if (!res.ok) {
-      const text = await res.text();
-      log.warn(`[sub-counter] Twitch followers API error ${res.status}: ${text}`);
-      return null;
-    }
-    const data = await res.json();
-    const total = data?.total;
-    if (total == null) {
-      log.warn('[sub-counter] Follower count missing from Twitch API response');
-      return null;
-    }
-    return total;
+    return await _twitch.getFollowerCount();
   } catch (err) {
     log.error('[sub-counter] Failed to fetch Twitch follower count:', err.message);
     return null;
@@ -304,25 +219,37 @@ async function _fetchTwitchFollowerCount() {
 
 // ── Plugin lifecycle ──────────────────────────────────────────────────────────
 
+// Captured from init(context). _twitch + _youtube are the main-module refs
+// exposed via the documented init contract; _client is the discord.js Client
+// (attached to context.discord.client after the bot logs in).
+let _twitch  = null;
+let _youtube = null;
+
 function init(context) {
-  _client = context?.client ?? null;
+  _twitch  = context.twitch  ?? null;
+  _youtube = context.youtube ?? null;
+  _client  = context?.discord?.client ?? context?.client ?? null;
 
   function _whenReady(cb) {
     if (_client?.isReady?.()) { cb(); return; }
     if (_client) { _client.once('ready', cb); return; }
+    // Poll for the discord client to be attached after login. The discord
+    // module sets api.client = client inside startDiscordBot after login
+    // completes, so we read it back via the same context reference.
     const poll = setInterval(() => {
-      if (!context?.client) return;
-      _client = context.client;
+      const client = context?.discord?.client ?? context?.client;
+      if (!client) return;
+      _client = client;
       clearInterval(poll);
       if (_client.isReady()) cb();
       else _client.once('ready', cb);
     }, 500);
   }
 
-  const queue = require('../../queue');
+  const queue = context.queue;
 
   if (!queue?.onMessage) {
-    log.warn('[sub-counter] queue.onMessage not available — no events will be received.');
+    log.warn('[sub-counter] queue not in init context — no events will be received.');
   } else {
     queue.onMessage(msg => {
       // YouTube subscriber

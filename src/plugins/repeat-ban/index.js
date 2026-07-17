@@ -16,9 +16,10 @@
  *   /repeatban pardons <user> — clear a specific user's history (un-flag them)
  *
  * Ban mechanics:
- *   - Twitch: issues a /ban via the chat reply handler
- *   - YouTube: issues a /ban via the chat reply handler (if supported by your
- *     YouTube integration; otherwise logs a warning and does nothing)
+ *   - Twitch: calls twitch.ban(username, reason) — a real Helix ban via the
+ *     broadcaster user OAuth token, not a chat-string /ban.
+ *   - YouTube: calls youtube.ban(username) — a real live-chat ban via the
+ *     YouTube Data API.
  *
  * The plugin emits an overlay section so you can see the current state on
  * stream if you want, but it intentionally shows no private user data —
@@ -28,6 +29,11 @@
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 const { registerSection, updateSection } = require('../../overlay-server');
+
+// ── Plugin context (set in init) ───────────────────────────────────────────
+
+let _twitch  = null;
+let _youtube = null;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -39,9 +45,6 @@ const ACCENT_COLOR = 0xff4444;
 
 let _enabled = false;
 const _history = new Map();
-
-// Injected by onChatReady()
-let _chatReply = { twitch: null, youtube: null };
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -60,6 +63,26 @@ function _clearAll() {
 
 function _notify() {
   updateSection('repeat-ban', { enabled: _enabled, trackedUsers: _history.size });
+}
+
+/**
+ * Issue a real platform ban via the twitch / youtube modules' public APIs.
+ * Falls back to a warning log if the platform isn't available.
+ */
+async function _banUser(platform, username, reason) {
+  try {
+    if (platform === 'twitch' && _twitch) {
+      await _twitch.ban(username, reason);
+      log.info(`[repeat-ban] Twitch ban applied to ${username}`);
+    } else if (platform === 'youtube' && _youtube) {
+      await _youtube.ban(username);
+      log.info(`[repeat-ban] YouTube ban applied to ${username}`);
+    } else {
+      log.warn(`[repeat-ban] No ban API available for platform "${platform}" — cannot ban ${username}.`);
+    }
+  } catch (err) {
+    log.error(`[repeat-ban] Failed to ban ${username} on ${platform}:`, err.message);
+  }
 }
 
 // ── Overlay ───────────────────────────────────────────────────────────────
@@ -103,16 +126,12 @@ async function processMessage(msg) {
     entry.count += 1;
 
     if (entry.count > REPEAT_LIMIT) {
-      // Ban the user
+      // Ban the user via the proper platform API.
+      const reason = `Repeated the same message more than ${REPEAT_LIMIT} times.`;
       log.warn(`[repeat-ban] Banning ${msg.username} (${msg.platform}) — repeated "${normalised}" ${entry.count} times`);
-
-      const send = _chatReply[msg.platform];
-      if (send) {
-        send(`/ban ${msg.username} Repeated the same message more than ${REPEAT_LIMIT} times.`)
-          .catch(e => log.error('[repeat-ban] ban command error:', e.message));
-      } else {
-        log.warn(`[repeat-ban] No chat reply handler for platform "${msg.platform}" — cannot issue ban.`);
-      }
+      // Fire-and-forget — ban may take a moment but we don't want to hold up
+      // the chat pipeline. Errors are caught and logged inside _banUser.
+      _banUser(msg.platform, msg.username, reason);
 
       // Clean up so if they return they get a fresh slate
       _history.delete(key);
@@ -201,17 +220,20 @@ async function handleInteraction(interaction) {
 
 // ── Plugin lifecycle ──────────────────────────────────────────────────────
 
-function onChatReady(chatReply) {
-  _chatReply = chatReply;
-  log.info('[repeat-ban] Chat reply handlers registered.');
+function init(context) {
+  _twitch  = context.twitch  ?? null;
+  _youtube = context.youtube ?? null;
+  if (!_twitch)  log.warn('[repeat-ban] twitch module not in init context — Twitch bans will not work');
+  if (!_youtube) log.warn('[repeat-ban] youtube module not in init context — YouTube bans will not work');
+  log.info('[repeat-ban] Plugin loaded.');
 }
 
 // ── Export ────────────────────────────────────────────────────────────────
 
 module.exports = {
   id: 'repeat-ban',
+  init,
   commands: [commandRepeatBan],
   handleInteraction,
   processMessage,
-  onChatReady,
 };

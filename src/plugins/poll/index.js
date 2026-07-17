@@ -9,8 +9,8 @@
  *   /poll status
  *
  * Twitch:
- *   - type:poll        → creates a real Twitch channel poll via Helix API
- *   - type:prediction  → creates a real Twitch prediction via Helix API
+ *   - type:poll        → creates a real Twitch channel poll via twitch.createPoll()
+ *   - type:prediction  → creates a real Twitch prediction via twitch.createPrediction()
  *
  * YouTube:
  *   - Always chat-based (YouTube API has no live poll/prediction endpoint)
@@ -19,11 +19,15 @@
  *   - /poll end or duration expiry posts results to both YouTube chat and Discord
  *
  * Required env vars:
- *   TWITCH_CLIENT_ID       — your app's client ID
- *   TWITCH_CLIENT_SECRET   — app client secret (for app token fallback)
- *   TWITCH_BROADCASTER_ID  — numeric broadcaster user ID (or set TWITCH_BROADCASTER_LOGIN to resolve automatically)
- *   .twitch-tokens.json    — broadcaster OAuth token file written by twitch-auth.js
- *                            (requires scopes: channel:manage:polls, channel:manage:predictions)
+ *   DISCORD_CHAT_WEBHOOK_URL  — for result embeds
+ *   .twitch-tokens.json      — broadcaster OAuth token file written by twitch-auth.js
+ *                              (requires scopes: channel:manage:polls, channel:manage:predictions)
+ *
+ * Note: This plugin uses the public twitch module APIs (createPoll, endPoll,
+ * getPoll, createPrediction, endPrediction, getBroadcasterId) instead of
+ * reimplementing Helix token plumbing. The previous version had ~150 lines
+ * of duplicate Helix code (token refresh, app token, broadcaster ID resolution)
+ * that have all been removed in favour of the shared twitch.js helpers.
  */
 
 const { SlashCommandBuilder, EmbedBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
@@ -32,100 +36,11 @@ const overlay = require('../../overlay-server');
 
 // ── Env / config ──────────────────────────────────────────────────────────
 
-const TWITCH_CLIENT_ID = process.env.TWITCH_CLIENT_ID ?? '';
 const CHAT_WEBHOOK_URL = process.env.DISCORD_CHAT_WEBHOOK_URL ?? '';
 
-const fs        = require('fs');
-const TOKEN_FILE = require('path').resolve('.twitch-tokens.json');
+// ── Plugin context (set in init) ───────────────────────────────────────────
 
-// Read & auto-refresh the broadcaster user token from .twitch-tokens.json
-// (written by twitch-auth.js). Mirrors getUserToken() in twitch.js exactly.
-// Polls/predictions require channel:manage:polls / channel:manage:predictions
-// scopes — only the broadcaster OAuth token carries these, not the IRC bot token.
-let _userTokenCache = null;
-async function _getBroadcasterToken() {
-  if (!_userTokenCache) {
-    if (!fs.existsSync(TOKEN_FILE)) return null;
-    try {
-      _userTokenCache = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-    } catch {
-      log.warn('[poll] Could not read .twitch-tokens.json');
-      return null;
-    }
-  }
-
-  if (Date.now() >= (_userTokenCache.expires_at ?? 0)) {
-    log.info('[poll] User token expired — refreshing…');
-    try {
-      const { default: fetch } = await import('node-fetch');
-      const res  = await fetch('https://id.twitch.tv/oauth2/token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          grant_type:    'refresh_token',
-          refresh_token: _userTokenCache.refresh_token,
-          client_id:     TWITCH_CLIENT_ID,
-          client_secret: CLIENT_SECRET,
-        }),
-      });
-      const data = await res.json();
-      if (!data.access_token) throw new Error(JSON.stringify(data));
-      _userTokenCache = {
-        access_token:  data.access_token,
-        refresh_token: data.refresh_token ?? _userTokenCache.refresh_token,
-        expires_at:    Date.now() + (data.expires_in - 60) * 1000,
-        scopes:        data.scope ?? _userTokenCache.scopes,
-      };
-      fs.writeFileSync(TOKEN_FILE, JSON.stringify(_userTokenCache, null, 2));
-      log.info('[poll] User token refreshed and saved.');
-    } catch (err) {
-      log.error('[poll] User token refresh failed:', err.message);
-      _userTokenCache = null;
-      return null;
-    }
-  }
-
-  return _userTokenCache.access_token;
-}
-
-// App token fallback (for read-only /users lookups when no user token is available).
-const CLIENT_SECRET = process.env.TWITCH_CLIENT_SECRET ?? '';
-let _appToken = null, _appTokenExpiry = 0;
-async function _getAppToken() {
-  if (_appToken && Date.now() < _appTokenExpiry) return _appToken;
-  const { default: fetch } = await import('node-fetch');
-  const res  = await fetch(
-    `https://id.twitch.tv/oauth2/token?client_id=${TWITCH_CLIENT_ID}&client_secret=${CLIENT_SECRET}&grant_type=client_credentials`,
-    { method: 'POST' }
-  );
-  const data = await res.json();
-  if (!data.access_token) throw new Error(`Failed to get app token: ${JSON.stringify(data)}`);
-  _appToken       = data.access_token;
-  _appTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-  return _appToken;
-}
-
-let TWITCH_BROADCASTER_ID = ''; // resolved at runtime
-
-// ── Twitch broadcaster ID resolution ───────────────────────────────────────
-
-async function _resolveBroadcasterId() {
-  if (process.env.TWITCH_BROADCASTER_ID) {
-    TWITCH_BROADCASTER_ID = process.env.TWITCH_BROADCASTER_ID;
-    log.info(`[poll] Broadcaster ID: ${TWITCH_BROADCASTER_ID}`);
-    return;
-  }
-  const login = process.env.TWITCH_BROADCASTER_LOGIN
-             || (process.env.TWITCH_CHANNELS ?? '').split(',')[0].trim();
-  if (!login) { log.warn('[poll] No broadcaster login found — set TWITCH_BROADCASTER_LOGIN'); return; }
-  try {
-    const data = await _twitchRequest('GET', `/users?login=${login}`, null);
-    TWITCH_BROADCASTER_ID = data?.data?.[0]?.id ?? '';
-    log.info(`[poll] Broadcaster ID resolved: ${TWITCH_BROADCASTER_ID} (${login})`);
-  } catch (e) {
-    log.error('[poll] Failed to resolve broadcaster ID:', e.message);
-  }
-}
+let _twitch = null;
 
 // ── Discord webhook (for result embeds) ───────────────────────────────────
 
@@ -141,7 +56,6 @@ let _chatReply = { twitch: null, youtube: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  _resolveBroadcasterId();
 }
 
 // ── Active poll state ─────────────────────────────────────────────────────
@@ -163,89 +77,71 @@ function onChatReady(chatReply) {
  *   // YouTube chat voting
  *   ytVotes:   { [option_index: string]: number },
  *   ytVoters:  Set<string>,
+ *   twitchVotes: { [option_index: string]: number },
+ *   pollInterval: NodeJS.Timeout | null,
  * } | null}
  */
 let _active = null;
 
-// ── Twitch Helix helpers ───────────────────────────────────────────────────
-
-async function _twitchRequest(method, path, body) {
-  // Polls and predictions require a broadcaster user token (same as vip/ban in twitch.js).
-  // Fall back to app token only for read-only requests (e.g. /users lookup).
-  const userToken = await _getBroadcasterToken();
-  const token = userToken ?? await _getAppToken();
-  if (!token) throw new Error('No Twitch token available — run twitch-auth.js to authorise');
-
-  const { default: fetch } = await import('node-fetch');
-  const res = await fetch(`https://api.twitch.tv/helix${path}`, {
-    method,
-    headers: {
-      'Client-ID':     TWITCH_CLIENT_ID,
-      'Authorization': `Bearer ${token}`,
-      'Content-Type':  'application/json',
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`Twitch ${method} ${path} → ${res.status}: ${text}`);
-  return text ? JSON.parse(text) : null;
-}
+// ── Twitch poll/prediction helpers (thin wrappers over twitch.js public API) ──
 
 async function _createTwitchPoll(title, options, durationSec) {
-  const data = await _twitchRequest('POST', '/polls', {
-    broadcaster_id: TWITCH_BROADCASTER_ID,
-    title,
-    choices: options.map(t => ({ title: t })),
-    duration: Math.min(Math.max(durationSec, 15), 1800), // Twitch: 15–1800s
-  });
-  return data?.data?.[0]?.id ?? null;
+  if (!_twitch) throw new Error('twitch module not in init context');
+  const poll = await _twitch.createPoll({ title, choices: options, duration: durationSec });
+  return poll?.id ?? null;
 }
 
 async function _endTwitchPoll(pollId) {
-  const data = await _twitchRequest('PATCH', '/polls', {
-    broadcaster_id: TWITCH_BROADCASTER_ID,
-    id:     pollId,
-    status: 'TERMINATED',
-  });
-  return data?.data?.[0] ?? null;
+  return _twitch.endPoll(pollId, true);
 }
 
 async function _createTwitchPrediction(title, options, durationSec) {
-  const data = await _twitchRequest('POST', '/predictions', {
-    broadcaster_id:    TWITCH_BROADCASTER_ID,
-    title,
-    outcomes:          options.map(t => ({ title: t })),
-    prediction_window: Math.min(Math.max(durationSec, 30), 1800),
-  });
-  return data?.data?.[0]?.id ?? null;
+  const pred = await _twitch.createPrediction({ title, outcomes: options, duration: durationSec });
+  return pred?.id ?? null;
 }
 
 async function _endTwitchPrediction(predictionId, winningIndex) {
-  // First LOCK it, then RESOLVE it (or just CANCEL if no winner)
-  const locked = await _twitchRequest('PATCH', '/predictions', {
-    broadcaster_id: TWITCH_BROADCASTER_ID,
-    id:     predictionId,
-    status: 'LOCKED',
-  });
+  // First LOCK it, then RESOLVE it (or CANCEL if no winner)
+  const locked = await _twitch.endPrediction(predictionId, 'LOCK');
 
-  const outcomes = locked?.data?.[0]?.outcomes ?? [];
+  const outcomes = locked?.outcomes ?? [];
 
   if (winningIndex !== null && winningIndex !== undefined && outcomes[winningIndex]) {
-    await _twitchRequest('PATCH', '/predictions', {
-      broadcaster_id:     TWITCH_BROADCASTER_ID,
-      id:                 predictionId,
-      status:             'RESOLVED',
-      winning_outcome_id: outcomes[winningIndex].id,
-    });
-  } else {
-    await _twitchRequest('PATCH', '/predictions', {
-      broadcaster_id: TWITCH_BROADCASTER_ID,
-      id:             predictionId,
-      status:         'CANCELED',
-    });
+    return _twitch.endPrediction(predictionId, 'RESOLVED', outcomes[winningIndex].id);
   }
+  return _twitch.endPrediction(predictionId, 'CANCEL', undefined);
+}
 
-  return locked?.data?.[0] ?? null;
+async function _fetchTwitchVotes() {
+  if (!_active) return;
+  try {
+    if (_active.twitchPollId) {
+      const poll = await _twitch.getPoll(_active.twitchPollId);
+      if (poll) {
+        (poll.choices ?? []).forEach((choice, i) => {
+          _active.twitchVotes[i] = (choice.votes ?? 0) + (choice.channel_points_votes ?? 0);
+        });
+      }
+    } else if (_active.twitchPredictionId) {
+      // Helix prediction status is fetched via helixUserRequest because we
+      // don't have a dedicated getPrediction helper — predictions have a
+      // different response shape than polls and aren't worth a dedicated
+      // helper just for this one read path.
+      const data = await _twitch.helixUserRequest(
+        'GET',
+        `/predictions?broadcaster_id=${await _twitch.getBroadcasterId()}&id=${_active.twitchPredictionId}`
+      );
+      const pred = data?.data?.[0];
+      if (pred) {
+        (pred.outcomes ?? []).forEach((outcome, i) => {
+          _active.twitchVotes[i] = outcome.channel_points ?? 0;
+        });
+      }
+    }
+    _pushOverlay();
+  } catch (e) {
+    log.debug('[poll] Twitch live fetch error:', e.message);
+  }
 }
 
 // ── YouTube chat voting helpers ───────────────────────────────────────────
@@ -342,31 +238,6 @@ function _pushOverlay() {
   });
 }
 
-async function _fetchTwitchVotes() {
-  if (!_active) return;
-  try {
-    if (_active.twitchPollId) {
-      const data = await _twitchRequest('GET', `/polls?broadcaster_id=${TWITCH_BROADCASTER_ID}&id=${_active.twitchPollId}`);
-      const poll = data?.data?.[0];
-      if (poll) {
-        (poll.choices ?? []).forEach((choice, i) => {
-          _active.twitchVotes[i] = (choice.votes ?? 0) + (choice.channel_points_votes ?? 0);
-        });
-      }
-    } else if (_active.twitchPredictionId) {
-      const data = await _twitchRequest('GET', `/predictions?broadcaster_id=${TWITCH_BROADCASTER_ID}&id=${_active.twitchPredictionId}`);
-      const pred = data?.data?.[0];
-      if (pred) {
-        (pred.outcomes ?? []).forEach((outcome, i) => {
-          _active.twitchVotes[i] = outcome.channel_points ?? 0;
-        });
-      }
-    }
-    _pushOverlay();
-  } catch (e) {
-    log.debug('[poll] Twitch live fetch error:', e.message);
-  }
-}
 // ── Start / end logic ─────────────────────────────────────────────────────
 
 async function _startPoll({ title, options, durationSec, type, platforms }) {
@@ -391,11 +262,15 @@ async function _startPoll({ title, options, durationSec, type, platforms }) {
 
   // Twitch
   if (platforms.includes('twitch')) {
-    if (!TWITCH_CLIENT_ID || !TWITCH_BROADCASTER_ID) {
-      errors.push('Twitch credentials not configured (TWITCH_CLIENT_ID or broadcaster ID missing)');
+    if (!_twitch) {
+      errors.push('Twitch module not available in init context');
     } else {
       try {
-        if (type === 'prediction') {
+        // Ensure broadcaster ID is resolvable before we try to create the poll
+        const bid = await _twitch.getBroadcasterId();
+        if (!bid) {
+          errors.push('Could not resolve Twitch broadcaster ID');
+        } else if (type === 'prediction') {
           _active.twitchPredictionId = await _createTwitchPrediction(title, options, durationSec);
           log.info(`[poll] Twitch prediction created: ${_active.twitchPredictionId}`);
         } else {
@@ -485,7 +360,7 @@ async function _endPoll(winningIndex) {
   // Discord embed
   await _postResultsEmbed(state, winningIndex, twitchVotes, combinedVotes);
 
-  // Push final combined results to overlay, then hide after 30s
+  // Push final combined results to overlay, then hide after 10s
   overlay.updatePollOverlay({
     type:          state.type,
     title:         state.title,
@@ -586,6 +461,15 @@ const commandPoll = new SlashCommandBuilder()
     .setName('status')
     .setDescription('Check the current poll status'));
 
+// ── init ───────────────────────────────────────────────────────────────────
+
+function init(context) {
+  _twitch = context.twitch;
+  if (!_twitch) {
+    log.warn('[poll] twitch module not in init context — Twitch poll/prediction creation disabled');
+  }
+}
+
 // ── handleInteraction ─────────────────────────────────────────────────────
 
 async function handleInteraction(interaction) {
@@ -684,6 +568,7 @@ async function handleInteraction(interaction) {
 
 module.exports = {
   id: 'poll',
+  init,
   onChatReady,
   processMessage,
   commands: [commandPoll],

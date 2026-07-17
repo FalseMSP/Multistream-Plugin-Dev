@@ -1002,6 +1002,36 @@ module.exports = {
     _activeSessions.delete(videoId);
     return true;
   },
+
+  /**
+   * Fetch the channel's current subscriber count from the YouTube Data API.
+   * Returns null if the API key isn't configured or the fetch fails.
+   * Exposed so plugins (sub-counter, etc.) stop reimplementing this inline.
+   * @returns {Promise<number|null>}
+   */
+  async getSubscriberCount() {
+    return _fetchSubscriberCount();
+  },
+
+  /**
+   * Fetch the current like count for a live video. Returns null if unknown.
+   * Exposed so plugins can poll like counts without reaching into internals.
+   * @param {string} videoId
+   * @returns {Promise<number|null>}
+   */
+  async getLikeCount(videoId) {
+    return _fetchLikeCount(videoId);
+  },
+
+  // Moderation (top-level convenience wrappers — mirror the modHandlers
+  // surface but with cleaner signatures for plugin call sites)
+  async ban(username)      { return ytBan('youtube', username); },
+  async timeout(username, durationSeconds = 300) {
+    return ytTimeout('youtube', username, durationSeconds);
+  },
+  async vip(username)      { return ytVip('youtube', username); },
+  async unvip(username)    { return ytUnvip('youtube', username); },
+
   modHandlers: {
     ban:     ytBan,
     timeout: ytTimeout,

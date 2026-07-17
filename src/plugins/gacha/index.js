@@ -3,11 +3,15 @@
 const log = require('../../logger');
 const commandsList = require('../commands-list');
 const { registerSection, updateSection, addRoute } = require('../../overlay-server');
-const queue = require('../../queue');
 const fs   = require('fs');
 const path = require('path');
 
 const GACHA_HTML = path.resolve(__dirname, 'overlay.html');
+
+// queue is injected via init(context) — see init() below.
+// We keep a module-level reference so setTimeout callbacks (which fire
+// long after init has run) can call pushRedeem to synthesise redeems.
+let _queue = null;
 
 // ─── Loot Table ─────────────────────────────────────────────────────────────
 // Each entry: { id, label, rarity, icon (folder name under gachaicons/) }
@@ -143,14 +147,18 @@ function _executePull({ user, isPremium }) {
     // so plugins like sfx pick it up at the right moment.
     if (!isDud && item.redeem) {
       log.info(`[gacha] Dispatching redeem "${item.redeem}" for ${user}`);
-      queue.pushRedeem({
-        username:  user,
-        title:     item.redeem,
-        cost:      0,
-        input:     null,
-        timestamp: new Date(),
-        _fromGacha: true, // flag so other plugins can tell it's synthetic
-      });
+      if (_queue) {
+        _queue.pushRedeem({
+          username:  user,
+          title:     item.redeem,
+          cost:      0,
+          input:     null,
+          timestamp: new Date(),
+          _fromGacha: true, // flag so other plugins can tell it's synthetic
+        });
+      } else {
+        log.warn('[gacha] queue not available — synthetic redeem not dispatched');
+      }
     }
   }, 8000);
 
@@ -206,10 +214,11 @@ function _normaliseTitle(raw) {
 }
 
 function init(context) {
-  const q = context.queue ?? context;
+  const q = context.queue;
+  _queue = q; // captured for setTimeout-callback access in _executePull
 
   // ── Channel Point redeems ────────────────────────────────────────────────
-  if (typeof q.onRedeem === 'function') {
+  if (typeof q?.onRedeem === 'function') {
     q.onRedeem(redeem => {
       const raw = redeem.title ?? redeem.reward?.title;
       if (!raw) {
@@ -236,7 +245,7 @@ function init(context) {
   // type: 'bits'                → standard pull (100 bits = 1 pull)
   // type: 'sub' | 'resub'      → 1 premium pull for the subscriber
   // type: 'subgift'            → 1 premium pull per sub gifted (credit gifter)
-  if (typeof q.onDonation === 'function') {
+  if (typeof q?.onDonation === 'function') {
     q.onDonation(event => {
       const type = event.type;
 

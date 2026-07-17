@@ -12,15 +12,18 @@
  * https://www.youtube.com/live/dQw4w9WgXcQ
  * dQw4w9WgXcQ   (bare ID)
  *
- * On success it calls triggerVideo() from the YouTube module, which starts a
- * new masterchat session for that video ID alongside any existing streams.
+ * On success it calls youtube.triggerVideo() (provided via init(context))
+ * which starts a new masterchat session for that video ID alongside any
+ * existing streams.
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const log          = require('../../logger');
-// queue is a module-level singleton — safe to require directly at load time.
-const queue        = require('../../queue');
-const { triggerVideo } = require('../../youtube');
+const log = require('../../logger');
+
+// ── Plugin context (set in init) ───────────────────────────────────────────
+
+let _youtube = null;
+let _queue   = null;
 
 // ── Video ID extraction ───────────────────────────────────────────────────
 
@@ -61,6 +64,13 @@ function _extractVideoId(input) {
 module.exports = {
   id: 'add-yt-stream',
 
+  init(context) {
+    _youtube = context.youtube ?? null;
+    _queue   = context.queue   ?? null;
+    if (!_youtube) log.warn('[add-yt-stream] youtube module not in init context — slash command will be disabled');
+    if (!_queue)   log.warn('[add-yt-stream] queue not in init context — triggerVideo will be unavailable');
+  },
+
   command: new SlashCommandBuilder()
     .setName('add-yt-stream')
     .setDescription('Add an additional YouTube stream to monitor')
@@ -74,6 +84,10 @@ module.exports = {
 
   async handleInteraction(interaction) {
     await interaction.deferReply({ ephemeral: true });
+
+    if (!_youtube) {
+      return interaction.editReply('⚠️ YouTube module not available — cannot add stream.');
+    }
 
     const raw     = interaction.options.getString('url', true);
     const videoId = _extractVideoId(raw);
@@ -90,7 +104,9 @@ module.exports = {
     }
 
     try {
-      triggerVideo(videoId, queue);
+      // youtube.triggerVideo expects (videoId, queue) — the queue is needed
+      // so it can push discovered chat messages into the pipeline.
+      _youtube.triggerVideo(videoId, _queue);
     } catch (err) {
       log.error('[add-yt-stream] triggerVideo error:', err.message);
       return interaction.editReply(`⚠️ Failed to start session: ${err.message}`);

@@ -1,0 +1,10 @@
+{
+  "commands": {
+    "points": "Check your YouTube point balance (or !points top for leaderboard)",
+    "redeem": "Spend points on a reward — !redeem <reward name>",
+    "rewards": "List available point rewards and their costs",
+    "gacha": "Spend 1000 channel points to pull from the gacha!",
+    "budgetgacha": "Spend 1000 channel points to pull from the gacha!",
+    "fragments": "Check how many Pull Fragments you have (3 = 1 free premium pull)"
+  }
+}

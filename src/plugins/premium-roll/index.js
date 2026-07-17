@@ -1,8 +1,13 @@
 'use strict';
 
-// ─── pull-fragment plugin ─────────────────────────────────────────────────────
+// ─── premium-roll plugin ──────────────────────────────────────────────────────
 //
 // Triggers a premium gacha pull immediately when executed.
+//
+// This is a sibling plugin to `pull-fragment` (which tracks fragments over
+// time and auto-triggers a pull once a threshold is reached). `premium-roll`
+// is the manual override — a mod can fire a premium pull on demand without
+// having to award three fragments first.
 //
 // Discord slash command (mods only):
 //   /pull <user>  — fire a premium pull for the given viewer
@@ -21,22 +26,22 @@ function _send(platform, text) {
   try {
     const result = fn(text);
     if (result && typeof result.catch === 'function') {
-      result.catch(e => log.error('[pull-fragment] chat reply error:', e.message));
+      result.catch(e => log.error('[premium-roll] chat reply error:', e.message));
     }
   } catch (e) {
-    log.error('[pull-fragment] chat reply error:', e.message);
+    log.error('[premium-roll] chat reply error:', e.message);
   }
 }
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  log.info('[pull-fragment] Chat ready.');
+  log.info('[premium-roll] Chat ready.');
 }
 
 // ─── Premium pull ─────────────────────────────────────────────────────────────
 
 function _triggerPremiumPull(user) {
-  log.info(`[pull-fragment] Triggering premium pull for ${user}.`);
+  log.info(`[premium-roll] Triggering premium pull for ${user}.`);
   _send('twitch',  `@${user} ✨ Triggering a premium gacha pull…`);
   _send('youtube', `@${user} ✨ Triggering a premium gacha pull…`);
   setTimeout(() => gacha.triggerPull({ user, isPremium: true }), 2000);
@@ -44,8 +49,8 @@ function _triggerPremiumPull(user) {
 
 // ─── Plugin lifecycle ─────────────────────────────────────────────────────────
 
-function init(context) {
-  log.info('[pull-fragment] Loaded.');
+function init() {
+  log.info('[premium-roll] Loaded.');
 }
 
 // ─── Discord slash command ────────────────────────────────────────────────────
@@ -69,7 +74,7 @@ async function handleInteraction(interaction) {
 // ─── Exports ──────────────────────────────────────────────────────────────────
 
 module.exports = {
-  id: 'pull-fragment',
+  id: 'premium-roll',
   init,
   onChatReady,
   command,

@@ -14,15 +14,37 @@ module.exports = {
   // Required — unique kebab-case identifier
   id: 'my-plugin',
 
-  // Optional — called once at startup with the full context object:
-  //   context.discord:   { sendChat, sendRedeem, onModAction }
-  //   context.chatReply: { twitch: async fn(text), youtube: async fn(text) }
-  // Note: chatReply values may be null at init time if platforms aren't ready yet.
-  // Prefer onChatReady() for anything that depends on chatReply being populated.
-  init(context) {},
+  // Optional — called once at startup with the full runtime context:
+  //
+  //   context.discord:  { sendChat, sendRedeem, sendDonation, registerCommands, onModAction, client }
+  //                     (`client` is the raw discord.js Client, set after login)
+  //   context.queue:    { onMessage, onRedeem, onDonation, pushMessage, pushRedeem, pushDonation, normaliseRedeemTitle }
+  //   context.twitch:   the src/twitch module — say, ban, timeout, vip, unvip,
+  //                     listRewards, createReward, deleteReward, updateReward,
+  //                     getRewardByTitle, setRewardEnabled, getFollowerCount,
+  //                     getSubscriberCount, createPoll, endPoll, getPoll,
+  //                     createPrediction, endPrediction, updateStreamInfo,
+  //                     getBroadcasterId, getUserToken, helixRequest, helixUserRequest
+  //   context.youtube:  the src/youtube module — say, sayTo, stopSession,
+  //                     triggerVideo, updateVideoInfo, getSubscriberCount,
+  //                     getLikeCount, ban, timeout, vip, unvip
+  //
+  // Note: chatReply is NOT in context — it's set later via onChatReady().
+  // Anything that needs to send chat replies must wait for onChatReady.
+  init(context) {
+    // Capture modules you need:
+    const { queue, twitch, youtube } = context;
+    // Subscribe to queue events:
+    queue.onRedeem(redeem => { /* ... */ });
+  },
 
-  // Optional — called when chat reply handlers become available
-  // chatReply: { twitch: fn, youtube: fn }
+  // Optional — called when chat reply handlers become available.
+  // chatReply shape:
+  //   {
+  //     twitch:         (text) => void,                  // broadcast to primary Twitch channel
+  //     youtube:        (text) => void,                  // broadcast to all live YT sessions
+  //     youtubeSession: (videoId, text) => void,         // target one specific YT live stream
+  //   }
   onChatReady(chatReply) {},
 
   // Optional — a single discord.js SlashCommandBuilder
@@ -63,21 +85,29 @@ Plugins are applied in order. The first plugin to suppress a message stops the p
 
 ## Replying to chat with `onChatReady`
 
-If your plugin needs to send messages back to Twitch or YouTube chat, implement `onChatReady(chatReply)`. This is called once the chat reply handlers are ready, and gives you a `{ twitch, youtube }` object where each value is an async function that accepts a string.
+If your plugin needs to send messages back to Twitch or YouTube chat, implement `onChatReady(chatReply)`. This is called once the chat reply handlers are ready, and gives you a `{ twitch, youtube, youtubeSession }` object.
 
 ```js
-let _chatReply = { twitch: null, youtube: null };
+let _chatReply = { twitch: null, youtube: null, youtubeSession: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
 }
 
 async function processMessage(msg) {
-  const send = _chatReply[msg.platform]; // platform is 'twitch' or 'youtube'
+  // Broadcast to the platform the message came from:
+  const send = _chatReply[msg.platform]; // 'twitch' or 'youtube'
   if (send) {
     send('Hello chat!')
       .catch(e => log.error('[my-plugin] chat reply error:', e.message));
   }
+
+  // OR target a specific YouTube live stream (when msg.videoId is set):
+  if (msg.platform === 'youtube' && msg.videoId && _chatReply.youtubeSession) {
+    _chatReply.youtubeSession(msg.videoId, 'Reply only to this stream')
+      .catch(e => log.error('[my-plugin] session reply error:', e.message));
+  }
+
   return { message: null };
 }
 
@@ -90,6 +120,17 @@ module.exports = {
 
 > **Always guard with `if (send)`** — a platform handler may be `null` if that platform isn't connected.  
 > **Always `.catch()`** — a failed send should never crash the plugin pipeline.
+
+### chatReply contract
+
+| Field | Signature | Use when… |
+|---|---|---|
+| `chatReply.twitch(text)` | `(text: string) => Promise<void>` | You want to broadcast to the primary Twitch channel |
+| `chatReply.youtube(text)` | `(text: string) => Promise<void>` | You want to broadcast to ALL active YouTube live sessions |
+| `chatReply.youtubeSession(videoId, text)` | `(videoId: string, text: string) => Promise<void>` | You want to reply only to the specific YouTube stream a message came from |
+
+`youtubeSession` is the right choice whenever you have a `msg.videoId` — it
+avoids broadcasting replies to other concurrent streams.
 
 ---
 
@@ -353,8 +394,16 @@ module.exports = {
 - **Env vars** for your plugin should follow the pattern `DISCORD_<PLUGIN>_WEBHOOK_URL` or `<PLUGIN>_<SETTING>`.
 - **No registration.** Just create `src/plugins/<name>/index.js` and restart the bot.
 - **Order matters.** Plugins are loaded alphabetically by directory name. If plugin A should run before plugin B, name accordingly (e.g. `01-plugin-a`, `02-plugin-b`).
-- **`init(context)`** receives `{ discord: { sendChat, sendRedeem, onModAction }, chatReply }` — use it if your plugin needs to register its own mod-action handler or send messages proactively. `chatReply` values may still be `null` at this point if platforms haven't started yet — use `onChatReady` instead for anything that needs to send to chat.
-- **`onChatReady(chatReply)`** is called once Twitch and YouTube clients are ready, after `init`. It's the correct hook for anything that sends replies to chat — by this point `chatReply.twitch` and `chatReply.youtube` are guaranteed to be populated.
+- **`init(context)`** receives `{ discord, queue, twitch, youtube }`:
+  - `context.discord` is the discord API object (`sendChat`, `sendRedeem`, `sendDonation`, `registerCommands`, `onModAction`, plus `client` after login).
+  - `context.queue` is the queue module — subscribe via `queue.onMessage` / `queue.onRedeem` / `queue.onDonation`.
+  - `context.twitch` and `context.youtube` are the main platform modules — use their public APIs (e.g. `twitch.listRewards()`, `twitch.ban(user, reason)`, `youtube.getSubscriberCount()`) rather than reimplementing Helix / YouTube Data API calls inline.
+- **`onChatReady(chatReply)`** is called once Twitch and YouTube clients are ready, after `init`. It's the correct hook for anything that sends replies to chat — by this point `chatReply.twitch`, `chatReply.youtube`, and `chatReply.youtubeSession` are all populated.
+- **Prefer `chatReply.youtubeSession(videoId, text)`** over `chatReply.youtube(text)` whenever you have a `msg.videoId` — it avoids broadcasting replies to other concurrent streams.
+- **Don't `require()` main modules directly** — use `init(context)` instead. If you find yourself writing `require('../../twitch')` or `require('../../youtube')` inside a plugin, that's a smell: the loader already passes those modules in via context.
+- **Don't monkey-patch `context.discord.sendRedeem`** or any other API method. If you need to react to redeems, subscribe via `context.queue.onRedeem(...)`.
+- **Use `queue.normaliseRedeemTitle(rawTitle)`** to strip `[YT]` suffixes and normalise case before matching redeem titles — every plugin that compares redeem titles should use this helper so the format is consistent.
 - **Suppress bot-trigger commands** from `#stream-chat` by returning `{ message: null }` — commands like `!q` or `!discord` are noise in the Discord feed.
 - **Serialise render functions** with `.toString()` when registering overlay sections. The function body must be fully self-contained.
+- **For standalone OBS browser sources** of a single section, use `overlay.buildStandaloneSectionPage(sectionId)` instead of reaching into private `_getSectionMeta` / `_getSectionData` helpers.
 - **Register every chat command** with `commandsList.registerCommand()` inside `onChatReady` so it appears in `!commands`. This is the single source of truth viewers see — if it's not registered, it's invisible.

@@ -47,7 +47,18 @@
 const { SlashCommandBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 const commandsList = require('../commands-list');
-const { setRewardEnabled } = require('../../twitch');
+
+// ── Plugin context (set in init) ───────────────────────────────────────────
+//
+// Previously this plugin monkey-patched context.sendRedeem / context.sendDonation
+// to intercept redeems and donations. That was a fragile coupling: it worked
+// only because discord.js's `api` object was shared by reference and the queue
+// invoked api.sendRedeem at call-time. We now subscribe via the documented
+// queue.onRedeem / queue.onDonation listeners, which is the contract plugins
+// are supposed to use when they want to react to redeems/donations.
+
+let _twitch = null;
+let _queue  = null;
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -55,7 +66,7 @@ const WEBHOOK_URL = process.env.DISCORD_MINECRAFT_WEBHOOK_URL ?? '';
 
 /**
  * Names of Twitch channel point redeems to enable/disable with this plugin.
- * Uses twitch.js → setRewardEnabled() (app token, no extra env vars needed).
+ * Uses twitch.setRewardEnabled() (exposed via init context).
  */
 const MANAGED_REDEEMS = ['Summon Wither', 'Disable 60s'];
 
@@ -125,12 +136,17 @@ function getWebhook() {
 // ── Twitch redeem helpers ─────────────────────────────────────────────────
 
 /**
- * Enable or disable all redeems listed in MANAGED_REDEEMS via twitch.js.
+ * Enable or disable all redeems listed in MANAGED_REDEEMS via the twitch
+ * module's setRewardEnabled() public API.
  * @param {boolean} enabled
  */
 async function syncManagedRedeems(enabled) {
+  if (!_twitch) {
+    log.warn('[minecraft-link] twitch module not in init context — cannot toggle redeems');
+    return;
+  }
   const results = await Promise.all(
-    MANAGED_REDEEMS.map(name => setRewardEnabled(name, enabled))
+    MANAGED_REDEEMS.map(name => _twitch.setRewardEnabled(name, enabled))
   );
   const failed = MANAGED_REDEEMS.filter((_, i) => !results[i]);
   if (failed.length) {
@@ -138,73 +154,76 @@ async function syncManagedRedeems(enabled) {
   }
 }
 
-// ── init — hook into sendRedeem / sendDonation ────────────────────────────
+// ── Redeem / donation forwarding (queue listeners) ────────────────────────
+
+/**
+ * Forward Twitch redeems to #plugin-chat in the format the Minecraft mod expects.
+ * Called via queue.onRedeem — no longer monkey-patches context.sendRedeem.
+ */
+function _forwardRedeem(redeem) {
+  const wh = getWebhook();
+  if (!wh || !WEBHOOK_URL) return;
+  const redeemName = redeem?.title
+    ?? redeem?.redeemName
+    ?? redeem?.reward?.title
+    ?? 'UNKNOWN';
+  const username = redeem?.username
+    ?? redeem?.user?.login
+    ?? redeem?.user?.display_name
+    ?? 'UNKNOWN';
+  // NOTE: The Minecraft mod's negative lookahead (?!.*REDEEM:) ensures
+  // these lines are never matched by keyword routes — they go to a
+  // dedicated redeem handler on the mod side.
+  const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
+  wh.send({ content: formatted })
+    .then(() => log.debug(`[minecraft-link] Redeem forwarded → "${formatted}"`))
+    .catch(err => log.error('[minecraft-link] Webhook send error (redeem):', err.message));
+}
+
+/**
+ * Forward Twitch donations (bits/subs/subgifts) to #plugin-chat.
+ * Called via queue.onDonation — no longer monkey-patches context.sendDonation.
+ */
+function _forwardDonation(donation) {
+  const wh = getWebhook();
+  if (!wh || !WEBHOOK_URL) return;
+  const username = donation?.username ?? 'UNKNOWN';
+  const type     = (donation?.type ?? 'donation').toUpperCase();
+  let detail;
+  switch (donation?.type) {
+    case 'bits':    detail = `CHEER: ${donation.amount} bits`; break;
+    case 'sub':     detail = `SUB (Tier ${donation.tier ?? '1000'})`; break;
+    case 'resub':   detail = `RESUB (${donation.months} months, Tier ${donation.tier ?? '1000'})`; break;
+    case 'subgift': detail = donation.recipient
+      ? `SUBGIFT → ${donation.recipient}`
+      : `SUBGIFT x${donation.quantity ?? 1}`; break;
+    default:        detail = type;
+  }
+  const formatted = `[TWITCH] ${username}: ${detail}`;
+  wh.send({ content: formatted })
+    .then(() => log.debug(`[minecraft-link] Donation forwarded → "${formatted}"`))
+    .catch(err => log.error('[minecraft-link] Webhook send error (donation):', err.message));
+}
+
+// ── init — subscribe to queue events (no monkey-patching) ─────────────────
 
 function init(context) {
-  log.info('[minecraft-link] init called, context keys:', Object.keys(context ?? {}));
+  _twitch = context.twitch ?? null;
+  _queue  = context.queue  ?? null;
 
-  if (typeof context?.sendRedeem !== 'function') {
-    log.warn('[minecraft-link] No sendRedeem found in context — redeem forwarding disabled.');
-  } else {
-    const _originalSendRedeem = context.sendRedeem;
-    context.sendRedeem = async function (redeem) {
-      const wh = getWebhook();
-      if (wh && WEBHOOK_URL) {
-        const redeemName = redeem?.title
-          ?? redeem?.redeemName
-          ?? redeem?.reward?.title
-          ?? 'UNKNOWN';
-        const username = redeem?.username
-          ?? redeem?.user?.login
-          ?? redeem?.user?.display_name
-          ?? 'UNKNOWN';
-        // NOTE: The Minecraft mod's negative lookahead (?!.*REDEEM:) ensures
-        // these lines are never matched by keyword routes — they go to a
-        // dedicated redeem handler on the mod side.
-        const formatted = `[TWITCH] ${username}: REDEEM: ${redeemName}`;
-        try {
-          await wh.send({ content: formatted });
-          log.debug(`[minecraft-link] Redeem forwarded → "${formatted}"`);
-        } catch (err) {
-          log.error('[minecraft-link] Webhook send error (redeem):', err.message);
-        }
-      }
-      return _originalSendRedeem(redeem);
-    };
-    log.info('[minecraft-link] Redeem forwarding hooked ✅');
+  if (!_twitch) {
+    log.warn('[minecraft-link] twitch module not in init context — managed redeems cannot be toggled.');
+  }
+  if (!_queue) {
+    log.warn('[minecraft-link] queue not in init context — redeem/donation forwarding disabled.');
+    return;
   }
 
-  if (typeof context?.sendDonation !== 'function') {
-    log.warn('[minecraft-link] No sendDonation found in context — donation forwarding disabled.');
-  } else {
-    const _originalSendDonation = context.sendDonation;
-    context.sendDonation = async function (donation) {
-      const wh = getWebhook();
-      if (wh && WEBHOOK_URL) {
-        const username = donation?.username ?? 'UNKNOWN';
-        const type     = (donation?.type ?? 'donation').toUpperCase();
-        let detail;
-        switch (donation?.type) {
-          case 'bits':    detail = `CHEER: ${donation.amount} bits`; break;
-          case 'sub':     detail = `SUB (Tier ${donation.tier ?? '1000'})`; break;
-          case 'resub':   detail = `RESUB (${donation.months} months, Tier ${donation.tier ?? '1000'})`; break;
-          case 'subgift': detail = donation.recipient
-            ? `SUBGIFT → ${donation.recipient}`
-            : `SUBGIFT x${donation.quantity ?? 1}`; break;
-          default:        detail = type;
-        }
-        const formatted = `[TWITCH] ${username}: ${detail}`;
-        try {
-          await wh.send({ content: formatted });
-          log.debug(`[minecraft-link] Donation forwarded → "${formatted}"`);
-        } catch (err) {
-          log.error('[minecraft-link] Webhook send error (donation):', err.message);
-        }
-      }
-      return _originalSendDonation(donation);
-    };
-    log.info('[minecraft-link] Donation forwarding hooked ✅');
-  }
+  // Subscribe to redeems + donations via the documented queue listener API.
+  // This replaces the previous monkey-patch of context.sendRedeem / sendDonation.
+  _queue.onRedeem(_forwardRedeem);
+  _queue.onDonation(_forwardDonation);
+  log.info('[minecraft-link] Redeem + donation forwarding subscribed via queue listeners ✅');
 }
 
 // ── onChatReady ───────────────────────────────────────────────────────────

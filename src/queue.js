@@ -139,6 +139,32 @@ function pushDonation(donation) {
   _dispatch(_donationHandlers, donation, 'donation');
 }
 
+// ── Reward title normalisation ─────────────────────────────────────────────
+//
+// Several plugins (gacha, gacha-at-home, sfx, event-feed, 0yt-points) each
+// reimplemented this same regex to strip the "[YT]" suffix that 0yt-points
+// appends when mirroring YouTube redeems into the redeem pipeline.
+// Centralising it here means a future change to the suffix format only
+// needs to happen in one place.
+//
+// Usage:
+//   const canonical = queue.normaliseRedeemTitle(rawTitle);
+//   // → 'gacha pull' for 'Gacha Pull [YT]', 'GACHA PULL', '  gacha pull  ', etc.
+
+/**
+ * Normalise a redeem title for case-insensitive matching.
+ * Strips trailing "[YT]" suffix, trims whitespace, and lowercases.
+ * @param {string} raw
+ * @returns {string}
+ */
+function normaliseRedeemTitle(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/\s*\[YT\]\s*$/i, '')
+    .trim()
+    .toLowerCase();
+}
+
 // ── Module exports ────────────────────────────────────────────────────────
 
 module.exports = {
@@ -151,4 +177,7 @@ module.exports = {
   pushMessage,
   pushRedeem,
   pushDonation,
+
+  // Helpers
+  normaliseRedeemTitle,
 };

@@ -38,11 +38,15 @@ const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const fs   = require('fs');
 const path = require('path');
 const log  = require('../../logger');
-const { helixUserRequest, getBroadcasterId } = require('../../twitch');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
-const REWARDS_FILE = path.resolve('src/plugins/create-reward/rewards.json');
+// Resolve relative to this file so the plugin works regardless of cwd.
+const REWARDS_FILE = path.resolve(__dirname, 'rewards.json');
+
+// ── Plugin context (set in init) ───────────────────────────────────────────
+
+let _twitch = null;
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -64,27 +68,69 @@ function saveRewardsFile(rewards) {
   fs.writeFileSync(REWARDS_FILE, JSON.stringify(rewards, null, 2));
 }
 
-/** Fetch all live custom rewards for the channel (all, not just bot-owned). */
-async function fetchLiveRewards(broadcasterId) {
-  const data = await helixUserRequest('GET', `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}`);
-  return data?.data ?? [];
+// ── Twitch reward helpers (thin wrappers over twitch.js public API) ────────
+//
+// Previously this plugin called helixUserRequest directly with hand-built
+// URLs. All that URL/payload plumbing now lives in twitch.js's
+// listRewards / createReward / deleteReward helpers, so this plugin just
+// translates between the rewards.json schema and the twitch.js contract.
+
+/** Fetch all live custom rewards for the channel. */
+async function fetchLiveRewards() {
+  return _twitch.listRewards({ force: true });
 }
 
-/** Create a single reward on Twitch. Returns the created reward object. */
-async function createReward(broadcasterId, payload) {
-  const clean = { ...payload };
-  Object.keys(clean).forEach(k => clean[k] === undefined && delete clean[k]);
-  const data = await helixUserRequest(
+/**
+ * Create a single reward on Twitch via the twitch module's createReward.
+ * Accepts the rewards.json payload shape (which is the raw Twitch API
+ * body) and forwards it. Returns the created reward object.
+ */
+async function createRewardOnTwitch(payload) {
+  const opts = {
+    title:    payload.title,
+    cost:     payload.cost,
+    prompt:   payload.prompt,
+    is_enabled:                  payload.is_enabled,
+    is_user_input_required:      payload.is_user_input_required,
+    background_color:            payload.background_color,
+  };
+  // Strip undefined fields so we don't override Twitch defaults with null
+  Object.keys(opts).forEach(k => opts[k] === undefined && delete opts[k]);
+
+  // Pass through advanced fields the twitch.createReward helper doesn't
+  // model directly by adding them onto the body via the lower-level
+  // helixUserRequest passthrough. We do this only for fields the rewards.json
+  // schema actually defines, so the helper still does most of the work.
+  const advanced = {};
+  for (const k of [
+    'is_max_per_stream_enabled', 'max_per_stream',
+    'is_max_per_user_per_stream_enabled', 'max_per_user_per_stream',
+    'is_global_cooldown_enabled', 'global_cooldown_seconds',
+    'should_redemptions_skip_request_queue',
+  ]) {
+    if (payload[k] !== undefined) advanced[k] = payload[k];
+  }
+
+  if (Object.keys(advanced).length === 0) {
+    return _twitch.createReward(opts);
+  }
+
+  // Fall back to helixUserRequest passthrough for advanced payloads so we
+  // don't lose any fields. twitch.js still owns token + URL plumbing.
+  const broadcasterId = await _twitch.getBroadcasterId();
+  const data = await _twitch.helixUserRequest(
     'POST',
     `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}`,
-    clean
+    { ...opts, ...advanced }
   );
+  // Invalidate the cached list since we just changed it.
+  await _twitch.listRewards({ force: true });
   return data?.data?.[0] ?? null;
 }
 
 /** Delete a reward from Twitch by ID. */
-async function deleteReward(broadcasterId, rewardId) {
-  await helixUserRequest('DELETE', `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${rewardId}`);
+async function deleteRewardFromTwitch(rewardId) {
+  return _twitch.deleteReward(rewardId);
 }
 
 // ── Startup sync ──────────────────────────────────────────────────────────
@@ -94,24 +140,20 @@ async function deleteReward(broadcasterId, rewardId) {
  * that title already exists. Returns a summary { created, skipped, failed }.
  */
 async function syncRewards() {
+  if (!_twitch) {
+    log.warn('[create-reward] twitch module not in init context — skipping sync');
+    return { created: [], skipped: [], failed: [] };
+  }
+
   const defined = loadRewardsFile();
   if (!defined.length) {
     log.info('[create-reward] rewards.json is empty or missing — nothing to sync.');
     return { created: [], skipped: [], failed: [] };
   }
 
-  let broadcasterId;
-  try {
-    broadcasterId = await getBroadcasterId();
-    if (!broadcasterId) throw new Error('getBroadcasterId() returned null');
-  } catch (err) {
-    log.error('[create-reward] Could not resolve broadcaster ID:', err.message);
-    return { created: [], skipped: [], failed: defined.map(r => r.title) };
-  }
-
   let liveRewards;
   try {
-    liveRewards = await fetchLiveRewards(broadcasterId);
+    liveRewards = await fetchLiveRewards();
   } catch (err) {
     log.error('[create-reward] Could not fetch live rewards:', err.message);
     return { created: [], skipped: [], failed: defined.map(r => r.title) };
@@ -127,7 +169,7 @@ async function syncRewards() {
       continue;
     }
     try {
-      await createReward(broadcasterId, reward);
+      await createRewardOnTwitch(reward);
       log.info(`[create-reward] Created reward: "${reward.title}"`);
       created.push(reward.title);
     } catch (err) {
@@ -141,7 +183,12 @@ async function syncRewards() {
 
 // ── init ──────────────────────────────────────────────────────────────────
 
-async function init() {
+async function init(context) {
+  _twitch = context?.twitch ?? null;
+  if (!_twitch) {
+    log.warn('[create-reward] twitch module not in init context — plugin disabled');
+    return;
+  }
   log.info('[create-reward] Running startup sync…');
   const { created, skipped, failed } = await syncRewards();
   if (created.length) log.info(`[create-reward] Created: ${created.join(', ')}`);
@@ -224,8 +271,7 @@ async function handleInteraction(interaction) {
 
     let liveRewards = [];
     try {
-      const broadcasterId = await getBroadcasterId();
-      if (broadcasterId) liveRewards = await fetchLiveRewards(broadcasterId);
+      if (_twitch) liveRewards = await fetchLiveRewards();
     } catch {
       // Best-effort — show defined list without live status
     }
@@ -289,9 +335,8 @@ async function handleInteraction(interaction) {
 
     let created;
     try {
-      const broadcasterId = await getBroadcasterId();
-      if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
-      created = await createReward(broadcasterId, payload);
+      if (!_twitch) throw new Error('twitch module not in init context');
+      created = await createRewardOnTwitch(payload);
     } catch (err) {
       log.error('[create-reward] /reward add failed:', err.message);
       return interaction.editReply(`❌ Twitch API error: ${err.message}`);
@@ -318,11 +363,10 @@ async function handleInteraction(interaction) {
   if (sub === 'remove') {
     const title = interaction.options.getString('title').trim();
 
-    let broadcasterId, liveRewards;
+    let liveRewards;
     try {
-      broadcasterId = await getBroadcasterId();
-      if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
-      liveRewards = await fetchLiveRewards(broadcasterId);
+      if (!_twitch) throw new Error('twitch module not in init context');
+      liveRewards = await fetchLiveRewards();
     } catch (err) {
       return interaction.editReply(`❌ Could not fetch live rewards: ${err.message}`);
     }
@@ -339,7 +383,7 @@ async function handleInteraction(interaction) {
 
     if (live) {
       try {
-        await deleteReward(broadcasterId, live.id);
+        await deleteRewardFromTwitch(live.id);
         results.push(`✅ Deleted from Twitch (id: \`${live.id}\`)`);
         log.info(`[create-reward] Deleted reward from Twitch: "${title}"`);
       } catch (err) {

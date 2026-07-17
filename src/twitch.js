@@ -753,13 +753,13 @@ async function setRewardEnabled(rewardName, enabled) {
 async function updateStreamInfo({ title, category, tags } = {}) {
   const broadcasterId = await getBroadcasterId();
   if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
- 
+
   const body = {};
- 
+
   if (title !== undefined && title !== null) {
     body.title = String(title).slice(0, 140);
   }
- 
+
   if (category !== undefined && category !== null && category !== '') {
     // Resolve category name → game_id
     const gamesData = await helixRequest('GET', `/games?name=${encodeURIComponent(category)}`);
@@ -768,7 +768,7 @@ async function updateStreamInfo({ title, category, tags } = {}) {
     body.game_id = game.id;
     log.info(`[Twitch] Resolved category "${category}" → game_id ${game.id}`);
   }
- 
+
   if (tags !== undefined && tags !== null) {
     // Sanitise: max 10 tags, each trimmed to 25 chars, no empty strings
     body.tags = tags
@@ -776,18 +776,18 @@ async function updateStreamInfo({ title, category, tags } = {}) {
       .filter(Boolean)
       .slice(0, 10);
   }
- 
+
   if (Object.keys(body).length === 0) {
     log.warn('[Twitch] updateStreamInfo called with no fields to update');
     return;
   }
- 
+
   await helixUserRequest(
     'PATCH',
     `/channels?broadcaster_id=${broadcasterId}`,
     body
   );
- 
+
   const parts = [
     body.title    !== undefined ? `title="${body.title}"`          : null,
     body.game_id  !== undefined ? `category="${category}"`         : null,
@@ -796,16 +796,328 @@ async function updateStreamInfo({ title, category, tags } = {}) {
   log.info(`[Twitch] Stream info updated: ${parts.join(', ')}`);
 }
 
+// ── Channel point reward CRUD ──────────────────────────────────────────────
+//
+// Exposed so plugins (create-reward, 0yt-points, minecraft-link) stop
+// reimplementing helixUserRequest calls inline. All reward operations use
+// the broadcaster's user OAuth token (helixUserRequest) so they work on
+// manually-created rewards too, not just ones created by this app's client ID.
+//
+// Reward shape (Twitch Helix):
+//   { id, title, prompt, cost, is_enabled, is_paused, background_color,
+//     ... }
+//
+// We cache the reward list for 60s to avoid hammering Helix on every lookup.
+
+let _rewardsCache     = null;
+let _rewardsCacheAt    = 0;
+const REWARDS_CACHE_TTL = 60_000;
+
+async function _invalidateRewardsCache() {
+  _rewardsCache  = null;
+  _rewardsCacheAt = 0;
+}
+
+/**
+ * List all custom channel point rewards for the broadcaster.
+ * Cached for 60s; pass { force: true } to bypass.
+ * @returns {Promise<Array>} Array of reward objects from Helix
+ */
+async function listRewards({ force = false } = {}) {
+  if (!force && _rewardsCache && Date.now() - _rewardsCacheAt < REWARDS_CACHE_TTL) {
+    return _rewardsCache;
+  }
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixUserRequest(
+    'GET',
+    `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&only_manageable_rewards=false`
+  );
+  _rewardsCache     = data?.data ?? [];
+  _rewardsCacheAt    = Date.now();
+  return _rewardsCache;
+}
+
+/**
+ * Find a reward by exact title (case-sensitive).
+ * @param {string} title
+ * @returns {Promise<object|null>}
+ */
+async function getRewardByTitle(title) {
+  const rewards = await listRewards();
+  return rewards.find(r => r.title === title) ?? null;
+}
+
+/**
+ * Create a new custom channel point reward.
+ * @param {{ title: string, cost: number, prompt?: string, background_color?: string, is_enabled?: boolean, is_user_input_required?: boolean }} opts
+ * @returns {Promise<object>} The created reward object (includes .id)
+ */
+async function createReward(opts) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  if (!opts?.title)   throw new Error('createReward: opts.title is required');
+  if (!opts?.cost)    throw new Error('createReward: opts.cost is required');
+
+  const body = {
+    title:             String(opts.title).slice(0, 45),
+    cost:              Number(opts.cost),
+    prompt:            opts.prompt ?? '',
+    is_enabled:        opts.is_enabled ?? true,
+    is_user_input_required: opts.is_user_input_required ?? false,
+  };
+  if (opts.background_color) body.background_color = opts.background_color;
+
+  const data = await helixUserRequest(
+    'POST',
+    `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}`,
+    body
+  );
+  const reward = data?.data?.[0];
+  if (reward) log.info(`[Twitch] Reward created: "${reward.title}" (id=${reward.id}, cost=${reward.cost})`);
+  await _invalidateRewardsCache();
+  return reward;
+}
+
+/**
+ * Delete a custom channel point reward by id.
+ * @param {string} rewardId
+ */
+async function deleteReward(rewardId) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  await helixUserRequest(
+    'DELETE',
+    `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${rewardId}`
+  );
+  log.info(`[Twitch] Reward deleted: id=${rewardId}`);
+  await _invalidateRewardsCache();
+}
+
+/**
+ * Patch a custom channel point reward by id.
+ * @param {string} rewardId
+ * @param {object} patch — partial reward fields (is_enabled, is_paused, title, cost, prompt, ...)
+ * @returns {Promise<object>} The updated reward object
+ */
+async function updateReward(rewardId, patch) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixUserRequest(
+    'PATCH',
+    `/channel_points/custom_rewards?broadcaster_id=${broadcasterId}&id=${rewardId}`,
+    patch
+  );
+  const reward = data?.data?.[0];
+  log.info(`[Twitch] Reward updated: id=${rewardId}`);
+  await _invalidateRewardsCache();
+  return reward;
+}
+
+// ── Follower / subscriber counts ────────────────────────────────────────────
+
+/**
+ * Get the broadcaster's follower count.
+ * @returns {Promise<number>}
+ */
+async function getFollowerCount() {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixRequest(
+    'GET',
+    `/channels/followers?broadcaster_id=${broadcasterId}&first=1`
+  );
+  return data?.total ?? 0;
+}
+
+/**
+ * Get the broadcaster's subscriber count (requires channel:read:subscriptions scope).
+ * @returns {Promise<number>}
+ */
+async function getSubscriberCount() {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixUserRequest(
+    'GET',
+    `/subscriptions?broadcaster_id=${broadcasterId}&first=1`
+  );
+  return data?.total ?? 0;
+}
+
+// ── Polls / Predictions ─────────────────────────────────────────────────────
+//
+// Exposed so the poll plugin doesn't have to reimplement Helix plumbing.
+// All operations use the broadcaster user OAuth token.
+
+/**
+ * Create a Twitch poll.
+ * @param {{ title: string, choices: string[], duration: number }} opts
+ *   title    — Poll question (max 60 chars)
+ *   choices  — Array of 2-5 choice strings (each max 25 chars)
+ *   duration — Duration in seconds (min 15, max 1800)
+ * @returns {Promise<object>} The created poll object (includes .id)
+ */
+async function createPoll({ title, choices, duration }) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  if (!title)         throw new Error('createPoll: title is required');
+  if (!Array.isArray(choices) || choices.length < 2 || choices.length > 5) {
+    throw new Error('createPoll: choices must be an array of 2-5 strings');
+  }
+  const body = {
+    broadcaster_id: broadcasterId,
+    title:          String(title).slice(0, 60),
+    choices:        choices.map(c => ({ title: String(c).slice(0, 25) })),
+    duration:       Math.min(1800, Math.max(15, Number(duration) || 15)),
+  };
+  const data = await helixUserRequest('POST', '/polls', body);
+  return data?.data?.[0] ?? null;
+}
+
+/**
+ * End a Twitch poll. If `display` is true, shows the result; if false, hides it.
+ * @param {string} pollId
+ * @param {boolean} display
+ * @returns {Promise<object>}
+ */
+async function endPoll(pollId, display = true) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixUserRequest('PATCH', '/polls', {
+    broadcaster_id: broadcasterId,
+    id:             pollId,
+    status:         display ? 'TERMINATED' : 'ARCHIVED',
+  });
+  return data?.data?.[0] ?? null;
+}
+
+/**
+ * Get the current status of a Twitch poll.
+ * @param {string} pollId
+ * @returns {Promise<object>}
+ */
+async function getPoll(pollId) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const data = await helixUserRequest(
+    'GET',
+    `/polls?broadcaster_id=${broadcasterId}&id=${pollId}`
+  );
+  return data?.data?.[0] ?? null;
+}
+
+/**
+ * Create a Twitch prediction.
+ * @param {{ title: string, outcomes: string[], duration: number }} opts
+ *   title    — Prediction title (max 45 chars)
+ *   outcomes — Array of 2 outcome titles (each max 25 chars)
+ *   duration — Duration in seconds (min 15, max 1800)
+ * @returns {Promise<object>}
+ */
+async function createPrediction({ title, outcomes, duration }) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  if (!title) throw new Error('createPrediction: title is required');
+  if (!Array.isArray(outcomes) || outcomes.length !== 2) {
+    throw new Error('createPrediction: outcomes must be an array of 2 strings');
+  }
+  const body = {
+    broadcaster_id: broadcasterId,
+    title:          String(title).slice(0, 45),
+    outcomes:       outcomes.map(o => ({ title: String(o).slice(0, 25) })),
+    prediction_window: Math.min(1800, Math.max(15, Number(duration) || 15)),
+  };
+  const data = await helixUserRequest('POST', '/predictions', body);
+  return data?.data?.[0] ?? null;
+}
+
+/**
+ * End a prediction: lock it (no more votes) or resolve it (pick winner).
+ * @param {string} predictionId
+ * @param {'LOCK'|'RESOLVE'} status
+ * @param {string} [outcomeId] — required when status is 'RESOLVE'
+ * @returns {Promise<object>}
+ */
+async function endPrediction(predictionId, status, outcomeId) {
+  const broadcasterId = await getBroadcasterId();
+  if (!broadcasterId) throw new Error('Could not resolve broadcaster ID');
+  const body = {
+    broadcaster_id: broadcasterId,
+    id:             predictionId,
+    status,
+  };
+  if (status === 'RESOLVE') {
+    if (!outcomeId) throw new Error('endPrediction: outcomeId required when status is RESOLVE');
+    body.outcome_id = outcomeId;
+  }
+  const data = await helixUserRequest('PATCH', '/predictions', body);
+  return data?.data?.[0] ?? null;
+}
+
+// ── Moderator-scoped helpers (top-level convenience wrappers) ────────────────
+//
+// These are also exposed via modHandlers, but exposing them at the top level
+// gives plugins a cleaner call site: `twitch.ban(user, reason)` instead of
+// `twitch.modHandlers.ban('twitch', user, reason)`. The modHandlers shape
+// only exists for the dispatcher in discord.js / dashboard.js.
+
+async function ban(username, reason) {
+  return twitchBan('twitch', username, reason);
+}
+
+async function timeout(username, duration, reason) {
+  return twitchTimeout('twitch', username, duration, reason);
+}
+
+async function vip(username) {
+  return twitchVip('twitch', username);
+}
+
+async function unvip(username) {
+  return twitchUnvip('twitch', username);
+}
+
 module.exports = {
   say,
   startTwitch,
   setupEventSub,
   getAppToken,
+  getUserToken,
+  helixRequest,
   handleEventSubNotification,
-  setRewardEnabled,
-  helixUserRequest,
   getBroadcasterId,
   updateStreamInfo,
+
+  // Reward CRUD
+  setRewardEnabled,
+  listRewards,
+  getRewardByTitle,
+  createReward,
+  deleteReward,
+  updateReward,
+
+  // Follower / subscriber counts
+  getFollowerCount,
+  getSubscriberCount,
+
+  // Polls / Predictions
+  createPoll,
+  endPoll,
+  getPoll,
+  createPrediction,
+  endPrediction,
+
+  // Helix passthrough (still exposed for plugins that need it, but the
+  // CRUD helpers above should be preferred — they centralise the URL/payload
+  // shape so changes only need to happen here)
+  helixUserRequest,
+
+  // Moderation (top-level convenience)
+  ban,
+  timeout,
+  vip,
+  unvip,
+
   modHandlers: {
     ban:     twitchBan,
     timeout: twitchTimeout,

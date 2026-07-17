@@ -90,10 +90,10 @@ addRoute('/event-feed', (req, res) => {
 // ─── Plugin hooks ─────────────────────────────────────────────────────────────
 
 function init(context) {
-  const q = context.queue ?? context;
+  const q = context.queue;
 
   // Redeems
-  if (typeof q.onRedeem === 'function') {
+  if (typeof q?.onRedeem === 'function') {
     q.onRedeem(redeem => {
       const title = (redeem.title ?? redeem.reward?.title ?? 'Unknown').replace(/\s*\[YT\]\s*$/i, '').trim();
       const user  = redeem.username ?? redeem.user ?? 'someone';
@@ -103,7 +103,7 @@ function init(context) {
   }
 
   // Bits / subs / follows / likes / etc.
-  if (typeof q.onDonation === 'function') {
+  if (typeof q?.onDonation === 'function') {
     q.onDonation(event => {
       const user = event.username ?? 'someone';
       switch (event.type) {

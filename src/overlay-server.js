@@ -729,4 +729,139 @@ function _getSectionData(id) {
   return _sections.get(id)?.data ?? null;
 }
 
-module.exports = { startOverlayServer, registerSection, updateSection, updatePollOverlay, addRoute, _getSectionMeta, _getSectionData };
+/**
+ * Build a self-contained standalone HTML page that renders exactly one
+ * registered section (plus its live SSE-driven data).
+ *
+ * Plugins that need a dedicated OBS browser source for their section —
+ * instead of appearing in the main /overlay mosaic — should call this
+ * helper from an addRoute() handler:
+ *
+ *   addRoute('/my-plugin', (req, res) => {
+ *     const html = buildStandaloneSectionPage('my-plugin');
+ *     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+ *     res.end(html);
+ *   });
+ *
+ * @param {string} sectionId  The id passed to registerSection()
+ * @param {{ title?: string }} [opts]  Optional page <title> override
+ * @returns {string}  Complete HTML document
+ */
+function buildStandaloneSectionPage(sectionId, opts = {}) {
+  const s = _sections.get(sectionId);
+  if (!s) {
+    return `<!DOCTYPE html><html><body><pre>Section "${sectionId}" not registered</pre></body></html>`;
+  }
+
+  const pageTitle = opts.title ?? s.title ?? sectionId;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${pageTitle}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --red:      #e53935;
+    --red-dim:  #7f1d1d;
+    --red-glow: rgba(229, 57, 53, 0.15);
+    --bg:       rgba(10, 8, 8, 0.92);
+    --border:   rgba(229, 57, 53, 0.3);
+    --text:     #f0e0e0;
+    --muted:    #6b4040;
+    --twitch:   #9147ff;
+    --youtube:  #ff0000;
+  }
+  html, body { background: transparent; width: 420px; font-family: 'Inter', sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
+  .overlay-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; width: 420px; }
+  .overlay-card[data-state="closed"] { border-color: var(--red-dim); opacity: 0.55; }
+  .overlay-card[data-state="closed"] .section-header { background: rgba(127,29,29,0.4); }
+  .overlay-card[data-state="closed"] .section-title  { color: var(--muted); }
+  .section-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: rgba(229,57,53,0.08); }
+  .section-icon   { width: 22px; height: 22px; flex-shrink: 0; }
+  .section-title  { font-size: 13px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--red); }
+  .section-badge  { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
+  .section-body   { /* delegate to plugin render fn */ }
+  .msg-reconnecting { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--red); border-top: 1px solid rgba(229,57,53,0.2); animation: blink 1s step-start infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<div class="overlay-card" id="card-${sectionId}">
+  <div class="section-header">
+    <span class="section-icon">${s.icon ?? ''}</span>
+    <span class="section-title">${s.title ?? sectionId}</span>
+    <span class="section-badge" id="badge-${sectionId}"></span>
+  </div>
+  <div class="section-body" id="body-${sectionId}"></div>
+</div>
+<div class="msg-reconnecting" id="reconn-${sectionId}" style="display:none">⚠ RECONNECTING…</div>
+
+<script>
+(function () {
+  const SECTION_ID  = ${JSON.stringify(sectionId)};
+  const RENDER_SRC  = ${JSON.stringify(s.render)};
+  const INITIAL_DATA = ${JSON.stringify(s.data)};
+
+  let renderFn;
+  try { renderFn = new Function('return (' + RENDER_SRC + ')')(); }
+  catch (e) { console.error('[overlay-standalone] compile error in', SECTION_ID, e); renderFn = function () {}; }
+
+  const card   = document.getElementById('card-' + SECTION_ID);
+  const body   = document.getElementById('body-' + SECTION_ID);
+  const badge  = document.getElementById('badge-' + SECTION_ID);
+  const reconn = document.getElementById('reconn-' + SECTION_ID);
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function invoke(data) {
+    if (!renderFn || !body) return;
+    try { renderFn(data, body, esc, { card, badge }); }
+    catch (e) { console.error('[overlay-standalone] render error in', SECTION_ID, e); }
+  }
+
+  invoke(INITIAL_DATA);
+
+  let es;
+  function connect() {
+    es = new EventSource('/sse');
+    es.onopen    = () => { reconn.style.display = 'none'; };
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'section' && msg.id === SECTION_ID) invoke(msg.data);
+      } catch {}
+    };
+    es.onerror = () => {
+      reconn.style.display = 'block';
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>`;
+}
+
+module.exports = {
+  startOverlayServer,
+  registerSection,
+  updateSection,
+  updatePollOverlay,
+  addRoute,
+  // Public helper — plugins that need a standalone OBS page for their
+  // section should use this instead of reaching into _getSectionMeta/_Data.
+  buildStandaloneSectionPage,
+  // Legacy private helpers — kept for backward compat, prefer
+  // buildStandaloneSectionPage() for new code.
+  _getSectionMeta,
+  _getSectionData,
+};

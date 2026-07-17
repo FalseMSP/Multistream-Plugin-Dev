@@ -19,9 +19,9 @@
 
 const { addRoute, registerSection, updateSection } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
-const twitch    = require('../../twitch'); 
-const queue = require('../../queue');
 const log   = require('../../logger');
+
+// queue is injected via init(context) — see init() below.
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -435,14 +435,15 @@ addRoute('/combined', (_req, res) => {
 
 // ─── Plugin entry point ───────────────────────────────────────────────────────
 
-function init(_context) {
+function init(context) {
+  const queue = context.queue;
   if (!queue?.onMessage) {
-    log.warn('[chat-overlay] queue.onMessage not available — chat messages will not appear.');
+    log.warn('[chat-overlay] queue not in init context — chat messages will not appear.');
     return;
   }
 
   queue.onMessage(msg => {
-    if (!msg) return; 
+    if (!msg) return;
 
     const { platform, username, message, color, emotes, ytEmotes, thirdPartyEmotes } = msg;
     if (!message || !username) return;
@@ -451,7 +452,7 @@ function init(_context) {
       pushMessage('youtube', username, message, color, undefined, ytEmotes ?? emotes, thirdPartyEmotes);
       return;
     }
-    
+
     if (platform === 'twitch') {
       pushMessage('twitch', username, message, color, emotes || undefined, undefined, thirdPartyEmotes);
     }

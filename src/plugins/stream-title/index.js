@@ -245,8 +245,13 @@ module.exports = {
   id: 'stream-title',
 
   init(context) {
-    try { _twitch  = require('../../twitch');  } catch { log.warn('[stream-title] twitch module not found'); }
-    try { _youtube = require('../../youtube'); } catch { log.warn('[stream-title] youtube module not found'); }
+    // Use the twitch + youtube modules provided via the documented init
+    // contract instead of lazy-requiring them. This both removes a hidden
+    // circular-dependency risk and makes the dependency explicit.
+    _twitch  = context.twitch  ?? null;
+    _youtube = context.youtube ?? null;
+    if (!_twitch)  log.warn('[stream-title] twitch module not in init context');
+    if (!_youtube) log.warn('[stream-title] youtube module not in init context');
 
     dashboard.registerAction('set-stream-info', _handleAction);
     _notify();

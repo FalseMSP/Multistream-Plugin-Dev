@@ -6,30 +6,23 @@
  * Dashboard widget that shows all active stream links (YouTube video IDs +
  * Twitch channel) with an × button to disable each one.
  *
- * ── Prerequisites ────────────────────────────────────────────────────────────
- *
- * Add the following export to youtube.js so this plugin can stop sessions:
- *
- *   stopSession(videoId) {
- *     const session = _activeSessions.get(videoId);
- *     if (!session) return false;
- *     session.stopSignal.stopped = true;
- *     if (session.likePollerTimer) clearInterval(session.likePollerTimer);
- *     _activeSessions.delete(videoId);
- *     return true;
- *   },
+ * Uses the youtube module's stopSession() public API via init(context) to
+ * stop YouTube sessions on demand — no require() of the main module inside
+ * the action handler.
  *
  * ── Env vars ─────────────────────────────────────────────────────────────────
  *
  *   TWITCH_CHANNEL  — Twitch channel name (set automatically by the Twitch
  *                     module; read here for display purposes)
  *   YT_CHANNEL_ID   — YouTube channel ID (used to build the channel link)
- *
- * Place this file at:  src/plugins/stream-links/index.js
  */
 
 const log       = require('../../logger');
 const dashboard = require('../../dashboard');
+
+// ── Plugin context (set in init) ───────────────────────────────────────────
+
+let _youtube = null;
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -170,17 +163,17 @@ dashboard.registerAction('stream-links:disable', async (body) => {
 
   if (stream.platform === 'youtube') {
     const videoId = id.replace(/^yt:/, '');
+    if (!_youtube) {
+      return { ok: false, error: 'youtube module not in init context — cannot stop session' };
+    }
     try {
-      const youtube = require('../../youtube');
-      if (typeof youtube.stopSession === 'function') {
-        const stopped = youtube.stopSession(videoId);
+      if (typeof _youtube.stopSession === 'function') {
+        const stopped = _youtube.stopSession(videoId);
         if (!stopped) {
           log.warn(`[stream-links] youtube.stopSession(${videoId}) returned false — session may already be gone`);
         }
       } else {
-        // Fallback: youtube.js doesn't yet export stopSession.
-        // We still remove it from our widget so the operator knows we tried.
-        log.warn('[stream-links] youtube.stopSession not available — add it to youtube.js exports. Removing from widget only.');
+        log.warn('[stream-links] youtube.stopSession not available in module exports — removing from widget only.');
       }
     } catch (err) {
       log.error(`[stream-links] Failed to stop YouTube session ${videoId}:`, err.message);
@@ -208,6 +201,11 @@ dashboard.registerAction('stream-links:disable', async (body) => {
  * YouTube entries are picked up lazily via processMessage.
  */
 function init(context) {
+  _youtube = context.youtube ?? null;
+  if (!_youtube) {
+    log.warn('[stream-links] youtube module not in init context — YT disable button will be unavailable');
+  }
+
   const twitchChannel = process.env.TWITCH_CHANNEL;
   if (twitchChannel && !_twitchRegistered) {
     _twitchRegistered = true;

@@ -149,12 +149,12 @@ function _onRedeem(redeem) {
 function init(context) {
   _load();
 
-  const q = context.queue ?? context;
+  const q = context.queue;
 
-  if (typeof q.onRedeem === 'function') {
+  if (typeof q?.onRedeem === 'function') {
     q.onRedeem(_onRedeem);
   } else {
-    log.warn('[pull-fragment] context.queue.onRedeem not available — fragment detection disabled');
+    log.warn('[pull-fragment] context.queue not available — fragment detection disabled');
   }
 
   log.info(`[pull-fragment] Loaded. ${FRAGMENTS_NEEDED} fragments → 1 premium pull.`);

@@ -28,7 +28,7 @@
 
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
-const { registerSection, updateSection, addRoute } = require('../../overlay-server');
+const { registerSection, updateSection, addRoute, buildStandaloneSectionPage } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -225,103 +225,14 @@ addRoute('/api/gd-queue/next', (req, res) => {
 
 // Serves a self-contained overlay page showing only the queue section.
 // Add http://<host>:2999/gd-queue as a Browser Source in OBS.
+//
+// Uses overlay-server's buildStandaloneSectionPage() public helper instead
+// of reaching into private _getSectionMeta / _getSectionData exports. This
+// drops ~95 lines of duplicated HTML/CSS/JS boilerplate that was previously
+// inlined here.
 
 addRoute('/gd-queue', (req, res) => {
-  const section = require('../../overlay-server')._getSectionMeta('gd-queue');
-  const data    = require('../../overlay-server')._getSectionData('gd-queue');
-
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>GD Level Queue</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
-<style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --red:      #e53935;
-    --red-dim:  #7f1d1d;
-    --red-glow: rgba(229, 57, 53, 0.15);
-    --bg:       rgba(10, 8, 8, 0.92);
-    --border:   rgba(229, 57, 53, 0.3);
-    --text:     #f0e0e0;
-    --muted:    #6b4040;
-    --twitch:   #9147ff;
-    --youtube:  #ff0000;
-  }
-  html, body { background: transparent; width: 420px; font-family: 'Inter', sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
-  .overlay-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; width: 420px; }
-  .overlay-card[data-state="closed"] { border-color: var(--red-dim); opacity: 0.55; }
-  .overlay-card[data-state="closed"] .section-header { background: rgba(127,29,29,0.4); }
-  .overlay-card[data-state="closed"] .section-title  { color: var(--muted); }
-  .section-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: rgba(229,57,53,0.08); }
-  .section-icon   { width: 22px; height: 22px; flex-shrink: 0; }
-  .section-title  { font-size: 13px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--red); }
-  .section-badge  { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
-  .entry { display: grid; grid-template-columns: 28px 1fr; align-items: center; gap: 4px 10px; padding: 8px 14px; border-bottom: 1px solid rgba(229,57,53,0.08); animation: fadeIn 0.2s ease; }
-  .entry:last-child { border-bottom: none; }
-  .entry:first-child { background: var(--red-glow); border-left: 3px solid var(--red); }
-  .entry:first-child .entry-id  { color: #fff; }
-  .entry:first-child .entry-pos { color: var(--red); }
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
-  .entry-pos  { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); text-align: right; font-weight: 700; }
-  .entry-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .entry-id   { font-size: 18px; font-weight: 700; color: var(--red); letter-spacing: 0.02em; line-height: 1.1; }
-  .entry-user { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .entry-notes { grid-column: 1/-1; font-size: 11px; color: rgba(229,57,53,0.4); font-style: italic; padding-left: 38px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .platform-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-  .platform-dot.twitch  { background: var(--twitch); }
-  .platform-dot.youtube { background: var(--youtube); }
-  .msg { padding: 16px 14px; font-size: 12px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; text-align: center; }
-  .msg-empty  { color: var(--muted); }
-  .msg-closed { color: var(--red-dim); }
-</style>
-</head>
-<body>
-<div class="overlay-card" id="card">
-  <div class="section-header">
-    <span class="section-icon"><svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <polygon points="11,2 13.5,8.5 20.5,8.5 14.9,12.7 17,19.5 11,15.3 5,19.5 7.1,12.7 1.5,8.5 8.5,8.5"
-               fill="none" stroke="#00e5ff" stroke-width="1.4" stroke-linejoin="round"/>
-    </svg></span>
-    <span class="section-title">Level Queue</span>
-    <span class="section-badge" id="badge"></span>
-  </div>
-  <div class="section-body" id="body"></div>
-</div>
-
-<script>
-(function () {
-  const renderFn    = new Function('return (' + ${JSON.stringify(section ? section.render : '() => {}')} + ')')();
-  const initialData = ${JSON.stringify(data)};
-  const card        = document.getElementById('card');
-  const body        = document.getElementById('body');
-  const badge       = document.getElementById('badge');
-
-  function esc(s) {
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  }
-
-  function invoke(data) {
-    try { renderFn(data, body, esc, { card, badge }); } catch (e) { console.error('[gd-queue]', e); }
-  }
-
-  invoke(initialData);
-
-  const es = new EventSource('/sse');
-  es.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'section' && msg.id === 'gd-queue') invoke(msg.data);
-    } catch {}
-  };
-  es.onerror = () => setTimeout(() => location.reload(), 3000);
-})();
-</script>
-</body>
-</html>`;
-
+  const html = buildStandaloneSectionPage('gd-queue', { title: 'GD Level Queue' });
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(html);
 });

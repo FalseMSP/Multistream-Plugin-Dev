@@ -31,24 +31,39 @@ process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err)
 async function main() {
   log.info('chat-mirror starting…');
 
-  // 1. Discord bot (also loads + inits plugins)
+  // 1. Discover plugins (idempotent — safe to call before discord is up).
+  //    We load plugin FILES early so their top-level registerSection() /
+  //    registerWidget() / addRoute() calls execute before the overlay server
+  //    starts listening. init() is NOT called yet — that happens in step 1c
+  //    once we have the full runtime context to hand them.
+  plugins.loadPlugins();
+
+  // 2. Start Discord bot (loads slash commands, sets up interaction router).
+  //    Note: startDiscordBot no longer calls plugins.initPlugins() itself —
+  //    we do that explicitly below with the full context so plugins get
+  //    queue + twitch + youtube + discord.client in a single init pass.
   const discord = await startDiscordBot();
 
-  // 1b. Re-init plugins with a merged context so queue-aware plugins (e.g. sfx)
-  //     can subscribe to queue events. loadPlugins() is idempotent — skips
-  //     already-loaded ids. initPlugins() runs init() again with the richer context.
-  plugins.loadPlugins();
-  plugins.initPlugins({ ...discord, queue });
+  // 2b. Initialise plugins ONCE with the full runtime context. This is the
+  //     only init pass — no duplicate "first init without queue" anymore,
+  //     which previously caused the spurious "context.queue not available"
+  //     warnings in gacha / sfx / event-feed / stream-events / pull-fragment.
+  plugins.initPlugins({
+    discord,
+    queue,
+    twitch: twitchModule,
+    youtube: ytModule,
+  });
+
+  // 2c. Mount dashboard routes on the overlay server, then start the HTTP
+  //     server. OBS Browser Source URL: http://127.0.0.1:2999/overlay
   dashboard.mountOnOverlayServer(require('./src/overlay-server'));
-  
-  // 1c. ▶ ADD THIS LINE — start the overlay HTTP server.
-  //     Port is optional; defaults to 2999.
-  //     OBS Browser Source URL: http://127.0.0.1:2999/overlay
   startOverlayServer(2999);
 
-  // 2. Wire queue → Discord embeds.
-  //    By the time onMessage fires, queue.pushMessage has already run the plugin
-  //    pipeline — msg is the filtered finalMsg, suppressed messages never arrive.
+  // 3. Wire queue → Discord embeds + dashboard chat feed.
+  //    By the time onMessage fires, queue.pushMessage has already run the
+  //    plugin pipeline — msg is the filtered finalMsg, suppressed messages
+  //    never arrive.
   queue.onMessage(async (msg) => {
     // Subscribe/membership events have no chat text — build a simple announcement.
     if (msg.type === 'subscribe') {
@@ -71,10 +86,10 @@ async function main() {
     discord.sendChat(msg);
     dashboard.pushChatMessage(msg);
   });
-  queue.onRedeem((redeem)  => discord.sendRedeem(redeem));
-  queue.onDonation((donation)  => discord.sendDonation(donation));
-  
-  // 3. Wire mod action handlers: Discord /ban /vip → Twitch & YouTube
+  queue.onRedeem((redeem)    => discord.sendRedeem(redeem));
+  queue.onDonation((donation) => discord.sendDonation(donation));
+
+  // 4. Wire mod action handlers: Discord /ban /vip → Twitch & YouTube
   discord.onModAction('ban', async (platform, username, reason) => {
     if (platform === 'twitch')  return twitchModule.modHandlers.ban('twitch', username, reason);
     if (platform === 'youtube') return ytModule.modHandlers.ban('youtube', username, reason);
@@ -88,10 +103,10 @@ async function main() {
     if (platform === 'youtube') return ytModule.modHandlers.unvip('youtube', username);
   });
 
-  // 4. YouTube WebSub + EventSub HTTP server
+  // 5. YouTube WebSub + EventSub HTTP server
   const websubRunning = await startWebSub(queue);
 
-  // 5. Purge any stale Twitch EventSub subs from previous runs, then
+  // 6. Purge any stale Twitch EventSub subs from previous runs, then
   //    register a fresh one — both must happen AFTER the server is listening
   //    so Twitch can reach /eventsub for the challenge handshake.
   const { getEventSubCallbackUrl, getTwitchSecret, purgeStaleTwitchSubs } = require('./src/websub');
@@ -105,20 +120,25 @@ async function main() {
     await twitchModule.setupEventSub(getEventSubCallbackUrl(), getTwitchSecret());
   }
 
-  // 6. Twitch IRC (chat mirroring)
+  // 7. Twitch IRC (chat mirroring)
   await twitchModule.startTwitch(queue);
 
-  // 7. YouTube chat + watchdog
+  // 8. YouTube chat + watchdog
   await ytModule.startYouTube(queue, websubRunning);
 
-  // 8. Now that both platform clients are up, give plugins access to chat reply.
+  // 9. Now that both platform clients are up, give plugins access to chat reply.
+  //    chatReply is the documented way for plugins to send messages back to
+  //    Twitch or YouTube chat. Two flavours:
+  //      chatReply.twitch(text)                — broadcast to primary Twitch channel
+  //      chatReply.youtube(text)               — broadcast to all live YT sessions
+  //      chatReply.youtubeSession(videoId, text) — target one specific YT live stream
   plugins.setChatReply({
-    twitch:  (text) => twitchModule.say(text),
-    youtube: (text) => ytModule.say(text),
-    _youtubeSession: (videoId, text) => youtube.sayTo(videoId, text),
+    twitch:         (text) => twitchModule.say(text),
+    youtube:        (text) => ytModule.say(text),
+    youtubeSession: (videoId, text) => ytModule.sayTo(videoId, text),
   });
 
-  // 9. Register Discord slash commands (idempotent guild deploy)
+  // 10. Register Discord slash commands (idempotent guild deploy)
   await discord.registerCommands();
 
   log.info('chat-mirror running. Ctrl+C to stop.');
