@@ -66,7 +66,7 @@
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const fs   = require('fs');
 const path = require('path');
-const log  = require('../../logger');
+const log  = require('../logger');
 const commandsList = require('../commands-list');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
