@@ -13,7 +13,7 @@
  *   /timer pause                — freeze the timer at its current value
  *   /timer resume               — resume from where pause froze it
  *   /timer reset                — stop and reset to the last set duration
- *   /timer status               — reply with current state
+ *   /timer status                — reply with current state
  *
  * Dashboard widget (at /dashboard):
  *   Same five buttons (Set / Start / Pause / Resume / Reset) + a live
@@ -538,9 +538,19 @@ async function handleInteraction(interaction) {
 // ── Standalone OBS overlay page ────────────────────────────────────────────
 //
 // We don't use buildStandaloneSectionPage() here because the timer needs a
-// custom RAF tick loop and a different visual treatment (sleek speedrun
-// look — no card chrome, just glowing digits on a transparent background).
+// custom tick loop and a different visual treatment (sleek speedrun look —
+// no card chrome, just glowing digits on a transparent background).
 // The SSE subscription is the same /sse stream the rest of the overlay uses.
+//
+// NOTE on ticking: OBS's Browser Source runs on Chromium (CEF), which
+// throttles/suspends requestAnimationFrame for pages it considers
+// "not visible" — which includes a browser source sitting on a scene that
+// isn't the currently active/program scene. A purely rAF-driven tick loop
+// will silently freeze in that situation even though the underlying data
+// keeps arriving over SSE. To avoid that we (a) pin the Page Visibility API
+// to "visible" so Chromium doesn't throttle timers, (b) drive the tick off
+// setInterval instead of requestAnimationFrame, and (c) render immediately
+// whenever a new SSE message arrives instead of only from the tick loop.
 
 function buildTimerOverlayHtml() {
   return /* html */`<!DOCTYPE html>
@@ -636,6 +646,16 @@ function buildTimerOverlayHtml() {
 
 <script>
 (function () {
+  // OBS's Browser Source (CEF) throttles requestAnimationFrame / timers
+  // when it considers the page "not visible" — which happens whenever this
+  // source isn't on the currently active scene. Pin visibility to "visible"
+  // so ticking never silently stalls while the overlay is off-screen.
+  try {
+    Object.defineProperty(document, 'hidden', { value: false, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  } catch (_) {}
+
   var display = document.getElementById('display');
   var reconn  = document.getElementById('reconn');
 
@@ -673,17 +693,21 @@ function buildTimerOverlayHtml() {
     display.classList.toggle('paused', !running);
   }
 
-  function tick() { render(); requestAnimationFrame(tick); }
-  requestAnimationFrame(tick);
+  // Drive ticking off setInterval rather than requestAnimationFrame — rAF
+  // is exactly what OBS/CEF throttles when this source isn't the active
+  // scene. A plain interval (with visibility pinned above) keeps firing
+  // regardless of whether the source is currently on-screen.
+  setInterval(render, 250);
 
   function connect() {
     var es = new EventSource('/sse');
-    es.onopen = function () { reconn.style.display = 'none'; };
+    es.onopen = function () { reconn.style.display = 'none'; render(); };
     es.onmessage = function (e) {
       try {
         var msg = JSON.parse(e.data);
         if (msg.type === 'section' && msg.id === 'timer') {
           latest = msg.data;
+          render(); // redraw immediately on every push, don't wait for the next tick
         }
       } catch (_) {}
     };
