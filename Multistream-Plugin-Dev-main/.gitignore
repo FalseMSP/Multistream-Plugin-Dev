@@ -1,0 +1,26 @@
+.env
+src/plugins/zfirst-time-chatter/seen.json
+package-lock.json
+
+# ClipCurator (Next.js app)
+clipcurator/node_modules
+clipcurator/.next
+clipcurator/out
+clipcurator/.env
+clipcurator/*.log
+clipcurator/dev.log
+clipcurator/server.log
+clipcurator/.vercel
+clipcurator/*.tsbuildinfo
+clipcurator/next-env.d.ts
+clipcurator/bun.lock
+clipcurator/package-lock.json
+
+# Clipper backend (Python)
+clipper/.venv
+clipper/__pycache__
+clipper/*.pyc
+clipper/.env
+
+# Clipper data (VODs and clips are large files)
+/tmp/clipcurator/

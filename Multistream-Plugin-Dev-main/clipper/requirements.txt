@@ -1,0 +1,31 @@
+# ClipCurator Python clipper backend
+# CPU-optimized video processing service
+
+faster-whisper==1.1.0
+# Uses CTranslate2 CPU backend — no CUDA needed, runs fast on modern CPUs
+ctranslate2>=4.0
+
+# FastAPI server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Video processing
+yt-dlp>=2024.12.0
+
+# Audio analysis
+librosa>=0.10.2
+soundfile>=0.12.1
+numpy>=1.26.0
+
+# YouTube upload
+google-api-python-client>=2.150.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1
+
+# Utilities
+python-dotenv>=1.0.0
+httpx>=0.27.0
+aiofiles>=24.1.0
+
+# HTTP for YouTube uploads
+httplib2>=0.22.0
