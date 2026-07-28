@@ -582,6 +582,23 @@ async def publish_to_youtube(
 
     tokens = json.loads(YT_TOKENS_FILE.read_text())
 
+    # Load client_id / client_secret from client_secret.json (same file youtube_auth.js uses)
+    # Falls back to env vars if the file is not present.
+    client_secret_file = Path(__file__).resolve().parent.parent / "client_secret.json"
+    client_id = ""
+    client_secret = ""
+    if client_secret_file.exists():
+        try:
+            cs_data = json.loads(client_secret_file.read_text())
+            installed = cs_data.get("installed", cs_data.get("web", {}))
+            client_id = installed.get("client_id", "")
+            client_secret = installed.get("client_secret", "")
+        except Exception as e:
+            log.warning(f"[publish] Could not parse client_secret.json: {e}")
+    # Override with env vars if available (e.g. YT_CLIENT_ID / YT_CLIENT_SECRET in .env)
+    client_id = os.environ.get("YT_CLIENT_ID", client_id)
+    client_secret = os.environ.get("YT_CLIENT_SECRET", client_secret)
+
     # Use google-auth to build credentials from the saved tokens
     try:
         from google.oauth2.credentials import Credentials
@@ -590,15 +607,20 @@ async def publish_to_youtube(
     except ImportError:
         raise RuntimeError("google-api-python-client not installed. Run: pip install google-api-python-client")
 
-    # Build credentials from saved tokens
-    # The tokens file from youtube_auth.js has: access_token, refresh_token, token_uri, client_id, client_secret, scopes, expiry
+    # Build credentials from saved tokens + client creds
+    # The tokens file from youtube_auth.js has: access_token, refresh_token, scope, expiry
+    # client_id/client_secret come from client_secret.json or env vars
+    scopes = tokens.get("scope", tokens.get("scopes", ["https://www.googleapis.com/auth/youtube.force-ssl"]))
+    if isinstance(scopes, str):
+        scopes = scopes.split(" ")
+
     creds = Credentials(
         token=tokens.get("access_token", ""),
         refresh_token=tokens.get("refresh_token", ""),
-        token_uri=tokens.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=tokens.get("client_id", ""),
-        client_secret=tokens.get("client_secret", ""),
-        scopes=tokens.get("scopes", ["https://www.googleapis.com/auth/youtube.force-ssl"]),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
     )
 
     # Refresh if expired

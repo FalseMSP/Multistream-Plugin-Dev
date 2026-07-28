@@ -748,6 +748,8 @@ function _buildHtml() {
 
 /** @type {Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>} */
 const _extraRoutes = new Map();
+/** @type {Map<string, Function>} prefix → handler for prefix-matched routes */
+const _prefixRoutes = new Map();
 
 /**
  * Register a custom GET route on the overlay server.
@@ -760,6 +762,25 @@ const _extraRoutes = new Map();
 function addRoute(path, handler) {
   _extraRoutes.set(path, handler);
   log.info(`[overlay] Extra route registered: GET ${path}`);
+}
+
+/**
+ * Register a prefix-based route on the overlay server.
+ * Any request whose URL starts with `prefix` will be forwarded to `handler`.
+ * The handler receives (req, res) — the original req.url is preserved
+ * (still contains the full path including the prefix).
+ *
+ * Prefix routes are checked BEFORE exact-match routes and static files.
+ * If multiple prefixes match, the longest prefix wins.
+ *
+ * @param {string}   prefix   URL prefix to match, e.g. '/clipcurator'
+ * @param {Function} handler  (req, res) => void
+ */
+function addPrefixRoute(prefix, handler) {
+  // Ensure prefix starts with / and doesn't end with /
+  prefix = '/' + prefix.replace(/^\/+|\/+$/g, '');
+  _prefixRoutes.set(prefix, handler);
+  log.info(`[overlay] Prefix route registered: ${prefix}/*`);
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────
@@ -874,6 +895,26 @@ function startOverlayServer(port = 2999) {
         redeemBufferMax:  EXTERNAL_BUFFER_MAX,
       }));
       return;
+    }
+
+    // ── Prefix-based routes (checked before exact routes) ───────────────
+    // Longest prefix wins if multiple match.
+    if (_prefixRoutes.size > 0) {
+      let matchedPrefix = '';
+      let matchedHandler = null;
+      for (const [prefix, handler] of _prefixRoutes) {
+        if (url.startsWith(prefix) && prefix.length > matchedPrefix.length) {
+          matchedPrefix = prefix;
+          matchedHandler = handler;
+        }
+      }
+      if (matchedHandler) {
+        try { matchedHandler(req, res); } catch (e) {
+          log.error('[overlay] Prefix route error:', e.message);
+          res.writeHead(500); res.end('Internal error');
+        }
+        return;
+      }
     }
 
     // Plugin-registered extra routes
@@ -1042,6 +1083,7 @@ module.exports = {
   updateSection,
   updatePollOverlay,
   addRoute,
+  addPrefixRoute,
   // Public helper — plugins that need a standalone OBS page for their
   // section should use this instead of reaching into _getSectionMeta/_Data.
   buildStandaloneSectionPage,
