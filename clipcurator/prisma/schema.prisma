@@ -1,0 +1,97 @@
+// ClipCurator Prisma schema
+// SQLite is used for the sandbox environment (PostgreSQL in production per spec)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  role      String   @default("REVIEWER") // ADMIN | REVIEWER
+  avatarUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clips     Clip[]
+  streams   StreamSource[]
+}
+
+model StreamSource {
+  id            String   @id @default(cuid())
+  url           String
+  platform      String   // TWITCH | YOUTUBE
+  title         String?
+  streamerName  String?
+  durationSec   Int?
+  downloadedAt  DateTime?
+  status        String   @default("PENDING") // PENDING | DOWNLOADING | ANALYZING | READY | FAILED
+  storagePath   String?  // mock R2/S3 key for full VOD
+  errorMessage  String?
+  progress      Int      @default(0) // 0-100
+  clipCount     Int      @default(0)
+  submittedById String?
+  submitter     User?    @relation(fields: [submittedById], references: [id])
+  clips         Clip[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model Clip {
+  id              String   @id @default(cuid())
+  sourceId        String
+  source          StreamSource @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  // Timing (seconds)
+  startTimeSec    Float
+  endTimeSec      Float
+  suggestedStart  Float
+  suggestedEnd    Float
+
+  // Review state
+  status          String   @default("PENDING") // PENDING | IN_REVIEW | APPROVED_A | APPROVED_B | REJECTED | PUBLISHING | PUBLISHED | FAILED
+  reviewerId      String?
+  reviewer        User?    @relation(fields: [reviewerId], references: [id])
+  reviewedAt      DateTime?
+
+  // Final output
+  finalStartSec   Float?
+  finalEndSec     Float?
+  storagePath     String?
+  youtubeVideoId  String?
+  publishedTo     String?  // CHANNEL_A | CHANNEL_B
+  publishedAt     DateTime?
+
+  // Metadata
+  engagementScore Float    @default(0) // 0.0 - 1.0
+  transcript      String?
+  chatVelocity    Int?     // msgs/sec at peak
+  thumbnailUrl    String?
+  peakPhrase      String?  // the highlight phrase from transcript
+
+  // Retry tracking
+  publishAttempts Int      @default(0)
+  errorMessage    String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model JobLog {
+  id          String   @id @default(cuid())
+  sourceId    String?
+  clipId      String?
+  jobType     String   // download-vod | analyze-stream | render-final-clip | publish-to-youtube
+  status      String   @default("QUEUED") // QUEUED | ACTIVE | COMPLETED | FAILED
+  progress    Int      @default(0)
+  payload     String?  // JSON string
+  error       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
