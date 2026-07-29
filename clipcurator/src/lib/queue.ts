@@ -1,17 +1,19 @@
-// In-memory job queue that dispatches work to the Python clipper backend
-// (clipper.py on port 8100).
+// PATCHED src/lib/queue.ts — fixes two bugs that caused downloads to appear
+// stuck at 5%:
 //
-// Job lifecycle:  QUEUED → ACTIVE → COMPLETED | FAILED
+// Bug 1: The heartbeat updated the in-memory JOB progress but NOT the
+//        StreamSource's progress field in the DB. The dashboard reads
+//        source.progress, so even when downloading worked, it looked frozen.
+//        FIX: The heartbeat now also updates source.progress in the DB.
 //
-// Each job calls a real clipper endpoint:
-//   download-vod       → POST /download   (yt-dlp)
-//   analyze-stream     → POST /analyze    (Whisper + librosa + chat velocity + laughter)
-//   render-final-clip  → POST /render     (FFmpeg + optional subtitles + backing track)
-//   publish-to-youtube → POST /publish    (YouTube Data API v3, multi-channel)
+// Bug 2: When downloadVod() threw (clipper unreachable, yt-dlp failed),
+//        runJob's catch block marked the JOB as FAILED but never updated
+//        the source — so it stayed at DOWNLOADING/5% forever.
+//        FIX: Each job function now has its own try/catch that marks the
+//        source/clip as FAILED with an error message before re-throwing.
 //
-// Progress is reported via a heartbeat timer that bumps the progress % every
-// few seconds while the HTTP call is in flight, so the UI shows activity
-// even when yt-dlp or Whisper takes minutes.
+// Also added console.log/error calls throughout so errors show up in
+// journalctl instead of being silently swallowed.
 
 import { db } from "@/lib/db";
 import {
@@ -82,6 +84,7 @@ function createJob(
   };
   jobs.set(id, job);
   emit();
+  console.log(`[queue] Job ${id} created: ${type}`, refs);
   setTimeout(() => runJob(id), 50);
   return job;
 }
@@ -92,6 +95,7 @@ async function runJob(id: string) {
   job.status = "ACTIVE";
   job.updatedAt = Date.now();
   emit();
+  console.log(`[queue] Job ${id} starting: ${job.type}`);
 
   try {
     switch (job.type) {
@@ -110,9 +114,11 @@ async function runJob(id: string) {
     }
     job.status = "COMPLETED";
     job.progress = 100;
+    console.log(`[queue] Job ${id} completed: ${job.type}`);
   } catch (err) {
     job.status = "FAILED";
     job.error = err instanceof Error ? err.message : String(err);
+    console.error(`[queue] Job ${id} FAILED: ${job.type}`, err);
   }
   job.updatedAt = Date.now();
   emit();
@@ -135,17 +141,28 @@ async function runJob(id: string) {
   }
 }
 
+// Heartbeat: bumps the in-memory job progress AND the source/clip progress
+// in the DB so the dashboard shows activity during long operations.
 function startHeartbeat(
   job: Job,
   intervalMs: number,
   step: number,
-  cap: number
+  cap: number,
+  dbUpdate?: (progress: number) => Promise<void>
 ): () => void {
-  const timer = setInterval(() => {
+  const timer = setInterval(async () => {
     if (job.progress < cap) {
       job.progress = Math.min(cap, job.progress + step);
       job.updatedAt = Date.now();
       emit();
+      // Also update the DB so the dashboard polling sees progress
+      if (dbUpdate) {
+        try {
+          await dbUpdate(job.progress);
+        } catch {
+          // best-effort — don't kill the heartbeat on DB errors
+        }
+      }
     }
   }, intervalMs);
   return () => clearInterval(timer);
@@ -159,18 +176,41 @@ async function runDownloadVod(job: Job) {
   });
   if (!source) throw new Error("stream source not found");
 
+  console.log(`[download] Starting download for source ${source.id}`, {
+    url: source.url,
+    platform: source.platform,
+  });
+
   await db.streamSource.update({
     where: { id: source.id },
     data: { status: "DOWNLOADING", errorMessage: null, progress: 5 },
   });
 
-  const stopHeartbeat = startHeartbeat(job, 3000, 2, 90);
+  // Heartbeat updates BOTH the job progress AND the source progress in the DB
+  const stopHeartbeat = startHeartbeat(
+    job,
+    3000,
+    2,
+    90,
+    async (progress) => {
+      await db.streamSource.update({
+        where: { id: source.id },
+        data: { progress },
+      });
+    }
+  );
 
   try {
+    console.log(`[download] Calling clipper /download for ${source.url}`);
     const result = await downloadVod({
       sourceId: source.id,
       url: source.url,
       platform: source.platform as "TWITCH" | "YOUTUBE",
+    });
+    console.log(`[download] Clipper returned successfully`, {
+      title: result.title,
+      durationSec: result.durationSec,
+      storagePath: result.storagePath,
     });
 
     await db.streamSource.update({
@@ -186,7 +226,22 @@ async function runDownloadVod(job: Job) {
       },
     });
 
+    console.log(`[download] Enqueuing analysis for source ${source.id}`);
     enqueueAnalyzeStream(source.id);
+  } catch (err) {
+    // Mark the SOURCE as failed — without this, the source stays at
+    // DOWNLOADING/5% forever and the user has no idea what went wrong.
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[download] Failed for source ${source.id}:`, errMsg);
+    await db.streamSource.update({
+      where: { id: source.id },
+      data: {
+        status: "FAILED",
+        errorMessage: errMsg,
+        progress: 0,
+      },
+    });
+    throw err;
   } finally {
     stopHeartbeat();
   }
@@ -203,19 +258,46 @@ async function runAnalyzeStream(job: Job) {
     throw new Error("source has no storagePath — download may have failed");
   }
 
+  console.log(`[analyze] Starting analysis for source ${source.id}`);
+
   await db.streamSource.update({
     where: { id: source.id },
     data: { status: "ANALYZING", progress: 10 },
   });
 
-  const stopHeartbeat = startHeartbeat(job, 5000, 1, 90);
+  const stopHeartbeat = startHeartbeat(
+    job,
+    5000,
+    1,
+    90,
+    async (progress) => {
+      await db.streamSource.update({
+        where: { id: source.id },
+        data: { progress },
+      });
+    }
+  );
 
   let result;
   try {
+    console.log(`[analyze] Calling clipper /analyze for source ${source.id}`);
     result = await analyzeVod({
       sourceId: source.id,
       storagePath: source.storagePath,
     });
+    console.log(`[analyze] Clipper returned ${result.clips.length} clips`);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[analyze] Failed for source ${source.id}:`, errMsg);
+    await db.streamSource.update({
+      where: { id: source.id },
+      data: {
+        status: "FAILED",
+        errorMessage: errMsg,
+        progress: 0,
+      },
+    });
+    throw err;
   } finally {
     stopHeartbeat();
   }
@@ -241,8 +323,7 @@ async function runAnalyzeStream(job: Job) {
     created.push(clip as unknown as Clip);
   }
 
-  // Persist the full Whisper transcript on the source — the subtitle editor
-  // fetches this via /api/sources/[id]/transcript and filters to the clip range.
+  // Persist the full Whisper transcript on the source
   await db.streamSource.update({
     where: { id: source.id },
     data: {
@@ -252,6 +333,8 @@ async function runAnalyzeStream(job: Job) {
       transcriptJson: JSON.stringify(result.transcript),
     },
   });
+
+  console.log(`[analyze] Source ${source.id} READY with ${created.length} clips`);
 }
 
 // ─── render-final-clip ───────────────────────────────────────────────────────
@@ -270,7 +353,8 @@ async function runRenderFinalClip(job: Job) {
     throw new Error("clip has no final trim — review not submitted");
   }
 
-  // Build render request with all post-processing options.
+  console.log(`[render] Starting render for clip ${clip.id}`);
+
   const renderReq: RenderRequest = {
     clipId: clip.id,
     sourceStoragePath: clip.source.storagePath,
@@ -295,7 +379,20 @@ async function runRenderFinalClip(job: Job) {
 
   let result;
   try {
+    console.log(`[render] Calling clipper /render for clip ${clip.id}`);
     result = await renderClip(renderReq);
+    console.log(`[render] Clipper returned: ${result.storagePath}`);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[render] Failed for clip ${clip.id}:`, errMsg);
+    await db.clip.update({
+      where: { id: clip.id },
+      data: {
+        status: "FAILED",
+        errorMessage: errMsg,
+      },
+    });
+    throw err;
   } finally {
     stopHeartbeat();
   }
@@ -306,8 +403,8 @@ async function runRenderFinalClip(job: Job) {
   });
 
   // Auto-enqueue publish if a channel was selected during review.
-  // (Download-only renders just leave the clip as RENDERED.)
   if (clip.status === "APPROVED_A" || clip.status === "APPROVED_B") {
+    console.log(`[render] Enqueuing publish for clip ${clip.id}`);
     enqueuePublishToYoutube(clip.id);
   }
 }
@@ -328,13 +425,14 @@ async function runPublishToYoutube(job: Job) {
   const channel = clip.publishedToChannelId;
   if (!channel) throw new Error("publishedToChannelId not set");
 
-  // Make sure the channel is configured before attempting upload.
   const channelRow = await db.channel.findUnique({ where: { id: channel } });
   if (!channelRow || !channelRow.isConfigured) {
     throw new Error(
       `${channel} is not configured — visit Settings to authorize it`
     );
   }
+
+  console.log(`[publish] Starting publish for clip ${clip.id} to ${channel}`);
 
   await db.clip.update({
     where: { id: clip.id },
@@ -350,19 +448,22 @@ async function runPublishToYoutube(job: Job) {
 
   let result;
   try {
+    console.log(`[publish] Calling clipper /publish for clip ${clip.id}`);
     result = await publishToYoutube({
       clipId: clip.id,
       clipStoragePath: clip.storagePath,
       channel,
       title,
     });
+    console.log(`[publish] Published! YouTube ID: ${result.youtubeVideoId}`);
   } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[publish] Failed for clip ${clip.id}:`, errMsg);
     await db.clip.update({
       where: { id: clip.id },
       data: {
         status: "FAILED",
-        errorMessage:
-          err instanceof Error ? err.message : "YouTube publish failed",
+        errorMessage: errMsg,
       },
     });
     throw err;

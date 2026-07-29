@@ -1,14 +1,19 @@
 "use client";
 
 // Admin → Streams view — manage stream sources.
+//
+// Updated to include a Delete button that removes the stream + its clips
+// + the VOD files from the clipper's disk.
 
 import * as React from "react";
 import {
   AlertTriangle,
   Film,
   RefreshCw,
+  Trash2,
   Twitch,
   Youtube,
+  Loader2,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -32,8 +37,19 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 
-import { useReprocessStream, useStreams } from "@/hooks/use-clipcurator";
+import { useReprocessStream, useStreams, useDeleteStream } from "@/hooks/use-clipcurator";
 import {
   platformBadgeClass,
   relativeTime,
@@ -56,6 +72,7 @@ const STATUS_OPTIONS: { value: string; label: string }[] = [
 export function AdminStreamsView() {
   const streams = useStreams();
   const reprocess = useReprocessStream();
+  const del = useDeleteStream();
   const [statusFilter, setStatusFilter] = React.useState<string>("ALL");
 
   const all = streams.data?.sources ?? [];
@@ -206,20 +223,76 @@ export function AdminStreamsView() {
                         {src.clipCount ?? 0}
                       </TableCell>
                       <TableCell>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          disabled={!isFailed || reprocess.isPending}
-                          onClick={() => reprocess.mutate(src.id)}
-                          className={cn(
-                            "h-8",
-                            isFailed &&
-                              "border-rose-500/40 text-rose-300 hover:bg-rose-500/10"
-                          )}
-                        >
-                          <RefreshCw className="size-3.5" />
-                          Re-process
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={!isFailed || reprocess.isPending}
+                            onClick={() => reprocess.mutate(src.id)}
+                            className={cn(
+                              "h-8",
+                              isFailed &&
+                                "border-rose-500/40 text-rose-300 hover:bg-rose-500/10"
+                            )}
+                          >
+                            <RefreshCw className="size-3.5" />
+                            Re-process
+                          </Button>
+
+                          {/* Delete button with confirmation dialog */}
+                          <AlertDialog>
+                            <AlertDialogTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-8 text-zinc-500 hover:text-rose-400"
+                                disabled={del.isPending}
+                                aria-label="Delete stream"
+                              >
+                                {del.isPending ? (
+                                  <Loader2 className="size-3.5 animate-spin" />
+                                ) : (
+                                  <Trash2 className="size-3.5" />
+                                )}
+                              </Button>
+                            </AlertDialogTrigger>
+                            <AlertDialogContent>
+                              <AlertDialogHeader>
+                                <AlertDialogTitle>
+                                  Delete this stream?
+                                </AlertDialogTitle>
+                                <AlertDialogDescription>
+                                  This will permanently delete:
+                                  <br />• The stream source row
+                                  <br />• All{" "}
+                                  {src.clipCount ?? 0} clips belonging to this
+                                  stream
+                                  <br />• The downloaded VOD file from the
+                                  clipper's disk
+                                  <br />
+                                  <br />
+                                  <span className="font-mono text-xs text-zinc-500">
+                                    {truncate(src.url, 80)}
+                                  </span>
+                                  <br />
+                                  <br />
+                                  This action cannot be undone.
+                                </AlertDialogDescription>
+                              </AlertDialogHeader>
+                              <AlertDialogFooter>
+                                <AlertDialogCancel>
+                                  Cancel
+                                </AlertDialogCancel>
+                                <AlertDialogAction
+                                  onClick={() => del.mutate(src.id)}
+                                  className="bg-rose-500 text-white hover:bg-rose-600"
+                                >
+                                  Delete
+                                </AlertDialogAction>
+                              </AlertDialogFooter>
+                            </AlertDialogContent>
+                          </AlertDialog>
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -230,7 +303,7 @@ export function AdminStreamsView() {
         </CardContent>
       </Card>
 
-      {/* Error log for failed streams (expandable below) */}
+      {/* Error log for failed streams */}
       {filtered.some((s) => s.status === "FAILED" && s.errorMessage) && (
         <Card className="mt-4 border-rose-500/30 bg-rose-500/5">
           <CardContent className="space-y-2 py-4">
