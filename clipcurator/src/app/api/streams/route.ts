@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { enqueueDownloadVod } from "@/lib/queue";
-import { isValidStreamUrl, urlPlatform, SAMPLE_VODS } from "@/lib/constants";
-import { pickSampleVod } from "@/lib/pipeline";
+import { isValidStreamUrl, urlPlatform } from "@/lib/constants";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/streams — submit a stream URL for processing
+// POST /api/streams — submit a stream URL for processing.
+//
+// We create the StreamSource immediately with just the URL + platform.
+// The real title, streamer name, and duration come back from yt-dlp via
+// the download job (see src/lib/queue.ts → runDownloadVod), which updates
+// the source row after the clipper's /download endpoint returns.
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -20,17 +24,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "invalid URL" }, { status: 400 });
     }
 
-    // Resolve sample VOD for demo (we always have a real video URL to play)
-    const sample = pickSampleVod(url);
     const platform = urlPlatform(url);
 
     const source = await db.streamSource.create({
       data: {
         url,
         platform,
-        title: sample.title,
-        streamerName: sample.streamerName,
-        durationSec: sample.durationSec,
+        // Title / streamerName / durationSec are filled in by the download
+        // job after yt-dlp runs. Leaving them null here is intentional.
+        title: null,
+        streamerName: null,
+        durationSec: null,
         status: "PENDING",
       },
     });
@@ -54,10 +58,4 @@ export async function GET() {
     take: 100,
   });
   return NextResponse.json({ sources });
-}
-
-// Convenience export so /api/streams?demo=true can return a list of
-// sample VODs the user can submit with one click.
-export async function PUT() {
-  return NextResponse.json({ samples: SAMPLE_VODS });
 }

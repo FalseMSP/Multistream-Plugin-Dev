@@ -1,17 +1,28 @@
-// In-memory job queue (BullMQ substitute for the sandbox).
-//
-// In production this runs on Redis + BullMQ and dispatches work to the
-// Python FastAPI clipper service. Here we keep the same job types and
-// lifecycle states but execute everything in-process so the demo is
-// fully observable from the UI.
+// In-memory job queue that dispatches work to the Python clipper backend
+// (clipper.py on port 8100).
 //
 // Job lifecycle:  QUEUED → ACTIVE → COMPLETED | FAILED
-// Each job emits progress events that the SSE endpoint forwards to the UI.
+//
+// Each job calls a real clipper endpoint:
+//   download-vod       → POST /download   (yt-dlp)
+//   analyze-stream     → POST /analyze    (Whisper + librosa + chat velocity + laughter)
+//   render-final-clip  → POST /render     (FFmpeg + optional subtitles + backing track)
+//   publish-to-youtube → POST /publish    (YouTube Data API v3, multi-channel)
+//
+// Progress is reported via a heartbeat timer that bumps the progress % every
+// few seconds while the HTTP call is in flight, so the UI shows activity
+// even when yt-dlp or Whisper takes minutes.
 
 import { db } from "@/lib/db";
-import { analyzeStream, generateYoutubeId, generateTitle, pickSampleVod } from "./pipeline";
-import { SAMPLE_VODS } from "./constants";
-import type { Clip } from "@/types";
+import {
+  downloadVod,
+  analyzeVod,
+  renderClip,
+  publishToYoutube,
+  type RenderRequest,
+} from "@/lib/clipper-client";
+import { generateTitle } from "@/lib/pipeline";
+import type { Clip, SubtitleStyle } from "@/types";
 
 type JobType =
   | "download-vod"
@@ -38,7 +49,9 @@ const listeners = new Set<ProgressListener>();
 let jobCounter = 0;
 
 function emit() {
-  const snapshot = Array.from(jobs.values()).sort((a, b) => b.createdAt - a.createdAt);
+  const snapshot = Array.from(jobs.values()).sort(
+    (a, b) => b.createdAt - a.createdAt
+  );
   for (const l of listeners) l(snapshot);
 }
 
@@ -52,7 +65,10 @@ export function listJobs(): Job[] {
   return Array.from(jobs.values()).sort((a, b) => b.createdAt - a.createdAt);
 }
 
-function createJob(type: JobType, refs: { sourceId?: string; clipId?: string }): Job {
+function createJob(
+  type: JobType,
+  refs: { sourceId?: string; clipId?: string }
+): Job {
   jobCounter += 1;
   const id = `job_${Date.now()}_${jobCounter}`;
   const job: Job = {
@@ -66,7 +82,6 @@ function createJob(type: JobType, refs: { sourceId?: string; clipId?: string }):
   };
   jobs.set(id, job);
   emit();
-  // Defer execution to next tick so the caller can return immediately.
   setTimeout(() => runJob(id), 50);
   return job;
 }
@@ -120,79 +135,94 @@ async function runJob(id: string) {
   }
 }
 
-function setProgress(job: Job, progress: number) {
-  job.progress = Math.min(100, Math.max(0, progress));
-  job.updatedAt = Date.now();
-  emit();
-}
-
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+function startHeartbeat(
+  job: Job,
+  intervalMs: number,
+  step: number,
+  cap: number
+): () => void {
+  const timer = setInterval(() => {
+    if (job.progress < cap) {
+      job.progress = Math.min(cap, job.progress + step);
+      job.updatedAt = Date.now();
+      emit();
+    }
+  }, intervalMs);
+  return () => clearInterval(timer);
 }
 
 // ─── download-vod ────────────────────────────────────────────────────────────
 async function runDownloadVod(job: Job) {
   if (!job.sourceId) throw new Error("sourceId required");
-  const source = await db.streamSource.findUnique({ where: { id: job.sourceId } });
+  const source = await db.streamSource.findUnique({
+    where: { id: job.sourceId },
+  });
   if (!source) throw new Error("stream source not found");
 
   await db.streamSource.update({
     where: { id: source.id },
-    data: { status: "DOWNLOADING", errorMessage: null },
+    data: { status: "DOWNLOADING", errorMessage: null, progress: 5 },
   });
 
-  // Simulate 3-5s download with progress
-  const totalSteps = 10;
-  for (let i = 1; i <= totalSteps; i++) {
-    await sleep(250 + Math.random() * 200);
-    setProgress(job, (i / totalSteps) * 100);
+  const stopHeartbeat = startHeartbeat(job, 3000, 2, 90);
+
+  try {
+    const result = await downloadVod({
+      sourceId: source.id,
+      url: source.url,
+      platform: source.platform as "TWITCH" | "YOUTUBE",
+    });
+
+    await db.streamSource.update({
+      where: { id: source.id },
+      data: {
+        status: "DOWNLOADING", // will move to ANALYZING next
+        title: result.title,
+        streamerName: result.streamerName,
+        durationSec: result.durationSec,
+        storagePath: result.storagePath,
+        downloadedAt: new Date(),
+        progress: 95,
+      },
+    });
+
+    enqueueAnalyzeStream(source.id);
+  } finally {
+    stopHeartbeat();
   }
-
-  // Resolve which sample VOD this URL maps to (or pick first if unknown)
-  const sample = pickSampleVod(source.url);
-  const durationSec = sample.durationSec;
-
-  await db.streamSource.update({
-    where: { id: source.id },
-    data: {
-      status: "DOWNLOADING", // will move to ANALYZING next
-      storagePath: `/vods/${source.id}/master.mp4`,
-      durationSec,
-      downloadedAt: new Date(),
-    },
-  });
-
-  // Auto-enqueue analyze-stream
-  enqueueAnalyzeStream(source.id);
 }
 
 // ─── analyze-stream ──────────────────────────────────────────────────────────
 async function runAnalyzeStream(job: Job) {
   if (!job.sourceId) throw new Error("sourceId required");
-  const source = await db.streamSource.findUnique({ where: { id: job.sourceId } });
+  const source = await db.streamSource.findUnique({
+    where: { id: job.sourceId },
+  });
   if (!source) throw new Error("stream source not found");
+  if (!source.storagePath) {
+    throw new Error("source has no storagePath — download may have failed");
+  }
 
   await db.streamSource.update({
     where: { id: source.id },
-    data: { status: "ANALYZING" },
+    data: { status: "ANALYZING", progress: 10 },
   });
 
-  // Simulate Whisper + librosa + chat velocity analysis
-  const totalSteps = 12;
-  for (let i = 1; i <= totalSteps; i++) {
-    await sleep(300 + Math.random() * 250);
-    setProgress(job, (i / totalSteps) * 100);
-  }
+  const stopHeartbeat = startHeartbeat(job, 5000, 1, 90);
 
-  const durationSec = source.durationSec ?? 600;
-  const seedKey = source.id;
-  const detected = analyzeStream(source.url, durationSec, seedKey);
-  const sample = pickSampleVod(source.url);
-  const thumbnailUrl = sample.poster || "";
+  let result;
+  try {
+    result = await analyzeVod({
+      sourceId: source.id,
+      storagePath: source.storagePath,
+    });
+  } finally {
+    stopHeartbeat();
+  }
 
   // Persist detected clips
   const created: Clip[] = [];
-  for (const d of detected) {
+  for (const d of result.clips) {
     const clip = await db.clip.create({
       data: {
         sourceId: source.id,
@@ -205,40 +235,78 @@ async function runAnalyzeStream(job: Job) {
         transcript: d.transcript,
         chatVelocity: d.chatVelocity,
         peakPhrase: d.peakPhrase,
-        thumbnailUrl,
+        thumbnailUrl: d.thumbnailUrl,
       },
     });
     created.push(clip as unknown as Clip);
   }
 
+  // Persist the full Whisper transcript on the source — the subtitle editor
+  // fetches this via /api/sources/[id]/transcript and filters to the clip range.
   await db.streamSource.update({
     where: { id: source.id },
-    data: { status: "READY", clipCount: created.length },
+    data: {
+      status: "READY",
+      clipCount: created.length,
+      progress: 100,
+      transcriptJson: JSON.stringify(result.transcript),
+    },
   });
 }
 
 // ─── render-final-clip ───────────────────────────────────────────────────────
 async function runRenderFinalClip(job: Job) {
   if (!job.clipId) throw new Error("clipId required");
-  const clip = await db.clip.findUnique({ where: { id: job.clipId } });
+  const clip = await db.clip.findUnique({
+    where: { id: job.clipId },
+    include: { source: true, backingTrack: true },
+  });
   if (!clip) throw new Error("clip not found");
+  if (!clip.source) throw new Error("source missing");
+  if (!clip.source.storagePath) {
+    throw new Error("source has no storagePath — VOD not downloaded");
+  }
+  if (clip.finalStartSec == null || clip.finalEndSec == null) {
+    throw new Error("clip has no final trim — review not submitted");
+  }
 
-  // Simulate FFmpeg render (1.5-3s)
-  const totalSteps = 6;
-  for (let i = 1; i <= totalSteps; i++) {
-    await sleep(250 + Math.random() * 200);
-    setProgress(job, (i / totalSteps) * 100);
+  // Build render request with all post-processing options.
+  const renderReq: RenderRequest = {
+    clipId: clip.id,
+    sourceStoragePath: clip.source.storagePath,
+    finalStartSec: clip.finalStartSec,
+    finalEndSec: clip.finalEndSec,
+    withSubtitles: clip.withSubtitles,
+    subtitleVtt: clip.withSubtitles ? clip.subtitleVtt ?? undefined : undefined,
+    subtitleStyle: clip.subtitleStyle
+      ? (JSON.parse(clip.subtitleStyle) as SubtitleStyle)
+      : undefined,
+    withBackingTrack: clip.withBackingTrack,
+    backingTrackPath:
+      clip.withBackingTrack && clip.backingTrack
+        ? clip.backingTrack.storagePath
+        : undefined,
+    backingTrackVolume: clip.withBackingTrack
+      ? clip.backingTrackVolume
+      : undefined,
+  };
+
+  const stopHeartbeat = startHeartbeat(job, 2000, 3, 90);
+
+  let result;
+  try {
+    result = await renderClip(renderReq);
+  } finally {
+    stopHeartbeat();
   }
 
   await db.clip.update({
     where: { id: clip.id },
-    data: {
-      storagePath: `/clips/${clip.id}/final.mp4`,
-    },
+    data: { storagePath: result.storagePath },
   });
 
-  // Auto-enqueue publish-to-youtube if a channel was selected
-  // (We only render after a publish decision is made.)
+  // Auto-enqueue publish if a channel was selected during review.
+  // (Download-only renders just leave the clip as RENDERED.)
   if (clip.status === "APPROVED_A" || clip.status === "APPROVED_B") {
     enqueuePublishToYoutube(clip.id);
   }
@@ -249,37 +317,64 @@ async function runPublishToYoutube(job: Job) {
   if (!job.clipId) throw new Error("clipId required");
   const clip = await db.clip.findUnique({
     where: { id: job.clipId },
-    include: { source: true },
+    include: { source: true, publishedToChannel: true },
   });
   if (!clip) throw new Error("clip not found");
   if (!clip.source) throw new Error("source missing");
+  if (!clip.storagePath) {
+    throw new Error("clip has no storagePath — render may have failed");
+  }
 
-  const channel = clip.publishedTo;
-  if (!channel) throw new Error("publishedTo not set");
+  const channel = clip.publishedToChannelId;
+  if (!channel) throw new Error("publishedToChannelId not set");
+
+  // Make sure the channel is configured before attempting upload.
+  const channelRow = await db.channel.findUnique({ where: { id: channel } });
+  if (!channelRow || !channelRow.isConfigured) {
+    throw new Error(
+      `${channel} is not configured — visit Settings to authorize it`
+    );
+  }
 
   await db.clip.update({
     where: { id: clip.id },
     data: { status: "PUBLISHING", publishAttempts: { increment: 1 } },
   });
 
-  // Simulate YouTube API upload (2-4s)
-  const totalSteps = 8;
-  for (let i = 1; i <= totalSteps; i++) {
-    await sleep(300 + Math.random() * 250);
-    setProgress(job, (i / totalSteps) * 100);
+  const title = generateTitle(
+    clip as unknown as Clip,
+    clip.source.streamerName
+  );
+
+  const stopHeartbeat = startHeartbeat(job, 2000, 2, 90);
+
+  let result;
+  try {
+    result = await publishToYoutube({
+      clipId: clip.id,
+      clipStoragePath: clip.storagePath,
+      channel,
+      title,
+    });
+  } catch (err) {
+    await db.clip.update({
+      where: { id: clip.id },
+      data: {
+        status: "FAILED",
+        errorMessage:
+          err instanceof Error ? err.message : "YouTube publish failed",
+      },
+    });
+    throw err;
+  } finally {
+    stopHeartbeat();
   }
 
-  // 5% chance of failure (to exercise retry path)
-  if (Math.random() < 0.05 && clip.publishAttempts < 3) {
-    throw new Error("YouTube API rate limited (simulated). Will retry.");
-  }
-
-  const youtubeId = generateYoutubeId();
   await db.clip.update({
     where: { id: clip.id },
     data: {
       status: "PUBLISHED",
-      youtubeVideoId: youtubeId,
+      youtubeVideoId: result.youtubeVideoId,
       publishedAt: new Date(),
       errorMessage: null,
     },
@@ -301,13 +396,4 @@ export function enqueueRenderFinalClip(clipId: string) {
 
 export function enqueuePublishToYoutube(clipId: string) {
   return createJob("publish-to-youtube", { clipId });
-}
-
-// For demo convenience: enqueue a quick demo stream that uses a known
-// sample VOD so the reviewer has something to look at immediately.
-export function enqueueDemoStream(url?: string) {
-  const sample = url
-    ? SAMPLE_VODS.find((v) => v.url === url) ?? SAMPLE_VODS[0]
-    : SAMPLE_VODS[Math.floor(Math.random() * SAMPLE_VODS.length)];
-  return sample;
 }

@@ -32,15 +32,21 @@ model StreamSource {
   durationSec   Int?
   downloadedAt  DateTime?
   status        String   @default("PENDING") // PENDING | DOWNLOADING | ANALYZING | READY | FAILED
-  storagePath   String?  // mock R2/S3 key for full VOD
+  storagePath   String?  // /vods/{id}/master.mp4 — served by clipper
   errorMessage  String?
   progress      Int      @default(0) // 0-100
   clipCount     Int      @default(0)
   submittedById String?
   submitter     User?    @relation(fields: [submittedById], references: [id])
   clips         Clip[]
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+
+  // Raw Whisper transcript JSON — full segment list from analyze step.
+  // The subtitle editor fetches this and filters to the clip's time range.
+  // Stored as JSON string: [{start, end, text}, ...]
+  transcriptJson String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Clip {
@@ -55,7 +61,7 @@ model Clip {
   suggestedEnd    Float
 
   // Review state
-  status          String   @default("PENDING") // PENDING | IN_REVIEW | APPROVED_A | APPROVED_B | REJECTED | PUBLISHING | PUBLISHED | FAILED
+  status          String   @default("PENDING") // PENDING | IN_REVIEW | APPROVED_A | APPROVED_B | REJECTED | PUBLISHING | PUBLISHED | FAILED | RENDERED
   reviewerId      String?
   reviewer        User?    @relation(fields: [reviewerId], references: [id])
   reviewedAt      DateTime?
@@ -63,9 +69,10 @@ model Clip {
   // Final output
   finalStartSec   Float?
   finalEndSec     Float?
-  storagePath     String?
+  storagePath     String?  // /clips/{id}/final.mp4 — served by clipper
   youtubeVideoId  String?
-  publishedTo     String?  // CHANNEL_A | CHANNEL_B
+  publishedToChannelId String? // CHANNEL_A | CHANNEL_B
+  publishedToChannel   Channel? @relation(fields: [publishedToChannelId], references: [id])
   publishedAt     DateTime?
 
   // Metadata
@@ -73,7 +80,22 @@ model Clip {
   transcript      String?
   chatVelocity    Int?     // msgs/sec at peak
   thumbnailUrl    String?
-  peakPhrase      String?  // the highlight phrase from transcript
+  peakPhrase      String?
+
+  // ─── Post-processing options (set during review) ────────────────────────
+  // Subtitles — when true, FFmpeg burns in VTT subtitles during render.
+  withSubtitles   Boolean  @default(false)
+  // WebVTT content for the clip (edited by user, defaults to Whisper output).
+  subtitleVtt     String?
+  // Subtitle styling — JSON string: {fontSize, color, bgColor, position, fontFamily}
+  subtitleStyle   String?
+
+  // Backing track — when true, FFmpeg mixes in the selected backing track.
+  withBackingTrack Boolean @default(false)
+  // Volume of backing track (0.0-1.0). Original audio is always 1.0.
+  backingTrackVolume Float @default(0.3)
+  backingTrackId  String?
+  backingTrack    BackingTrack? @relation(fields: [backingTrackId], references: [id], onDelete: SetNull)
 
   // Retry tracking
   publishAttempts Int      @default(0)
@@ -81,6 +103,33 @@ model Clip {
 
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+}
+
+model Channel {
+  // id is "CHANNEL_A" or "CHANNEL_B" — fixed, not auto-generated.
+  id                  String   @id
+  label               String   @default("Channel A") // user-editable display name
+  youtubeChannelId    String?  // fetched from YouTube API after OAuth
+  youtubeChannelName  String?
+  youtubeChannelAvatar String?
+  // Path to OAuth tokens file (relative to project root). Defaults:
+  //   CHANNEL_A → .youtube-tokens.json
+  //   CHANNEL_B → .youtube-tokens-b.json
+  tokenFilePath      String
+  isConfigured       Boolean  @default(false) // true once tokens exist + YouTube API confirms
+  clips              Clip[]
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+model BackingTrack {
+  id          String   @id @default(cuid())
+  name        String   // user-provided label, e.g. "Lofi Beat"
+  storagePath String   // /backing/{id}.mp3 — served by clipper
+  fileSizeBytes Int?
+  durationSec Float?
+  createdAt   DateTime @default(now())
+  clips       Clip[]
 }
 
 model JobLog {

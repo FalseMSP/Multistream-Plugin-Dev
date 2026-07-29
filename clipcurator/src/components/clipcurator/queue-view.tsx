@@ -2,13 +2,17 @@
 
 // Queue view — the heart of ClipCurator.
 //
-// Desktop: two-column grid [1fr_320px] — left has video + timeline + actions,
-//         right has metadata sidebar.
-// Mobile: single column. Metadata collapses into an Accordion, action buttons
-//         become a sticky bottom bar.
+// Desktop layout:
+//   [video player + speed + timeline]
+//   [Download | Channel A | Channel B | Reject]   ← action buttons
+//   [Subtitle editor | Metadata sidebar]
+//
+// Mobile: single column, action buttons become a sticky bottom bar,
+//         metadata + subtitle editor collapse into accordions.
 
 import * as React from "react";
 import {
+  Download,
   Upload,
   X,
   Keyboard,
@@ -21,6 +25,8 @@ import {
   Inbox,
   Twitch,
   Youtube,
+  Music,
+  Loader2,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -49,17 +55,25 @@ import {
   AccordionTrigger,
 } from "@/components/ui/accordion";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Slider } from "@/components/ui/slider";
+import { Label } from "@/components/ui/label";
 
 import { useQueueStore } from "@/store/queue";
-import { useLoadNextClip, useSubmitReview } from "@/hooks/use-clipcurator";
+import {
+  useLoadNextClip,
+  useSubmitReview,
+  useRenderPreview,
+  useBackingTracks,
+} from "@/hooks/use-clipcurator";
 import { VideoProvider, useVideo } from "./video-context";
 import { TimelineTrimmer } from "./timeline-trimmer";
+import { SubtitleEditor } from "./subtitle-editor";
 import { cn } from "@/lib/utils";
 import { formatTime, platformBadgeClass } from "@/lib/format";
 import type { ClipWithSource, Decision } from "@/types";
 
 interface QueueViewProps {
-  onNavigate: (view: "dashboard" | "queue" | "history" | "admin") => void;
+  onNavigate: (view: "dashboard" | "queue" | "history" | "admin" | "settings") => void;
 }
 
 export function QueueView({ onNavigate }: QueueViewProps) {
@@ -82,11 +96,30 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
   const trimEnd = useQueueStore((s) => s.trimEnd);
   const setTrim = useQueueStore((s) => s.setTrim);
 
+  // Post-processing state
+  const withSubtitles = useQueueStore((s) => s.withSubtitles);
+  const subtitleStyle = useQueueStore((s) => s.subtitleStyle);
+  const withBackingTrack = useQueueStore((s) => s.withBackingTrack);
+  const backingTrackId = useQueueStore((s) => s.backingTrackId);
+  const backingTrackVolume = useQueueStore((s) => s.backingTrackVolume);
+  const setWithBackingTrack = useQueueStore((s) => s.setWithBackingTrack);
+  const setBackingTrackId = useQueueStore((s) => s.setBackingTrackId);
+  const setBackingTrackVolume = useQueueStore((s) => s.setBackingTrackVolume);
+
   const loadNext = useLoadNextClip();
   const submitReview = useSubmitReview();
+  const renderPreview = useRenderPreview();
   const video = useVideo();
 
+  // Local VTT state — populated by the SubtitleEditor's onVttChange callback.
+  const [subtitleVtt, setSubtitleVtt] = React.useState<string | null>(null);
+
   const hasLoadedOnceRef = React.useRef(false);
+
+  // Reset post-processing state when a new clip loads.
+  React.useEffect(() => {
+    setSubtitleVtt(null);
+  }, [currentClip?.id]);
 
   // Auto-load the first clip on mount if none is present.
   React.useEffect(() => {
@@ -104,10 +137,54 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         decision,
         finalStart: trimStart,
         finalEnd: trimEnd,
+        withSubtitles,
+        subtitleVtt: withSubtitles ? subtitleVtt ?? undefined : undefined,
+        subtitleStyle: withSubtitles ? subtitleStyle : undefined,
+        withBackingTrack,
+        backingTrackId: withBackingTrack ? backingTrackId : null,
+        backingTrackVolume,
       });
     },
-    [currentClip, submitReview, trimStart, trimEnd]
+    [
+      currentClip,
+      submitReview,
+      trimStart,
+      trimEnd,
+      withSubtitles,
+      subtitleVtt,
+      subtitleStyle,
+      withBackingTrack,
+      backingTrackId,
+      backingTrackVolume,
+    ]
   );
+
+  const onDownload = React.useCallback(() => {
+    if (!currentClip) return;
+    renderPreview.mutate({
+      clipId: currentClip.id,
+      decision: "DOWNLOAD",
+      finalStart: trimStart,
+      finalEnd: trimEnd,
+      withSubtitles,
+      subtitleVtt: withSubtitles ? subtitleVtt ?? undefined : undefined,
+      subtitleStyle: withSubtitles ? subtitleStyle : undefined,
+      withBackingTrack,
+      backingTrackId: withBackingTrack ? backingTrackId : null,
+      backingTrackVolume,
+    });
+  }, [
+    currentClip,
+    renderPreview,
+    trimStart,
+    trimEnd,
+    withSubtitles,
+    subtitleVtt,
+    subtitleStyle,
+    withBackingTrack,
+    backingTrackId,
+    backingTrackVolume,
+  ]);
 
   const resetToAi = React.useCallback(() => {
     if (!currentClip) return;
@@ -116,7 +193,6 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
   }, [currentClip, setTrim, video]);
 
   // Reload listeners when a new clip / videoUrl arrives; seek to suggested start.
-  // Deps intentionally limited to clip id + url so we don't re-run on every timeupdate.
   React.useEffect(() => {
     if (currentClip && videoUrl) {
       video.reload();
@@ -207,8 +283,9 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         <Inbox className="size-12 text-zinc-700" />
         <h2 className="text-xl font-semibold text-zinc-200">Queue is empty</h2>
         <p className="max-w-md text-sm text-zinc-500">
-          Submit a stream URL to generate highlight clips, or load demo data to
-          see the review flow in action.
+          Submit a stream URL to generate highlight clips. The clipper backend
+          will download the VOD, run Whisper + librosa + chat velocity
+          analysis, and surface highlight clips here for review.
         </p>
         <div className="flex flex-wrap items-center justify-center gap-2">
           <Button
@@ -267,7 +344,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_320px]">
-        {/* Left column: video + timeline + actions */}
+        {/* Left column: video + timeline + actions + subtitle editor */}
         <div className="flex flex-col gap-3">
           <VideoPlayer src={videoUrl ?? ""} poster={poster} />
 
@@ -309,11 +386,27 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
             </CardContent>
           </Card>
 
-          {/* Action buttons (desktop) */}
+          {/* Action buttons (desktop) — Download on top, then A/B/Reject */}
           <div className="hidden gap-2 lg:flex">
             <ActionButton
+              onClick={onDownload}
+              disabled={renderPreview.isPending || submitReview.isPending}
+              accent="zinc"
+              icon={
+                renderPreview.isPending ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Download className="size-4" />
+                )
+              }
+              label={
+                renderPreview.isPending ? "Rendering…" : "Download MP4"
+              }
+              shortcut="D"
+            />
+            <ActionButton
               onClick={() => decide("A")}
-              disabled={submitReview.isPending}
+              disabled={submitReview.isPending || renderPreview.isPending}
               accent="emerald"
               icon={<Upload className="size-4" />}
               label="Publish to Channel A"
@@ -321,7 +414,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
             />
             <ActionButton
               onClick={() => decide("B")}
-              disabled={submitReview.isPending}
+              disabled={submitReview.isPending || renderPreview.isPending}
               accent="blue"
               icon={<Upload className="size-4" />}
               label="Publish to Channel B"
@@ -329,13 +422,33 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
             />
             <ActionButton
               onClick={() => decide("REJECT")}
-              disabled={submitReview.isPending}
+              disabled={submitReview.isPending || renderPreview.isPending}
               accent="rose"
               icon={<X className="size-4" />}
               label="Reject Clip"
               shortcut="R"
             />
           </div>
+
+          {/* Subtitle editor (desktop) */}
+          {src && (
+            <SubtitleEditor
+              sourceId={src.id}
+              clipStart={trimStart}
+              clipEnd={trimEnd}
+              onVttChange={setSubtitleVtt}
+            />
+          )}
+
+          {/* Backing track selector (desktop) */}
+          <BackingTrackSelector
+            withBackingTrack={withBackingTrack}
+            setWithBackingTrack={setWithBackingTrack}
+            backingTrackId={backingTrackId}
+            setBackingTrackId={setBackingTrackId}
+            backingTrackVolume={backingTrackVolume}
+            setBackingTrackVolume={setBackingTrackVolume}
+          />
         </div>
 
         {/* Right column: metadata sidebar (desktop) */}
@@ -344,7 +457,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         </div>
       </div>
 
-      {/* Mobile: metadata accordion */}
+      {/* Mobile: metadata + subtitle + backing track accordion */}
       <div className="mt-4 lg:hidden">
         <Accordion
           type="single"
@@ -364,14 +477,59 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
               />
             </AccordionContent>
           </AccordionItem>
+          {src && (
+            <AccordionItem value="subs" className="border-b-0">
+              <AccordionTrigger className="py-3 text-sm font-medium">
+                Subtitles
+              </AccordionTrigger>
+              <AccordionContent>
+                <SubtitleEditor
+                  sourceId={src.id}
+                  clipStart={trimStart}
+                  clipEnd={trimEnd}
+                  onVttChange={setSubtitleVtt}
+                />
+              </AccordionContent>
+            </AccordionItem>
+          )}
+          <AccordionItem value="backing" className="border-b-0">
+            <AccordionTrigger className="py-3 text-sm font-medium">
+              Backing track
+            </AccordionTrigger>
+            <AccordionContent>
+              <BackingTrackSelector
+                withBackingTrack={withBackingTrack}
+                setWithBackingTrack={setWithBackingTrack}
+                backingTrackId={backingTrackId}
+                setBackingTrackId={setBackingTrackId}
+                backingTrackVolume={backingTrackVolume}
+                setBackingTrackVolume={setBackingTrackVolume}
+              />
+            </AccordionContent>
+          </AccordionItem>
         </Accordion>
       </div>
 
       {/* Mobile: sticky bottom action bar */}
-      <div className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-3 gap-2 border-t border-zinc-800 bg-zinc-950/95 p-3 backdrop-blur lg:hidden">
+      <div className="fixed inset-x-0 bottom-0 z-40 grid grid-cols-4 gap-1.5 border-t border-zinc-800 bg-zinc-950/95 p-3 backdrop-blur lg:hidden">
+        <ActionButton
+          onClick={onDownload}
+          disabled={renderPreview.isPending || submitReview.isPending}
+          accent="zinc"
+          icon={
+            renderPreview.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : (
+              <Download className="size-4" />
+            )
+          }
+          label="DL"
+          shortcut="D"
+          compact
+        />
         <ActionButton
           onClick={() => decide("A")}
-          disabled={submitReview.isPending}
+          disabled={submitReview.isPending || renderPreview.isPending}
           accent="emerald"
           icon={<Upload className="size-4" />}
           label="Chan A"
@@ -380,7 +538,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         />
         <ActionButton
           onClick={() => decide("B")}
-          disabled={submitReview.isPending}
+          disabled={submitReview.isPending || renderPreview.isPending}
           accent="blue"
           icon={<Upload className="size-4" />}
           label="Chan B"
@@ -389,7 +547,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         />
         <ActionButton
           onClick={() => decide("REJECT")}
-          disabled={submitReview.isPending}
+          disabled={submitReview.isPending || renderPreview.isPending}
           accent="rose"
           icon={<X className="size-4" />}
           label="Reject"
@@ -398,7 +556,6 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         />
       </div>
 
-      {/* Spacer so mobile sticky bar doesn't cover content */}
       <div className="h-20 lg:hidden" aria-hidden />
     </div>
   );
@@ -447,7 +604,7 @@ function ActionButton({
 }: {
   onClick: () => void;
   disabled?: boolean;
-  accent: "emerald" | "blue" | "rose";
+  accent: "emerald" | "blue" | "rose" | "zinc";
   icon: React.ReactNode;
   label: string;
   shortcut: string;
@@ -457,6 +614,7 @@ function ActionButton({
     emerald: "bg-emerald-500 hover:bg-emerald-600 text-white",
     blue: "bg-blue-500 hover:bg-blue-600 text-white",
     rose: "bg-rose-500 hover:bg-rose-600 text-white",
+    zinc: "bg-zinc-700 hover:bg-zinc-600 text-white",
   }[accent];
   return (
     <Button
@@ -480,6 +638,103 @@ function ActionButton({
         {shortcut}
       </kbd>
     </Button>
+  );
+}
+
+// ── Backing track selector ─────────────────────────────────────────────
+function BackingTrackSelector({
+  withBackingTrack,
+  setWithBackingTrack,
+  backingTrackId,
+  setBackingTrackId,
+  backingTrackVolume,
+  setBackingTrackVolume,
+}: {
+  withBackingTrack: boolean;
+  setWithBackingTrack: (b: boolean) => void;
+  backingTrackId: string | null;
+  setBackingTrackId: (id: string | null) => void;
+  backingTrackVolume: number;
+  setBackingTrackVolume: (v: number) => void;
+}) {
+  const { data, isLoading } = useBackingTracks();
+  const tracks = data?.tracks ?? [];
+
+  return (
+    <Card className="border-zinc-800 bg-card">
+      <CardContent className="space-y-3 py-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Music className="size-4 text-emerald-400" />
+            <h3 className="text-sm font-semibold text-zinc-100">
+              Backing Track
+            </h3>
+          </div>
+          <Button
+            size="sm"
+            variant={withBackingTrack ? "default" : "outline"}
+            onClick={() => setWithBackingTrack(!withBackingTrack)}
+            disabled={tracks.length === 0}
+          >
+            {withBackingTrack ? "On" : "Off"}
+          </Button>
+        </div>
+
+        {!withBackingTrack ? (
+          <p className="text-xs text-zinc-500">
+            {tracks.length === 0
+              ? "No backing tracks uploaded. Visit Settings to add some."
+              : "Toggle on to mix a backing track into the clip's audio."}
+          </p>
+        ) : (
+          <>
+            <Select
+              value={backingTrackId ?? ""}
+              onValueChange={(v) => setBackingTrackId(v || null)}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue placeholder="Select a track…" />
+              </SelectTrigger>
+              <SelectContent>
+                {isLoading ? (
+                  <SelectItem value="loading" disabled>
+                    Loading…
+                  </SelectItem>
+                ) : tracks.length === 0 ? (
+                  <SelectItem value="none" disabled>
+                    No tracks — visit Settings
+                  </SelectItem>
+                ) : (
+                  tracks.map((t) => (
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name}
+                      {t.durationSec
+                        ? ` (${Math.floor(t.durationSec / 60)}:${String(
+                            Math.floor(t.durationSec % 60)
+                          ).padStart(2, "0")})`
+                        : ""}
+                    </SelectItem>
+                  ))
+                )}
+              </SelectContent>
+            </Select>
+
+            <div>
+              <Label className="mb-1 block text-xs text-zinc-500">
+                Volume: {Math.round(backingTrackVolume * 100)}%
+              </Label>
+              <Slider
+                value={[Math.round(backingTrackVolume * 100)]}
+                onValueChange={([v]) => setBackingTrackVolume(v / 100)}
+                min={0}
+                max={100}
+                step={5}
+              />
+            </div>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -541,7 +796,12 @@ function MetadataSidebar({
                 pathLength={100}
               />
             </svg>
-            <span className={cn("absolute text-sm font-bold tabular-nums", ringColor)}>
+            <span
+              className={cn(
+                "absolute text-sm font-bold tabular-nums",
+                ringColor
+              )}
+            >
               {score.toFixed(2)}
             </span>
           </div>
@@ -578,7 +838,10 @@ function MetadataSidebar({
               {src && (
                 <Badge
                   variant="outline"
-                  className={cn("ml-2 align-middle", platformBadgeClass(src.platform))}
+                  className={cn(
+                    "ml-2 align-middle",
+                    platformBadgeClass(src.platform)
+                  )}
                 >
                   {src.platform === "TWITCH" ? "Twitch" : "YouTube"}
                 </Badge>
@@ -587,7 +850,7 @@ function MetadataSidebar({
           </MetaItem>
           <MetaItem icon={<Sparkles className="size-3.5" />} label="Peak Phrase" full>
             <span className="italic text-zinc-300">
-              “{clip.peakPhrase ?? "—"}”
+              "{clip.peakPhrase ?? "—"}"
             </span>
           </MetaItem>
         </div>

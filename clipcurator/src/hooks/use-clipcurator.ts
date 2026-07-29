@@ -8,7 +8,16 @@ import {
 import { useQueueStore } from "@/store/queue";
 import { useToast } from "@/hooks/use-toast";
 import { apiUrl } from "@/lib/constants";
-import type { ClipWithSource, Decision, ReviewRequest } from "@/types";
+import type {
+  Channel,
+  ChannelId,
+  BackingTrack,
+  ClipWithSource,
+  Decision,
+  ReviewRequest,
+  SubtitleSegment,
+  SubtitleStyle,
+} from "@/types";
 
 // ─── Query keys ─────────────────────────────────────────────────────────────
 export const qk = {
@@ -18,6 +27,10 @@ export const qk = {
     ["clips", params] as const,
   queueNext: ["queue", "next"] as const,
   jobs: ["jobs"] as const,
+  channels: ["channels"] as const,
+  backingTracks: ["backing-tracks"] as const,
+  transcript: (sourceId: string) => ["transcript", sourceId] as const,
+  subtitles: (clipId: string) => ["subtitles", clipId] as const,
 };
 
 // ─── Fetch helpers ──────────────────────────────────────────────────────────
@@ -59,8 +72,7 @@ export function useStats() {
 export function useStreams() {
   return useQuery({
     queryKey: qk.streams,
-    queryFn: () =>
-      fetchJson<{ sources: any[] }>(apiUrl("/api/streams")),
+    queryFn: () => fetchJson<{ sources: any[] }>(apiUrl("/api/streams")),
     refetchInterval: 2000,
   });
 }
@@ -152,30 +164,59 @@ export function useLoadNextClip() {
   });
 }
 
+export interface ReviewArgs {
+  clipId: string;
+  decision: Decision | "DOWNLOAD";
+  finalStart: number;
+  finalEnd: number;
+  withSubtitles: boolean;
+  subtitleVtt?: string;
+  subtitleStyle?: SubtitleStyle;
+  withBackingTrack: boolean;
+  backingTrackId?: string | null;
+  backingTrackVolume?: number;
+}
+
 export function useSubmitReview() {
   const qc = useQueryClient();
   const setCurrentClip = useQueueStore((s) => s.setCurrentClip);
   const { toast } = useToast();
   return useMutation({
-    mutationFn: (args: { clipId: string; decision: Decision; finalStart: number; finalEnd: number }) => {
+    mutationFn: (args: ReviewArgs) => {
       const body: ReviewRequest = {
         decision: args.decision,
         finalStart: args.finalStart,
         finalEnd: args.finalEnd,
+        withSubtitles: args.withSubtitles,
+        subtitleVtt: args.subtitleVtt,
+        subtitleStyle: args.subtitleStyle,
+        withBackingTrack: args.withBackingTrack,
+        backingTrackId: args.backingTrackId,
+        backingTrackVolume: args.backingTrackVolume,
       };
-      return fetchJson<{ clip: any }>(apiUrl(`/api/queue/${args.clipId}/review`), {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+      return fetchJson<{ clip: any }>(
+        apiUrl(`/api/queue/${args.clipId}/review`),
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        }
+      );
     },
     onSuccess: (data, vars) => {
-      const label = vars.decision === "REJECT" ? "Rejected" : `Published to Channel ${vars.decision}`;
+      const label =
+        vars.decision === "REJECT"
+          ? "Rejected"
+          : vars.decision === "DOWNLOAD"
+            ? "Rendered for download"
+            : `Publishing to Channel ${vars.decision}`;
       toast({
         title: label,
         description:
           vars.decision === "REJECT"
             ? "Clip archived."
-            : "Render + upload started in background.",
+            : vars.decision === "DOWNLOAD"
+              ? "Render complete — use the Download button to save the MP4."
+              : "Render + upload started in background.",
       });
       setCurrentClip(null, null, "");
       qc.invalidateQueries({ queryKey: qk.stats });
@@ -191,6 +232,50 @@ export function useSubmitReview() {
   });
 }
 
+// ─── Render preview (download button) ───────────────────────────────────────
+export function useRenderPreview() {
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: async (args: ReviewArgs) => {
+      const res = await fetch(apiUrl(`/api/clips/${args.clipId}/render-preview`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          finalStart: args.finalStart,
+          finalEnd: args.finalEnd,
+          withSubtitles: args.withSubtitles,
+          subtitleVtt: args.subtitleVtt,
+          subtitleStyle: args.subtitleStyle,
+          withBackingTrack: args.withBackingTrack,
+          backingTrackId: args.backingTrackId,
+          backingTrackVolume: args.backingTrackVolume,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error ?? "render failed");
+      }
+      return res.json() as Promise<{ storagePath: string }>;
+    },
+    onSuccess: (data, vars) => {
+      toast({
+        title: "Render complete",
+        description: "Starting download…",
+      });
+      // Trigger browser download via the download endpoint
+      const downloadUrl = apiUrl(`/api/clips/${vars.clipId}/download`);
+      window.open(downloadUrl, "_blank");
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Render failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
 // ─── Clips (history) ────────────────────────────────────────────────────────
 export function useClips(params: Record<string, string | number>) {
   return useQuery({
@@ -198,15 +283,18 @@ export function useClips(params: Record<string, string | number>) {
     queryFn: () => {
       const qs = new URLSearchParams();
       for (const [k, v] of Object.entries(params)) qs.set(k, String(v));
-      return fetchJson<{ items: ClipWithSource[]; total: number; page: number; pageSize: number }>(
-        apiUrl(`/api/clips?${qs.toString()}`)
-      );
+      return fetchJson<{
+        items: ClipWithSource[];
+        total: number;
+        page: number;
+        pageSize: number;
+      }>(apiUrl(`/api/clips?${qs.toString()}`));
     },
     refetchInterval: 4000,
   });
 }
 
-// ─── Jobs (in-memory queue state for /queue UI) ─────────────────────────────
+// ─── Jobs ───────────────────────────────────────────────────────────────────
 export function useJobs() {
   return useQuery({
     queryKey: qk.jobs,
@@ -215,19 +303,171 @@ export function useJobs() {
   });
 }
 
-// ─── Seed (demo data) ───────────────────────────────────────────────────────
-export function useSeedDemo() {
+// ─── Channels ───────────────────────────────────────────────────────────────
+export function useChannels() {
+  return useQuery({
+    queryKey: qk.channels,
+    queryFn: () => fetchJson<{ channels: Channel[] }>(apiUrl("/api/channels")),
+    refetchInterval: 10000,
+  });
+}
+
+export function useUpdateChannel() {
   const qc = useQueryClient();
   const { toast } = useToast();
   return useMutation({
-    mutationFn: () => fetchJson<{ ok: boolean; enqueued: number }>(apiUrl("/api/seed"), { method: "POST" }),
-    onSuccess: (data) => {
-      toast({
-        title: "Demo data loaded",
-        description: `${data.enqueued} sample streams enqueued for processing.`,
-      });
-      qc.invalidateQueries({ queryKey: qk.stats });
-      qc.invalidateQueries({ queryKey: qk.streams });
+    mutationFn: (args: { id: ChannelId; label?: string }) =>
+      fetchJson<{ channel: Channel }>(apiUrl(`/api/channels/${args.id}`), {
+        method: "PUT",
+        body: JSON.stringify({ label: args.label }),
+      }),
+    onSuccess: () => {
+      toast({ title: "Channel updated" });
+      qc.invalidateQueries({ queryKey: qk.channels });
     },
+    onError: (err: Error) => {
+      toast({
+        title: "Update failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
+export function useRefreshChannel() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: ChannelId) =>
+      fetchJson<{ channel: Channel }>(apiUrl(`/api/channels/${id}`), {
+        method: "POST",
+        body: JSON.stringify({ action: "refresh" }),
+      }),
+    onSuccess: (data) => {
+      if (data.channel.isConfigured) {
+        toast({
+          title: `${data.channel.label} connected`,
+          description: data.channel.youtubeChannelName ?? undefined,
+        });
+      } else {
+        toast({
+          title: "Channel not configured",
+          description:
+            "Tokens missing or invalid. Run the OAuth flow on the server.",
+          variant: "destructive",
+        });
+      }
+      qc.invalidateQueries({ queryKey: qk.channels });
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Refresh failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
+// ─── Backing tracks ─────────────────────────────────────────────────────────
+export function useBackingTracks() {
+  return useQuery({
+    queryKey: qk.backingTracks,
+    queryFn: () =>
+      fetchJson<{ tracks: BackingTrack[] }>(apiUrl("/api/backing-tracks")),
+    refetchInterval: 30000,
+  });
+}
+
+export function useUploadBackingTrack() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: async (args: { name: string; file: File }) => {
+      const formData = new FormData();
+      formData.append("name", args.name);
+      formData.append("file", args.file);
+      const res = await fetch(apiUrl("/api/backing-tracks"), {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: res.statusText }));
+        throw new Error(err.error ?? "upload failed");
+      }
+      return res.json() as Promise<{ track: BackingTrack }>;
+    },
+    onSuccess: () => {
+      toast({ title: "Backing track uploaded" });
+      qc.invalidateQueries({ queryKey: qk.backingTracks });
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Upload failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
+export function useDeleteBackingTrack() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetchJson<{ ok: boolean }>(apiUrl(`/api/backing-tracks/${id}`), {
+        method: "DELETE",
+      }),
+    onSuccess: () => {
+      toast({ title: "Backing track deleted" });
+      qc.invalidateQueries({ queryKey: qk.backingTracks });
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Delete failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
+
+// ─── Transcript (Whisper segments for subtitle editor) ──────────────────────
+export function useTranscript(
+  sourceId: string | null | undefined,
+  start?: number,
+  end?: number
+) {
+  return useQuery({
+    queryKey: sourceId
+      ? [...qk.transcript(sourceId), start ?? null, end ?? null]
+      : ["transcript", "disabled"],
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      if (start != null) params.set("start", String(start));
+      if (end != null) params.set("end", String(end));
+      const qs = params.toString();
+      const url = apiUrl(
+        `/api/sources/${sourceId}/transcript${qs ? `?${qs}` : ""}`
+      );
+      return fetchJson<{ sourceId: string; segments: SubtitleSegment[] }>(url);
+    },
+    enabled: !!sourceId,
+  });
+}
+
+// ─── Subtitles (per-clip saved VTT) ─────────────────────────────────────────
+export function useClipSubtitles(clipId: string | null | undefined) {
+  return useQuery({
+    queryKey: clipId ? qk.subtitles(clipId) : ["subtitles", "disabled"],
+    queryFn: () =>
+      fetchJson<{
+        withSubtitles: boolean;
+        subtitleVtt: string | null;
+        subtitleStyle: SubtitleStyle | null;
+      }>(apiUrl(`/api/clips/${clipId}/subtitles`)),
+    enabled: !!clipId,
   });
 }

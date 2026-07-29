@@ -1,256 +1,22 @@
-// Mock video processing pipeline.
+// Title generation for YouTube uploads.
 //
-// In production this lives in the Python FastAPI clipper service
-// (yt-dlp + FFmpeg + Whisper + librosa + chat-velocity parser).
-// In the sandbox we simulate the full pipeline in-process so the
-// UI/UX flow (submit → download → analyze → render → review → publish)
-// can be exercised end-to-end without external services.
-//
-// The engagement-detection algorithm below mirrors the Python spec
-// from the project README:
-//   - chat velocity spikes (2.5× std above mean)
-//   - audio dB peaks
-//   - transcript highlights (laughter / caps / repeated phrases)
-//   - merge proximate peaks (within 15s)
-//   - pad each window to 45–90s
-//   - hard cap at 20 clips per stream
+// The rest of the old mock pipeline (analyzeStream, pickSampleVod,
+// generateYoutubeId) has been removed — real video processing now lives
+// in the Python clipper backend (clipper/clipper.py) and is called via
+// src/lib/clipper-client.ts.
 
-import { HIGHLIGHT_PHRASES, SAMPLE_VODS, TRANSCRIPT_TEMPLATES } from "./constants";
 import type { Clip } from "@/types";
 
-export interface DetectedClip {
-  startTimeSec: number;
-  endTimeSec: number;
-  suggestedStart: number;
-  suggestedEnd: number;
-  engagementScore: number;
-  chatVelocity: number;
-  transcript: string;
-  peakPhrase: string;
-  thumbnailUrl: string;
-}
-
-// Deterministic pseudo-random so re-analyzing the same URL gives
-// the same clip set (makes the demo reproducible).
-function seeded(seedStr: string): () => number {
-  let h = 1779033703 ^ seedStr.length;
-  for (let i = 0; i < seedStr.length; i++) {
-    h = Math.imul(h ^ seedStr.charCodeAt(i), 3432918353);
-    h = (h << 13) | (h >>> 19);
-  }
-  return function () {
-    h = Math.imul(h ^ (h >>> 16), 2246822507);
-    h = Math.imul(h ^ (h >>> 13), 3266489909);
-    h ^= h >>> 16;
-    return (h >>> 0) / 4294967296;
-  };
-}
-
-function pick<T>(arr: T[], rng: () => number): T {
-  return arr[Math.floor(rng() * arr.length)];
-}
-
-// Simulate chat velocity over the VOD: ~1 msg/sec baseline with random spikes.
-function simulateChatVelocity(durationSec: number, rng: () => number) {
-  const samples: number[] = [];
-  const bucketSize = 5; // 5s buckets
-  const bucketCount = Math.max(1, Math.floor(durationSec / bucketSize));
-  for (let i = 0; i < bucketCount; i++) {
-    const baseline = 1 + rng() * 3;
-    const spike = rng() > 0.85 ? rng() * 140 : 0; // occasional big spike
-    samples.push(Math.round(baseline + spike));
-  }
-  return { samples, bucketSize };
-}
-
-function detectChatPeaks(samples: number[]) {
-  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
-  const variance =
-    samples.reduce((a, b) => a + (b - mean) ** 2, 0) / samples.length;
-  const std = Math.sqrt(variance);
-  const threshold = mean + 2.5 * std;
-  const peaks: { index: number; value: number; score: number }[] = [];
-  for (let i = 0; i < samples.length; i++) {
-    if (samples[i] > threshold) {
-      const score = Math.min(1, (samples[i] - mean) / (3 * std + 1));
-      peaks.push({ index: i, value: samples[i], score });
-    }
-  }
-  return peaks;
-}
-
-// Simulate audio peak detection: ~5-10 loud segments per VOD.
-function detectAudioPeaks(durationSec: number, rng: () => number) {
-  const count = 4 + Math.floor(rng() * 6);
-  const peaks: { time: number; score: number }[] = [];
-  for (let i = 0; i < count; i++) {
-    peaks.push({
-      time: rng() * (durationSec - 30) + 15,
-      score: 0.4 + rng() * 0.5,
-    });
-  }
-  return peaks;
-}
-
-// Simulate transcript highlights: pick 6-12 random timecodes.
-function detectTranscriptPeaks(durationSec: number, rng: () => number) {
-  const count = 6 + Math.floor(rng() * 7);
-  const peaks: { time: number; score: number; phrase: string }[] = [];
-  for (let i = 0; i < count; i++) {
-    peaks.push({
-      time: rng() * (durationSec - 30) + 15,
-      score: 0.3 + rng() * 0.6,
-      phrase: pick(HIGHLIGHT_PHRASES, rng),
-    });
-  }
-  return peaks;
-}
-
-// Merge peaks that fall within `withinSec` of each other.
-function mergeProximatePeaks(
-  peaks: { time: number; score: number; phrase?: string; chatValue?: number }[],
-  withinSec: number
-) {
-  if (peaks.length === 0) return [];
-  const sorted = [...peaks].sort((a, b) => a.time - b.time);
-  const merged: {
-    time: number;
-    score: number;
-    phrase?: string;
-    chatValue?: number;
-  }[] = [];
-  let current = { ...sorted[0] };
-  for (let i = 1; i < sorted.length; i++) {
-    const next = sorted[i];
-    if (next.time - current.time <= withinSec) {
-      current.score = Math.max(current.score, next.score);
-      if (next.chatValue) {
-        current.chatValue = Math.max(current.chatValue ?? 0, next.chatValue);
-      }
-      if (next.phrase && (!current.phrase || next.score > current.score)) {
-        current.phrase = next.phrase;
-      }
-      current.time = (current.time + next.time) / 2;
-    } else {
-      merged.push(current);
-      current = { ...next };
-    }
-  }
-  merged.push(current);
-  return merged;
-}
-
-function buildTranscript(peak: { time: number; phrase?: string }, rng: () => number, durationSec: number) {
-  const template = pick(TRANSCRIPT_TEMPLATES, rng);
-  const peakPhrase = peak.phrase ?? pick(HIGHLIGHT_PHRASES, rng);
-  const filled = template.replace(/\{peak\}/g, peakPhrase);
-  // Timestamp prefix
-  const mm = Math.floor(peak.time / 60)
-    .toString()
-    .padStart(2, "0");
-  const ss = Math.floor(peak.time % 60)
-    .toString()
-    .padStart(2, "0");
-  return `[${mm}:${ss}] ${filled}`;
-}
-
-// MAIN ENTRY: simulate analyzing a VOD and producing detected clips.
-export function analyzeStream(
-  vodUrl: string,
-  durationSec: number,
-  seedKey: string
-): DetectedClip[] {
-  const rng = seeded(seedKey + vodUrl + durationSec);
-
-  const { samples, bucketSize } = simulateChatVelocity(durationSec, rng);
-  const chatPeaksRaw = detectChatPeaks(samples).map((p) => ({
-    time: p.index * bucketSize,
-    score: p.score,
-    chatValue: p.value,
-  }));
-  const audioPeaksRaw = detectAudioPeaks(durationSec, rng).map((p) => ({
-    time: p.time,
-    score: p.score,
-  }));
-  const transcriptPeaksRaw = detectTranscriptPeaks(durationSec, rng).map((p) => ({
-    time: p.time,
-    score: p.score,
-    phrase: p.phrase,
-  }));
-
-  const merged = mergeProximatePeaks(
-    [...chatPeaksRaw, ...audioPeaksRaw, ...transcriptPeaksRaw],
-    15
-  );
-
-  // Sort by score descending, take top 20 max
-  merged.sort((a, b) => b.score - a.score);
-  const top = merged.slice(0, 20);
-
-  const clips: DetectedClip[] = top.map((peak) => {
-    // STRATEGY: start 15s before peak, end 30-75s after
-    const start = Math.max(0, peak.time - 15);
-    let end = Math.min(durationSec, peak.time + 30 + rng() * 45);
-
-    // Enforce minimum 45s
-    if (end - start < 45) {
-      end = Math.min(durationSec, start + 45);
-    }
-    // Enforce maximum 90s
-    if (end - start > 90) {
-      end = start + 90;
-    }
-
-    const peakPhrase = peak.phrase ?? pick(HIGHLIGHT_PHRASES, rng);
-    const transcript = buildTranscript(peak, rng, durationSec);
-
-    // Engagement score: weighted blend of signals
-    const chatBoost = peak.chatValue ? Math.min(0.3, peak.chatValue / 500) : 0;
-    const engagementScore = Math.min(
-      0.99,
-      0.4 + peak.score * 0.4 + chatBoost + rng() * 0.1
-    );
-
-    return {
-      startTimeSec: start,
-      endTimeSec: end,
-      suggestedStart: start,
-      suggestedEnd: end,
-      engagementScore: Number(engagementScore.toFixed(2)),
-      chatVelocity: peak.chatValue ?? Math.round(20 + rng() * 100),
-      transcript,
-      peakPhrase,
-      thumbnailUrl: "", // populated by client from video poster
-    };
-  });
-
-  // Sort clips by start time
-  clips.sort((a, b) => a.startTimeSec - b.startTimeSec);
-  return clips;
-}
-
-// Pick a sample VOD by URL (falls back to the first sample if no match).
-export function pickSampleVod(url: string) {
-  const found = SAMPLE_VODS.find((v) => v.url === url);
-  return found ?? SAMPLE_VODS[0];
-}
-
-// Generate a fake YouTube video ID (11 chars).
-export function generateYoutubeId(): string {
-  const chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-  let id = "";
-  for (let i = 0; i < 11; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return id;
-}
-
-// Auto-generate a YouTube title from a clip's transcript peak phrase.
-export function generateTitle(clip: Clip, streamerName: string | null | undefined): string {
+// Auto-generate a YouTube title from a clip's peak phrase + streamer name.
+//
+// Called by the publish job (src/lib/queue.ts → runPublishToYoutube) right
+// before handing the title to the clipper's /publish endpoint.
+export function generateTitle(
+  clip: Clip,
+  streamerName: string | null | undefined
+): string {
   const peak = clip.peakPhrase ?? "Best Moment";
   const streamer = streamerName ?? "Streamer";
-  // Variety: occasionally prepend "Best of"
   const variants = [
     `${peak} — ${streamer} Highlight`,
     `Best of ${streamer}: ${peak}`,
@@ -258,4 +24,73 @@ export function generateTitle(clip: Clip, streamerName: string | null | undefine
     `${peak} (${streamer} Clip)`,
   ];
   return variants[Math.floor(Math.random() * variants.length)];
+}
+
+// Convert a list of subtitle segments to WebVTT format.
+// Used by the subtitle editor when saving user edits.
+export function segmentsToVtt(
+  segments: { start: number; end: number; text: string }[]
+): string {
+  const lines = ["WEBVTT", ""];
+  for (const seg of segments) {
+    lines.push(formatVttTimestamp(seg.start) + " --> " + formatVttTimestamp(seg.end));
+    lines.push(seg.text);
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+// Convert WebVTT content back to segment list.
+// Used when loading an existing VTT into the editor.
+export function vttToSegments(vtt: string): { start: number; end: number; text: string }[] {
+  const segments: { start: number; end: number; text: string }[] = [];
+  const blocks = vtt.replace(/^WEBVTT\s*\n/i, "").split(/\n\s*\n/);
+  for (const block of blocks) {
+    const lines = block.trim().split("\n");
+    if (lines.length < 2) continue;
+    // Skip cue identifier line if present (e.g. "1", "2", ...)
+    let timecodeLine = lines[0];
+    let textLines = lines.slice(1);
+    if (!timecodeLine.includes("-->")) {
+      timecodeLine = lines[1];
+      textLines = lines.slice(2);
+    }
+    const match = timecodeLine.match(
+      /([\d:.]+)\s*-->\s*([\d:.]+)/
+    );
+    if (!match) continue;
+    const start = parseVttTimestamp(match[1]);
+    const end = parseVttTimestamp(match[2]);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+    segments.push({ start, end, text: textLines.join("\n").trim() });
+  }
+  return segments;
+}
+
+function formatVttTimestamp(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  const ms = Math.floor((seconds % 1) * 1000);
+  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}.${pad(ms, 3)}`;
+}
+
+function parseVttTimestamp(ts: string): number {
+  const match = ts.match(/(\d+):(\d+):(\d+)\.(\d+)/);
+  if (!match) {
+    // Try without hours
+    const m2 = ts.match(/(\d+):(\d+)\.(\d+)/);
+    if (!m2) return NaN;
+    return Number(m2[1]) * 60 + Number(m2[2]) + Number(m2[3]) / 1000;
+  }
+  return (
+    Number(match[1]) * 3600 +
+    Number(match[2]) * 60 +
+    Number(match[3]) +
+    Number(match[4]) / 1000
+  );
+}
+
+function pad(n: number, len: number): string {
+  return String(n).padStart(len, "0");
 }

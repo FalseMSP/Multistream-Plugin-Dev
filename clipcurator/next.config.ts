@@ -1,5 +1,4 @@
 import type { NextConfig } from "next";
-import path from "node:path";
 
 const nextConfig: NextConfig = {
   output: "standalone",
@@ -14,9 +13,7 @@ const nextConfig: NextConfig = {
 
   // Allow the dev server (HMR / webpack-hmr websocket) to be reached from
   // hosts other than localhost. Without this, browsers hitting the dev
-  // server from a public IP get the "Blocked cross-origin request to
-  // Next.js dev resource" warning, which can stall hydration.
-  // Add your own host/IP here if you access from somewhere else.
+  // server from a public IP get the "Blocked cross-origin request" warning.
   allowedDevOrigins: [
     "129.213.29.112",
     "localhost",
@@ -25,18 +22,13 @@ const nextConfig: NextConfig = {
 
   // Tell Turbopack where the clipcurator project root is.
   // MUST be an absolute path — a relative value like "." corrupts the
-  // React Client Manifest and breaks client hydration, which is what
-  // causes "buttons don't work" (the server-rendered HTML loads, but
-  // React never attaches event handlers on the client).
-  //
-  // We use process.cwd() because `next dev` is always launched from
-  // inside the clipcurator/ directory (see start-clipcurator.sh).
+  // React Client Manifest and breaks client hydration.
   turbopack: {
     root: process.cwd(),
   },
 
-  // Proxy VOD and clip file requests to the clipper backend
-  // so the video player can load them without CORS issues.
+  // Proxy VOD, clip, and backing-track file requests to the clipper backend
+  // so the browser can load them without CORS issues.
   // Note: these paths are relative to basePath, so /vod/... actually
   // means /clipcurator/vod/... in the browser.
   async rewrites() {
@@ -50,12 +42,12 @@ const nextConfig: NextConfig = {
         source: "/clip/:path*",
         destination: `${clipperUrl}/clip/:path*`,
       },
+      {
+        source: "/backing/:path*",
+        destination: `${clipperUrl}/backing/:path*`,
+      },
     ];
   },
 };
-
-// `path` is imported above for any future absolute-path needs; keep the
-// import so the linter doesn't strip it if you switch to path.resolve().
-void path;
 
 export default nextConfig;

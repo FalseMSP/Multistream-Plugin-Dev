@@ -8,6 +8,7 @@ import {
   ListVideo,
   History,
   Settings2,
+  Settings,
   Scissors,
   Menu,
 } from "lucide-react";
@@ -33,14 +34,16 @@ import { DashboardView } from "./dashboard-view";
 import { QueueView } from "./queue-view";
 import { HistoryView } from "./history-view";
 import { AdminStreamsView } from "./admin-streams-view";
+import { SettingsView } from "./settings-view";
 
-type View = "dashboard" | "queue" | "history" | "admin";
+type View = "dashboard" | "queue" | "history" | "admin" | "settings";
 
 const NAV: { id: View; label: string; icon: React.ReactNode }[] = [
   { id: "dashboard", label: "Dashboard", icon: <LayoutDashboard className="size-4" /> },
   { id: "queue", label: "Queue", icon: <ListVideo className="size-4" /> },
   { id: "history", label: "History", icon: <History className="size-4" /> },
   { id: "admin", label: "Admin", icon: <Settings2 className="size-4" /> },
+  { id: "settings", label: "Settings", icon: <Settings className="size-4" /> },
 ];
 
 export function AppShell() {
@@ -172,6 +175,7 @@ export function AppShell() {
         {view === "queue" && <QueueView onNavigate={navigate} />}
         {view === "history" && <HistoryView />}
         {view === "admin" && <AdminStreamsView />}
+        {view === "settings" && <SettingsView />}
       </main>
     </div>
   );

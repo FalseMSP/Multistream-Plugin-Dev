@@ -1,6 +1,9 @@
 "use client";
 
 // Dashboard view: KPI stat cards + submit-stream form + recent streams list.
+//
+// All fake/demo data has been removed. The only way to populate the system
+// is to submit a real Twitch/YouTube VOD URL.
 
 import * as React from "react";
 import { motion } from "framer-motion";
@@ -10,34 +13,41 @@ import {
   Clock,
   Film,
   Rocket,
-  Sparkles,
-  Twitch,
-  Youtube,
   XCircle,
   Upload,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 
-import { useSeedDemo, useStats, useStreams, useSubmitStream } from "@/hooks/use-clipcurator";
-import { SAMPLE_VODS, isValidStreamUrl } from "@/lib/constants";
-import { platformBadgeClass, relativeTime, sourceStatusBadgeClass, sourceStatusLabel } from "@/lib/format";
+import { useStats, useStreams, useSubmitStream } from "@/hooks/use-clipcurator";
+import { isValidStreamUrl } from "@/lib/constants";
+import {
+  platformBadgeClass,
+  relativeTime,
+  sourceStatusBadgeClass,
+  sourceStatusLabel,
+} from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 interface DashboardViewProps {
-  onNavigate: (view: "dashboard" | "queue" | "history" | "admin") => void;
+  onNavigate: (view: "dashboard" | "queue" | "history" | "admin" | "settings") => void;
 }
 
 export function DashboardView({ onNavigate }: DashboardViewProps) {
   const stats = useStats();
   const streams = useStreams();
   const submit = useSubmitStream();
-  const seed = useSeedDemo();
 
   const [url, setUrl] = React.useState("");
 
@@ -123,7 +133,9 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
               Submit Stream URL
             </CardTitle>
             <CardDescription>
-              Paste a Twitch or YouTube VOD URL — ClipCurator will download, transcribe, and surface highlight clips for review.
+              Paste a Twitch or YouTube VOD URL — ClipCurator will download,
+              transcribe (Whisper), analyze audio (librosa) + chat velocity, and
+              surface highlight clips for review.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -146,55 +158,11 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
               </Button>
             </form>
 
-            <div>
-              <p className="mb-2 text-xs uppercase tracking-wide text-zinc-500">
-                Quick picks
-              </p>
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                {SAMPLE_VODS.map((vod) => (
-                  <button
-                    key={vod.url}
-                    type="button"
-                    onClick={() => submit.mutate(vod.url)}
-                    disabled={submit.isPending}
-                    className="flex items-center justify-between gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-left transition hover:border-emerald-500/50 hover:bg-zinc-900 disabled:opacity-50"
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium text-zinc-200">
-                        {vod.streamerName}
-                      </span>
-                      <span className="block truncate text-xs text-zinc-500">
-                        {vod.title}
-                      </span>
-                    </span>
-                    <Badge
-                      variant="outline"
-                      className={cn("shrink-0", platformBadgeClass(vod.platform))}
-                    >
-                      {vod.platform === "TWITCH" ? (
-                        <Twitch className="size-3" />
-                      ) : (
-                        <Youtube className="size-3" />
-                      )}
-                      {vod.platform === "TWITCH" ? "Twitch" : "YouTube"}
-                    </Badge>
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {totalClips === 0 && !stats.isLoading && (
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => seed.mutate()}
-                disabled={seed.isPending}
-                className="w-full"
-              >
-                <Sparkles className="size-4 text-emerald-400" />
-                {seed.isPending ? "Loading demo…" : "Load demo data"}
-              </Button>
-            )}
+            <p className="text-xs text-zinc-500">
+              The clipper backend downloads via yt-dlp, so any URL yt-dlp
+              supports will work (Twitch VODs, YouTube videos, YouTube Live
+              replays, etc.).
+            </p>
           </CardContent>
         </Card>
 
@@ -220,21 +188,16 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
               <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
                 <Film className="size-8 text-zinc-700" />
                 <p className="text-sm text-zinc-500">No streams submitted yet.</p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => seed.mutate()}
-                  disabled={seed.isPending}
-                >
-                  <Sparkles className="size-4 text-emerald-400" />
-                  Load demo data
-                </Button>
+                <p className="text-xs text-zinc-600">
+                  Submit a VOD URL above to get started.
+                </p>
               </div>
             ) : (
               <ul className="space-y-2">
                 {recentStreams.map((src) => {
                   const status = src.status as string;
-                  const isWorking = status === "DOWNLOADING" || status === "ANALYZING";
+                  const isWorking =
+                    status === "DOWNLOADING" || status === "ANALYZING";
                   return (
                     <li
                       key={src.id}
@@ -243,7 +206,7 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <span className="truncate text-sm font-medium text-zinc-200">
-                            {src.streamerName ?? "Unknown"}
+                            {src.streamerName ?? src.title ?? src.url}
                           </span>
                           <Badge
                             variant="outline"
@@ -257,7 +220,10 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
                         </p>
                         {isWorking && (
                           <div className="mt-1.5 flex items-center gap-2">
-                            <Progress value={src.progress ?? 0} className="h-1.5 flex-1" />
+                            <Progress
+                              value={src.progress ?? 0}
+                              className="h-1.5 flex-1"
+                            />
                             <span className="text-xs tabular-nums text-zinc-400">
                               {Math.round(src.progress ?? 0)}%
                             </span>

@@ -1,7 +1,8 @@
 "use client";
 
 import { create } from "zustand";
-import type { ClipWithSource } from "@/types";
+import type { ClipWithSource, SubtitleStyle } from "@/types";
+import { DEFAULT_SUBTITLE_STYLE } from "@/types";
 
 export interface QueueState {
   currentClip: ClipWithSource | null;
@@ -22,6 +23,13 @@ export interface QueueState {
     rejectedToday: number;
     failed: number;
   };
+  // Subtitle editor state
+  withSubtitles: boolean;
+  subtitleStyle: SubtitleStyle;
+  // Backing track state
+  withBackingTrack: boolean;
+  backingTrackId: string | null;
+  backingTrackVolume: number;
   // Actions are provided by hooks — store is purely state here.
   setCurrentClip: (clip: ClipWithSource | null, videoUrl: string | null, poster: string) => void;
   setQueueLength: (n: number) => void;
@@ -29,6 +37,11 @@ export interface QueueState {
   setSubmitting: (b: boolean) => void;
   setTrim: (start: number, end: number) => void;
   setStats: (s: Partial<QueueState["stats"]>) => void;
+  setWithSubtitles: (b: boolean) => void;
+  setSubtitleStyle: (s: Partial<SubtitleStyle>) => void;
+  setWithBackingTrack: (b: boolean) => void;
+  setBackingTrackId: (id: string | null) => void;
+  setBackingTrackVolume: (v: number) => void;
   reset: () => void;
 }
 
@@ -49,6 +62,11 @@ export const useQueueStore = create<QueueState>((set) => ({
     rejectedToday: 0,
     failed: 0,
   },
+  withSubtitles: false,
+  subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
+  withBackingTrack: false,
+  backingTrackId: null,
+  backingTrackVolume: 0.3,
   setCurrentClip: (clip, videoUrl, poster) =>
     set({
       currentClip: clip,
@@ -63,6 +81,13 @@ export const useQueueStore = create<QueueState>((set) => ({
   setTrim: (start, end) => set({ trimStart: start, trimEnd: end }),
   setStats: (s) =>
     set((state) => ({ stats: { ...state.stats, ...s } })),
+  setWithSubtitles: (b) => set({ withSubtitles: b }),
+  setSubtitleStyle: (s) =>
+    set((state) => ({ subtitleStyle: { ...state.subtitleStyle, ...s } })),
+  setWithBackingTrack: (b) => set({ withBackingTrack: b }),
+  setBackingTrackId: (id) => set({ backingTrackId: id }),
+  setBackingTrackVolume: (v) =>
+    set({ backingTrackVolume: Math.min(1, Math.max(0, v)) }),
   reset: () =>
     set({
       currentClip: null,
@@ -71,5 +96,10 @@ export const useQueueStore = create<QueueState>((set) => ({
       trimStart: 0,
       trimEnd: 0,
       queueLength: 0,
+      withSubtitles: false,
+      subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
+      withBackingTrack: false,
+      backingTrackId: null,
+      backingTrackVolume: 0.3,
     }),
 }));
