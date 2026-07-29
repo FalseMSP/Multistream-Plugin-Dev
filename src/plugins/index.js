@@ -47,14 +47,14 @@
  */
 
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
-const log       = require('../../logger');
-const dashboard = require('../../dashboard');
+const log       = require('../logger');
+const dashboard = require('../dashboard');
 const {
   registerSection,
   updateSection,
   addRoute,
   buildStandaloneSectionPage,
-} = require('../../overlay-server');
+} = require('../overlay-server');
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
