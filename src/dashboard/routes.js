@@ -46,16 +46,20 @@ async function handleRequest(req, res) {
   if (method === 'POST' && url === '/dashboard/login') {
     const raw    = await _readBody(req);
     const fields = _parseFormBody(raw);
+    // The redirect field comes from the hidden input in the login form.
+    // It preserves where the user originally wanted to go (e.g. /clipcurator).
+    const redirect = fields.redirect || '';
     if (fields.password && auth._checkPassword(fields.password)) {
       const token = auth._createSession();
+      const location = redirect || '/dashboard';
       res.writeHead(302, {
         'Set-Cookie': auth._sessionCookieHeader(token),
-        'Location':   '/dashboard',
+        'Location':   location,
       });
       res.end();
     } else {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(buildLoginPage('Incorrect password.'));
+      res.end(buildLoginPage('Incorrect password.', redirect));
     }
     return true;
   }
@@ -76,8 +80,11 @@ async function handleRequest(req, res) {
   if (!url.startsWith('/dashboard')) return false;
 
   if (!auth._isAuthenticated(req)) {
+    // Extract the redirect query param so the login form can preserve it.
+    const qs = req.url.split('?')[1] || '';
+    const redirectParam = new URLSearchParams(qs).get('redirect') || '';
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(buildLoginPage());
+    res.end(buildLoginPage('', redirectParam));
     return true;
   }
 

@@ -1,16 +1,13 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { checkApiAuth } from "@/lib/api-auth";
+import { pickSampleVod } from "@/lib/pipeline";
 import type { ClipWithSource } from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// GET /api/queue/next — returns the oldest PENDING clip + video URL (auth-gated)
-export async function GET(req: NextRequest) {
-  const deny = checkApiAuth(req);
-  if (deny) return deny;
-
+// GET /api/queue/next — returns the oldest PENDING clip + its presigned video URL
+export async function GET() {
   const clip = await db.clip.findFirst({
     where: { status: "PENDING" },
     orderBy: { createdAt: "asc" },
@@ -18,10 +15,10 @@ export async function GET(req: NextRequest) {
   });
 
   if (!clip) {
-    return NextResponse.json({ clip: null, videoUrl: null, queueLength: 0, poster: "" });
+    return NextResponse.json({ clip: null, videoUrl: null, queueLength: 0 });
   }
 
-  // Mark as IN_REVIEW so it's not handed out twice
+  // Mark as IN_REVIEW so it's not handed out twice in quick succession.
   await db.clip.update({
     where: { id: clip.id },
     data: { status: "IN_REVIEW" },
@@ -29,13 +26,9 @@ export async function GET(req: NextRequest) {
 
   const queueLength = await db.clip.count({ where: { status: "PENDING" } });
 
-  // Build the video URL: served via Next.js rewrites to the clipper backend
-  // Format: /vod/{sourceId}/master.mp4 (proxied through Next.js to avoid CORS)
-  const videoUrl = clip.source?.storagePath
-    ? `/vod/${clip.source.id}/master.mp4`
-    : null;
-
-  const poster = clip.thumbnailUrl ?? "";
+  // Resolve the real playable video URL from the sample VOD mapping
+  const sample = pickSampleVod(clip.source?.url ?? "");
+  const videoUrl = sample.url;
 
   const payload: {
     clip: ClipWithSource | null;
@@ -50,7 +43,7 @@ export async function GET(req: NextRequest) {
     },
     videoUrl,
     queueLength,
-    poster,
+    poster: sample.poster,
   };
 
   return NextResponse.json(payload);

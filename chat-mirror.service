@@ -1,0 +1,32 @@
+[Unit]
+Description=chat-mirror — Twitch/YouTube to Discord chat bridge
+
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-chat-mirror2
+
+# Load NVM so node/npx are available
+Environment=NVM_DIR=/home/ubuntu/.nvm
+Environment=PATH=/home/ubuntu/.nvm/versions/node/v24.14.1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Kill stale processes on port 2999 before starting
+ExecStartPre=/usr/bin/bash -c 'pid=$(lsof -ti :2999 2>/dev/null); [ -n "$pid" ] && kill $pid 2>/dev/null || true'
+
+# Start the bot using the production startup script
+ExecStart=/home/ubuntu/.nvm/versions/node/v24.14.1/bin/node index.js
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chat-mirror
+
+[Install]
+WantedBy=multi-user.target

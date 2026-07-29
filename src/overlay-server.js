@@ -748,8 +748,13 @@ function _buildHtml() {
 
 /** @type {Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>} */
 const _extraRoutes = new Map();
-/** @type {Map<string, Function>} prefix → handler for prefix-matched routes */
-const _prefixRoutes = new Map();
+
+/**
+ * Prefix-based route registry for paths like /clipcurator/*.
+ * Entries are checked via url.startsWith(prefix) before exact routes.
+ * @type {Array<{ prefix: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => void }>}
+ */
+const _prefixRoutes = [];
 
 /**
  * Register a custom GET route on the overlay server.
@@ -766,20 +771,15 @@ function addRoute(path, handler) {
 
 /**
  * Register a prefix-based route on the overlay server.
- * Any request whose URL starts with `prefix` will be forwarded to `handler`.
- * The handler receives (req, res) — the original req.url is preserved
- * (still contains the full path including the prefix).
+ * Any request whose URL starts with `prefix` will be dispatched to `handler`.
+ * Prefix routes are checked BEFORE exact routes, so a /clipcurator prefix
+ * will match /clipcurator, /clipcurator/, /clipcurator/api/stats, etc.
  *
- * Prefix routes are checked BEFORE exact-match routes and static files.
- * If multiple prefixes match, the longest prefix wins.
- *
- * @param {string}   prefix   URL prefix to match, e.g. '/clipcurator'
+ * @param {string}   prefix   Path prefix to match, e.g. '/clipcurator'
  * @param {Function} handler  (req, res) => void
  */
 function addPrefixRoute(prefix, handler) {
-  // Ensure prefix starts with / and doesn't end with /
-  prefix = '/' + prefix.replace(/^\/+|\/+$/g, '');
-  _prefixRoutes.set(prefix, handler);
+  _prefixRoutes.push({ prefix, handler });
   log.info(`[overlay] Prefix route registered: ${prefix}/*`);
 }
 
@@ -897,27 +897,21 @@ function startOverlayServer(port = 2999) {
       return;
     }
 
-    // ── Prefix-based routes (checked before exact routes) ───────────────
-    // Longest prefix wins if multiple match.
-    if (_prefixRoutes.size > 0) {
-      let matchedPrefix = '';
-      let matchedHandler = null;
-      for (const [prefix, handler] of _prefixRoutes) {
-        if (url.startsWith(prefix) && prefix.length > matchedPrefix.length) {
-          matchedPrefix = prefix;
-          matchedHandler = handler;
-        }
-      }
-      if (matchedHandler) {
-        try { matchedHandler(req, res); } catch (e) {
-          log.error('[overlay] Prefix route error:', e.message);
-          res.writeHead(500); res.end('Internal error');
+    // ── Prefix-based routes (e.g. /clipcurator/*) ─────────────────────────
+    // Checked before exact routes so /clipcurator catches all sub-paths.
+    for (const { prefix, handler } of _prefixRoutes) {
+      if (url.startsWith(prefix)) {
+        try { handler(req, res); } catch (e) {
+          log.error(`[overlay] Prefix route error (${prefix}):`, e.message);
+          if (!res.headersSent) {
+            res.writeHead(500); res.end('Internal error');
+          }
         }
         return;
       }
     }
 
-    // Plugin-registered extra routes
+    // Plugin-registered extra routes (exact match)
     const extraHandler = _extraRoutes.get(url);
     if (extraHandler) {
       try { extraHandler(req, res); } catch (e) {

@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { checkApiAuth } from "@/lib/api-auth";
 import type { ClipStatus } from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// GET /api/clips — paginated, filterable list of all clips (auth-gated)
+// GET /api/clips — paginated, filterable list of all clips
+// Query params:
+//   page (default 1)
+//   pageSize (default 20, max 100)
+//   status (optional, comma-separated list of ClipStatus)
+//   sourceId (optional)
+//   q (optional, searches transcript + peakPhrase)
 export async function GET(req: NextRequest) {
-  const deny = checkApiAuth(req);
-  if (deny) return deny;
-
   const url = new URL(req.url);
   const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
   const pageSize = Math.min(
@@ -21,6 +23,7 @@ export async function GET(req: NextRequest) {
   const sourceId = url.searchParams.get("sourceId");
   const q = url.searchParams.get("q")?.trim();
 
+   
   const where: any = {};
   if (statusParam) {
     const statuses = statusParam

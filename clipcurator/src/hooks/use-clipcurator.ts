@@ -26,10 +26,6 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
   if (!res.ok) {
-    if (res.status === 401) {
-      // Redirect to login — the app shell will handle this
-      throw new Error("Authentication required");
-    }
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error ?? "request failed");
   }
@@ -80,7 +76,7 @@ export function useSubmitStream() {
     onSuccess: (data) => {
       toast({
         title: "Stream submitted",
-        description: `Processing ${data.source.title ?? data.source.url}…`,
+        description: `Downloading ${data.source.title ?? data.source.url}…`,
       });
       qc.invalidateQueries({ queryKey: qk.streams });
       qc.invalidateQueries({ queryKey: qk.stats });
@@ -215,5 +211,22 @@ export function useJobs() {
     queryKey: qk.jobs,
     queryFn: () => fetchJson<{ jobs: any[] }>("/api/jobs"),
     refetchInterval: 1500,
+  });
+}
+
+// ─── Seed (demo data) ───────────────────────────────────────────────────────
+export function useSeedDemo() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: () => fetchJson<{ ok: boolean; enqueued: number }>("/api/seed", { method: "POST" }),
+    onSuccess: (data) => {
+      toast({
+        title: "Demo data loaded",
+        description: `${data.enqueued} sample streams enqueued for processing.`,
+      });
+      qc.invalidateQueries({ queryKey: qk.stats });
+      qc.invalidateQueries({ queryKey: qk.streams });
+    },
   });
 }

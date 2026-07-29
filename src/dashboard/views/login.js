@@ -11,7 +11,10 @@
  * file + tiny templating helper would add machinery for negligible gain.
  */
 
-function buildLoginPage(errorMsg = '') {
+function buildLoginPage(errorMsg = '', redirect = '') {
+  const redirectField = redirect
+    ? `<input type="hidden" name="redirect" value="${encodeURIComponent(redirect)}">`
+    : '';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -56,6 +59,7 @@ function buildLoginPage(errorMsg = '') {
     Stream Dashboard
   </h1>
   <form method="POST" action="/dashboard/login">
+    ${redirectField}
     <label for="pwd">Password</label>
     <input id="pwd" type="password" name="password" autofocus autocomplete="current-password" placeholder="Enter dashboard password">
     <button type="submit">Sign in</button>

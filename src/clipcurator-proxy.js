@@ -15,11 +15,17 @@
  * internal routing (API calls, static assets, client-side navigation)
  * all use the /clipcurator prefix automatically.
  *
+ * Authentication is handled by the ClipCurator Next.js app's own
+ * middleware (middleware.ts), which validates the dash_session cookie
+ * by calling GET /api/auth/check on the overlay server. The proxy
+ * does NOT add its own auth gate — it simply forwards requests.
+ *
  * No UDP is needed — everything is HTTP (REST + SSE).
  */
 
 const http = require('http');
 const log  = require('./logger');
+const auth = require('./dashboard/auth');
 
 const CLIPCURATOR_HOST = process.env.CLIPCURATOR_HOST || '127.0.0.1';
 const CLIPCURATOR_PORT = parseInt(process.env.CLIPCURATOR_PORT || '3001', 10);
@@ -149,6 +155,21 @@ function serveBackendUnavailable(res) {
  * @param {{ addPrefixRoute: Function }} overlayModule
  */
 function mountOnOverlayServer(overlayModule) {
+  // Register an auth-check API endpoint used by ClipCurator's middleware.ts
+  // to validate the dash_session cookie. This is called by the Next.js app
+  // (running on port 3001) to check if the user is authenticated on the
+  // overlay server (port 2999).
+  overlayModule.addRoute('/api/auth/check', (req, res) => {
+    const authenticated = auth._isAuthenticated(req);
+    res.writeHead(200, {
+      'Content-Type':  'application/json; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*',
+    });
+    res.end(JSON.stringify({ authenticated }));
+  });
+
+  // Register prefix-based proxy for /clipcurator/*
   overlayModule.addPrefixRoute(PREFIX, handleClipCuratorRequest);
   log.info(`[clipcurator-proxy] Mounted at ${PREFIX}/* → ${CLIPCURATOR_HOST}:${CLIPCURATOR_PORT}`);
 }

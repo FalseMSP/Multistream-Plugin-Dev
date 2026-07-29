@@ -84,27 +84,6 @@ Or with auto-restart on file changes (Node 18+):
 npm run dev
 ```
 
-### 9. ClipCurator (optional — VOD clip review)
-
-ClipCurator is a web app for reviewing and publishing highlight clips from Twitch/YouTube VODs. It's reverse-proxied through the same port 2999 as the dashboard.
-
-**Access**: `http://localhost:2999/clipcurator/`
-
-To start ClipCurator alongside the bot:
-
-```bash
-./dev-both.sh        # starts bot + clipper + ClipCurator
-./dev-both.sh clips  # starts only clipper + ClipCurator
-```
-
-ClipCurator setup:
-1. Set `DASHBOARD_PASSWORD` in `.env` (shared with the bot dashboard)
-2. Run `node youtube_auth.js` once to create `.youtube-tokens.json` for YouTube publishing
-3. Install Python deps: the `dev-both.sh` script auto-creates a venv in `clipper/.venv`
-4. Install ClipCurator Node deps: `cd clipcurator && npm install`
-
-ClipCurator uses the same password auth as the bot dashboard — one login works for both.
-
 ---
 
 ## YouTube moderation limitation
@@ -136,10 +115,4 @@ YouTube (masterchat)                 ▼
 Discord bot (discord.js)
   └─ /ban /vip /unvip ──► Twitch Helix API
                       └──► YouTube Data API (OAuth required)
-
-ClipCurator (port 2999/clipcurator)
-  └─ VOD URL ──► yt-dlp download ──► Whisper (CPU) + librosa (CPU)
-  └─ Detected highlights ──► Review queue ──► FFmpeg render
-  └─ Approved clips ──► YouTube Data API upload
-  └─ Reverse-proxied via overlay server from internal port 3001
 ```

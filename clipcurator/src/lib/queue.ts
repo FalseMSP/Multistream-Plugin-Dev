@@ -1,21 +1,16 @@
-/**
- * Job queue — dispatches work to the real Python clipper backend.
- *
- * In production this could run on Redis + BullMQ, but for now we keep the
- * same in-process job tracking with real HTTP calls to the clipper service.
- *
- * Job lifecycle:  QUEUED → ACTIVE → COMPLETED | FAILED
- * Each job emits progress events that the SSE endpoint forwards to the UI.
- */
+// In-memory job queue (BullMQ substitute for the sandbox).
+//
+// In production this runs on Redis + BullMQ and dispatches work to the
+// Python FastAPI clipper service. Here we keep the same job types and
+// lifecycle states but execute everything in-process so the demo is
+// fully observable from the UI.
+//
+// Job lifecycle:  QUEUED → ACTIVE → COMPLETED | FAILED
+// Each job emits progress events that the SSE endpoint forwards to the UI.
 
 import { db } from "@/lib/db";
-import {
-  downloadVod,
-  analyzeStream,
-  renderFinalClip,
-  publishToYoutube,
-  generateTitle,
-} from "./pipeline";
+import { analyzeStream, generateYoutubeId, generateTitle, pickSampleVod } from "./pipeline";
+import { SAMPLE_VODS } from "./constants";
 import type { Clip } from "@/types";
 
 type JobType =
@@ -71,7 +66,7 @@ function createJob(type: JobType, refs: { sourceId?: string; clipId?: string }):
   };
   jobs.set(id, job);
   emit();
-  // Defer execution to next tick
+  // Defer execution to next tick so the caller can return immediately.
   setTimeout(() => runJob(id), 50);
   return job;
 }
@@ -107,7 +102,7 @@ async function runJob(id: string) {
   job.updatedAt = Date.now();
   emit();
 
-  // Persist to JobLog table (best-effort)
+  // Persist to JobLog table (best-effort, never throws)
   try {
     await db.jobLog.create({
       data: {
@@ -131,6 +126,10 @@ function setProgress(job: Job, progress: number) {
   emit();
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ─── download-vod ────────────────────────────────────────────────────────────
 async function runDownloadVod(job: Job) {
   if (!job.sourceId) throw new Error("sourceId required");
@@ -142,26 +141,26 @@ async function runDownloadVod(job: Job) {
     data: { status: "DOWNLOADING", errorMessage: null },
   });
 
-  setProgress(job, 10);
+  // Simulate 3-5s download with progress
+  const totalSteps = 10;
+  for (let i = 1; i <= totalSteps; i++) {
+    await sleep(250 + Math.random() * 200);
+    setProgress(job, (i / totalSteps) * 100);
+  }
 
-  // Call the real clipper backend to download the VOD
-  const result = await downloadVod(source.id, source.url, source.platform);
-
-  setProgress(job, 80);
+  // Resolve which sample VOD this URL maps to (or pick first if unknown)
+  const sample = pickSampleVod(source.url);
+  const durationSec = sample.durationSec;
 
   await db.streamSource.update({
     where: { id: source.id },
     data: {
-      title: result.title,
-      streamerName: result.streamerName,
-      durationSec: result.durationSec,
-      storagePath: result.storagePath,
-      downloadedAt: new Date(),
       status: "DOWNLOADING", // will move to ANALYZING next
+      storagePath: `/vods/${source.id}/master.mp4`,
+      durationSec,
+      downloadedAt: new Date(),
     },
   });
-
-  setProgress(job, 100);
 
   // Auto-enqueue analyze-stream
   enqueueAnalyzeStream(source.id);
@@ -178,16 +177,22 @@ async function runAnalyzeStream(job: Job) {
     data: { status: "ANALYZING" },
   });
 
-  setProgress(job, 10);
+  // Simulate Whisper + librosa + chat velocity analysis
+  const totalSteps = 12;
+  for (let i = 1; i <= totalSteps; i++) {
+    await sleep(300 + Math.random() * 250);
+    setProgress(job, (i / totalSteps) * 100);
+  }
 
-  // Call the real clipper backend to analyze the VOD
-  const result = await analyzeStream(source.id, source.storagePath ?? "");
-
-  setProgress(job, 70);
+  const durationSec = source.durationSec ?? 600;
+  const seedKey = source.id;
+  const detected = analyzeStream(source.url, durationSec, seedKey);
+  const sample = pickSampleVod(source.url);
+  const thumbnailUrl = sample.poster || "";
 
   // Persist detected clips
   const created: Clip[] = [];
-  for (const d of result.clips) {
+  for (const d of detected) {
     const clip = await db.clip.create({
       data: {
         sourceId: source.id,
@@ -200,7 +205,7 @@ async function runAnalyzeStream(job: Job) {
         transcript: d.transcript,
         chatVelocity: d.chatVelocity,
         peakPhrase: d.peakPhrase,
-        thumbnailUrl: d.thumbnailUrl,
+        thumbnailUrl,
       },
     });
     created.push(clip as unknown as Clip);
@@ -210,38 +215,30 @@ async function runAnalyzeStream(job: Job) {
     where: { id: source.id },
     data: { status: "READY", clipCount: created.length },
   });
-
-  setProgress(job, 100);
 }
 
 // ─── render-final-clip ───────────────────────────────────────────────────────
 async function runRenderFinalClip(job: Job) {
   if (!job.clipId) throw new Error("clipId required");
-  const clip = await db.clip.findUnique({
-    where: { id: job.clipId },
-    include: { source: true },
-  });
+  const clip = await db.clip.findUnique({ where: { id: job.clipId } });
   if (!clip) throw new Error("clip not found");
-  if (!clip.source) throw new Error("source missing for clip");
 
-  setProgress(job, 10);
-
-  // Call the real clipper backend to render the clip via FFmpeg
-  const result = await renderFinalClip(
-    clip.id,
-    clip.source.storagePath ?? "",
-    clip.finalStartSec ?? clip.suggestedStart,
-    clip.finalEndSec ?? clip.suggestedEnd
-  );
+  // Simulate FFmpeg render (1.5-3s)
+  const totalSteps = 6;
+  for (let i = 1; i <= totalSteps; i++) {
+    await sleep(250 + Math.random() * 200);
+    setProgress(job, (i / totalSteps) * 100);
+  }
 
   await db.clip.update({
     where: { id: clip.id },
-    data: { storagePath: result.storagePath },
+    data: {
+      storagePath: `/clips/${clip.id}/final.mp4`,
+    },
   });
 
-  setProgress(job, 100);
-
   // Auto-enqueue publish-to-youtube if a channel was selected
+  // (We only render after a publish decision is made.)
   if (clip.status === "APPROVED_A" || clip.status === "APPROVED_B") {
     enqueuePublishToYoutube(clip.id);
   }
@@ -265,30 +262,28 @@ async function runPublishToYoutube(job: Job) {
     data: { status: "PUBLISHING", publishAttempts: { increment: 1 } },
   });
 
-  setProgress(job, 10);
+  // Simulate YouTube API upload (2-4s)
+  const totalSteps = 8;
+  for (let i = 1; i <= totalSteps; i++) {
+    await sleep(300 + Math.random() * 250);
+    setProgress(job, (i / totalSteps) * 100);
+  }
 
-  // Call the real clipper backend to upload to YouTube
-  const title = generateTitle(clip, clip.source.streamerName);
-  const result = await publishToYoutube(
-    clip.id,
-    clip.storagePath ?? "",
-    channel,
-    title
-  );
+  // 5% chance of failure (to exercise retry path)
+  if (Math.random() < 0.05 && clip.publishAttempts < 3) {
+    throw new Error("YouTube API rate limited (simulated). Will retry.");
+  }
 
-  setProgress(job, 90);
-
+  const youtubeId = generateYoutubeId();
   await db.clip.update({
     where: { id: clip.id },
     data: {
       status: "PUBLISHED",
-      youtubeVideoId: result.youtubeVideoId,
+      youtubeVideoId: youtubeId,
       publishedAt: new Date(),
       errorMessage: null,
     },
   });
-
-  setProgress(job, 100);
 }
 
 // ─── Public enqueue helpers ──────────────────────────────────────────────────
@@ -306,4 +301,13 @@ export function enqueueRenderFinalClip(clipId: string) {
 
 export function enqueuePublishToYoutube(clipId: string) {
   return createJob("publish-to-youtube", { clipId });
+}
+
+// For demo convenience: enqueue a quick demo stream that uses a known
+// sample VOD so the reviewer has something to look at immediately.
+export function enqueueDemoStream(url?: string) {
+  const sample = url
+    ? SAMPLE_VODS.find((v) => v.url === url) ?? SAMPLE_VODS[0]
+    : SAMPLE_VODS[Math.floor(Math.random() * SAMPLE_VODS.length)];
+  return sample;
 }

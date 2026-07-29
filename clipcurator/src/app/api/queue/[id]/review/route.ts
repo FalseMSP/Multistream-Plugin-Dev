@@ -1,20 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { checkApiAuth } from "@/lib/api-auth";
 import { enqueueRenderFinalClip } from "@/lib/queue";
 import type { Decision } from "@/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/queue/[id]/review — accept or reject a clip (auth-gated)
+// POST /api/queue/[id]/review — accept or reject a clip
+// Body: { decision: "A" | "B" | "REJECT", finalStart: number, finalEnd: number }
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const deny = checkApiAuth(req);
-  if (deny) return deny;
-
   try {
     const { id } = await params;
     const body = await req.json().catch(() => ({}));
@@ -72,7 +69,7 @@ export async function POST(
       },
     });
 
-    // Render the final clip via FFmpeg, then auto-enqueue YouTube publish
+    // Render the final clip (FFmpeg), then auto-enqueue YouTube publish
     enqueueRenderFinalClip(clip.id);
 
     return NextResponse.json({ clip: updated });

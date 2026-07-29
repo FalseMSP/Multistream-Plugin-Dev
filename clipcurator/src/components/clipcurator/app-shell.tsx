@@ -1,8 +1,6 @@
 "use client";
 
-// App shell — auth gate + sticky header with logo + nav + queue badge + active view below.
-// If DASHBOARD_PASSWORD is set in .env, the user must log in before accessing
-// any content. Auth mirrors the multistream dashboard's cookie-based approach.
+// App shell — sticky header with logo + nav + queue badge, and the active view below.
 
 import * as React from "react";
 import {
@@ -12,10 +10,9 @@ import {
   Settings2,
   Scissors,
   Menu,
-  LogOut,
 } from "lucide-react";
 
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,7 +33,6 @@ import { DashboardView } from "./dashboard-view";
 import { QueueView } from "./queue-view";
 import { HistoryView } from "./history-view";
 import { AdminStreamsView } from "./admin-streams-view";
-import { LoginView } from "./login-view";
 
 type View = "dashboard" | "queue" | "history" | "admin";
 
@@ -48,72 +44,21 @@ const NAV: { id: View; label: string; icon: React.ReactNode }[] = [
 ];
 
 export function AppShell() {
-  const [authenticated, setAuthenticated] = React.useState<boolean | null>(null);
-  const [requiresAuth, setRequiresAuth] = React.useState(true);
   const [view, setView] = React.useState<View>("dashboard");
 
-  // Hooks must be called unconditionally — we use them in the authenticated UI
+  // Wire up live SSE stats + react-query stats polling so the badge + dashboard
+  // numbers are always up to date.
   useQueueSse();
   const stats = useStats();
+
+  // Prefer the SSE-fed store value; fall back to the stats query.
   const storeStats = useQueueStore((s) => s.stats);
   const queueLength = useQueueStore((s) => s.queueLength);
   const pending =
     storeStats.pending || stats.data?.pending || queueLength || 0;
 
-  // Check auth status on mount
-  React.useEffect(() => {
-    (async () => {
-      try {
-        const authRes = await fetch("/api/auth/login");
-        const authData = await authRes.json();
-        setRequiresAuth(authData.requiresAuth ?? true);
-
-        if (!authData.requiresAuth) {
-          setAuthenticated(true);
-          return;
-        }
-
-        const testRes = await fetch("/api/stats");
-        if (testRes.ok) {
-          setAuthenticated(true);
-        } else if (testRes.status === 401) {
-          setAuthenticated(false);
-        } else {
-          setAuthenticated(false);
-        }
-      } catch {
-        setAuthenticated(false);
-      }
-    })();
-  }, []);
-
-  const onLoginSuccess = () => setAuthenticated(true);
-
-  const logout = async () => {
-    try { await fetch("/api/auth/login", { method: "DELETE" }); } catch {}
-    setAuthenticated(false);
-  };
-
   const navigate = (v: View) => setView(v);
 
-  // Loading state
-  if (authenticated === null) {
-    return (
-      <div className="flex min-h-screen items-center justify-center bg-background">
-        <div className="flex items-center gap-2 text-zinc-500">
-          <Scissors className="size-5 animate-pulse text-emerald-400" />
-          <span className="text-sm">Loading ClipCurator…</span>
-        </div>
-      </div>
-    );
-  }
-
-  // Not authenticated — show login
-  if (!authenticated) {
-    return <LoginView onLogin={onLoginSuccess} />;
-  }
-
-  // Authenticated — show main app
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {/* Header */}
@@ -155,7 +100,7 @@ export function AppShell() {
             })}
           </nav>
 
-          {/* Right side */}
+          {/* Right side: queue badge + avatar */}
           <div className="ml-auto flex items-center gap-2">
             <Badge
               variant="outline"
@@ -177,22 +122,14 @@ export function AppShell() {
             </Badge>
 
             <Avatar className="size-8 ring-1 ring-zinc-700">
+              <AvatarImage
+                src="https://i.pravatar.cc/40?u=reviewer"
+                alt="Reviewer avatar"
+              />
               <AvatarFallback className="bg-zinc-800 text-xs text-zinc-300">
                 RV
               </AvatarFallback>
             </Avatar>
-
-            {requiresAuth && (
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-8 text-zinc-400 hover:text-zinc-200"
-                onClick={logout}
-                aria-label="Sign out"
-              >
-                <LogOut className="size-4" />
-              </Button>
-            )}
 
             {/* Mobile nav trigger */}
             <DropdownMenu>
@@ -223,15 +160,6 @@ export function AppShell() {
                     {item.label}
                   </DropdownMenuItem>
                 ))}
-                {requiresAuth && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem onClick={logout} className="text-rose-300">
-                      <LogOut className="size-4" />
-                      Sign out
-                    </DropdownMenuItem>
-                  </>
-                )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>

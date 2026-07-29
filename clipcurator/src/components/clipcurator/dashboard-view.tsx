@@ -1,7 +1,6 @@
 "use client";
 
 // Dashboard view: KPI stat cards + submit-stream form + recent streams list.
-// No demo mode — all data comes from real streams.
 
 import * as React from "react";
 import { motion } from "framer-motion";
@@ -11,6 +10,7 @@ import {
   Clock,
   Film,
   Rocket,
+  Sparkles,
   Twitch,
   Youtube,
   XCircle,
@@ -24,8 +24,8 @@ import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
 
-import { useStats, useStreams, useSubmitStream } from "@/hooks/use-clipcurator";
-import { isValidStreamUrl } from "@/lib/constants";
+import { useSeedDemo, useStats, useStreams, useSubmitStream } from "@/hooks/use-clipcurator";
+import { SAMPLE_VODS, isValidStreamUrl } from "@/lib/constants";
 import { platformBadgeClass, relativeTime, sourceStatusBadgeClass, sourceStatusLabel } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -37,6 +37,7 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
   const stats = useStats();
   const streams = useStreams();
   const submit = useSubmitStream();
+  const seed = useSeedDemo();
 
   const [url, setUrl] = React.useState("");
 
@@ -145,10 +146,54 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
               </Button>
             </form>
 
-            {submit.isError && (
-              <p className="text-sm text-rose-400">
-                {submit.error?.message ?? "Submission failed"}
+            <div>
+              <p className="mb-2 text-xs uppercase tracking-wide text-zinc-500">
+                Quick picks
               </p>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                {SAMPLE_VODS.map((vod) => (
+                  <button
+                    key={vod.url}
+                    type="button"
+                    onClick={() => submit.mutate(vod.url)}
+                    disabled={submit.isPending}
+                    className="flex items-center justify-between gap-2 rounded-md border border-zinc-800 bg-zinc-950/60 px-3 py-2 text-left transition hover:border-emerald-500/50 hover:bg-zinc-900 disabled:opacity-50"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium text-zinc-200">
+                        {vod.streamerName}
+                      </span>
+                      <span className="block truncate text-xs text-zinc-500">
+                        {vod.title}
+                      </span>
+                    </span>
+                    <Badge
+                      variant="outline"
+                      className={cn("shrink-0", platformBadgeClass(vod.platform))}
+                    >
+                      {vod.platform === "TWITCH" ? (
+                        <Twitch className="size-3" />
+                      ) : (
+                        <Youtube className="size-3" />
+                      )}
+                      {vod.platform === "TWITCH" ? "Twitch" : "YouTube"}
+                    </Badge>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {totalClips === 0 && !stats.isLoading && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => seed.mutate()}
+                disabled={seed.isPending}
+                className="w-full"
+              >
+                <Sparkles className="size-4 text-emerald-400" />
+                {seed.isPending ? "Loading demo…" : "Load demo data"}
+              </Button>
             )}
           </CardContent>
         </Card>
@@ -175,7 +220,15 @@ export function DashboardView({ onNavigate }: DashboardViewProps) {
               <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
                 <Film className="size-8 text-zinc-700" />
                 <p className="text-sm text-zinc-500">No streams submitted yet.</p>
-                <p className="text-xs text-zinc-600">Submit a Twitch or YouTube VOD URL to get started.</p>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => seed.mutate()}
+                  disabled={seed.isPending}
+                >
+                  <Sparkles className="size-4 text-emerald-400" />
+                  Load demo data
+                </Button>
               </div>
             ) : (
               <ul className="space-y-2">

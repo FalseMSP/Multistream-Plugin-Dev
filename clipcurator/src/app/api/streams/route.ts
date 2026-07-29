@@ -1,19 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { checkApiAuth } from "@/lib/api-auth";
 import { enqueueAnalyzeStream } from "@/lib/queue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/streams/[id]/reprocess — re-run analysis on a FAILED stream (auth-gated)
+// POST /api/streams/[id]/reprocess — re-run analysis on a FAILED stream
 export async function POST(
-  req: NextRequest,
+  _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
-  const deny = checkApiAuth(req);
-  if (deny) return deny;
-
   try {
     const { id } = await params;
     const source = await db.streamSource.findUnique({ where: { id } });
@@ -26,6 +22,7 @@ export async function POST(
       data: { status: "PENDING", errorMessage: null, progress: 0 },
     });
 
+    // If we already have the VOD downloaded, skip straight to analyze.
     if (source.downloadedAt && source.storagePath) {
       enqueueAnalyzeStream(id);
     } else {

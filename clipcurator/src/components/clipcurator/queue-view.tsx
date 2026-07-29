@@ -207,7 +207,8 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
         <Inbox className="size-12 text-zinc-700" />
         <h2 className="text-xl font-semibold text-zinc-200">Queue is empty</h2>
         <p className="max-w-md text-sm text-zinc-500">
-          Submit a stream URL to generate highlight clips for review.
+          Submit a stream URL to generate highlight clips, or load demo data to
+          see the review flow in action.
         </p>
         <div className="flex flex-wrap items-center justify-center gap-2">
           <Button

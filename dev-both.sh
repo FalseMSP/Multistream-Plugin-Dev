@@ -14,7 +14,8 @@
 # Access ClipCurator at: http://localhost:2999/clipcurator/
 # Access the dashboard at: http://localhost:2999/dashboard
 #
-# For systemd / production, use start-bot.sh instead of this script.
+# For systemd / production, use start-bot.sh for the bot and separate
+# systemd services for clipcurator and clipper.
 # This script is for local development only.
 
 set -euo pipefail

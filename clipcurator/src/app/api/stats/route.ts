@@ -1,15 +1,11 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { checkApiAuth } from "@/lib/api-auth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// GET /api/stats — dashboard summary numbers (auth-gated)
-export async function GET(req: NextRequest) {
-  const deny = checkApiAuth(req);
-  if (deny) return deny;
-
+// GET /api/stats — dashboard summary numbers
+export async function GET() {
   const pending = await db.clip.count({ where: { status: "PENDING" } });
   const inReview = await db.clip.count({ where: { status: "IN_REVIEW" } });
   const publishing = await db.clip.count({ where: { status: "PUBLISHING" } });
