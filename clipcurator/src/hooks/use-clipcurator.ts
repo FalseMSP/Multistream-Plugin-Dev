@@ -471,3 +471,30 @@ export function useClipSubtitles(clipId: string | null | undefined) {
     enabled: !!clipId,
   });
 }
+
+export function useDeleteStream() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetchJson<{ ok: boolean; deletedClips: number }>(
+        apiUrl(`/api/streams/${id}`),
+        { method: "DELETE" }
+      ),
+    onSuccess: (data) => {
+      toast({
+        title: "Stream deleted",
+        description: `${data.deletedClips} clips removed. VOD files cleaned up.`,
+      });
+      qc.invalidateQueries({ queryKey: qk.streams });
+      qc.invalidateQueries({ queryKey: qk.stats });
+    },
+    onError: (err: Error) => {
+      toast({
+        title: "Delete failed",
+        description: err.message,
+        variant: "destructive",
+      });
+    },
+  });
+}
