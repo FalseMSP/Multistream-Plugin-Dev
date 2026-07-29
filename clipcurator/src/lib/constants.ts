@@ -1,5 +1,23 @@
 import type { Platform } from "@/types";
 
+// ─── basePath-aware API helper ──────────────────────────────────────────────
+// Next.js auto-prefixes <Link> and <Image> with basePath, but raw fetch() and
+// EventSource calls are NOT auto-prefixed. Without this, every API call from
+// the browser hits the server root (/api/...) instead of /clipcurator/api/...
+// and 404s — which makes every button silently fail.
+//
+// Keep this in sync with `basePath` in next.config.ts. If you change one,
+// change the other (or set NEXT_PUBLIC_BASE_PATH env var to override both).
+export const API_BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "/clipcurator";
+
+export function apiUrl(path: string): string {
+  // Avoid double-slash if caller accidentally passes "/api/..." with leading /
+  // and API_BASE already ends in /clipcurator (no trailing slash).
+  if (path.startsWith("/")) return `${API_BASE}${path}`;
+  return `${API_BASE}/${path}`;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Channel A and B branding
 export const CHANNELS = {
   CHANNEL_A: {

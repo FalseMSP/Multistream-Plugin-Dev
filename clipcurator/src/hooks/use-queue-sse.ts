@@ -2,6 +2,7 @@
 
 import { useEffect } from "react";
 import { useQueueStore } from "@/store/queue";
+import { apiUrl } from "@/lib/constants";
 
 // Subscribes to the /api/queue/sse Server-Sent Events stream and feeds
 // live stats into the Zustand store. Reconnects on disconnect.
@@ -16,7 +17,8 @@ export function useQueueSse() {
 
     const connect = () => {
       if (closed) return;
-      es = new EventSource("/api/queue/sse");
+      // EventSource (like fetch) does NOT auto-prefix basePath — must do it manually.
+      es = new EventSource(apiUrl("/api/queue/sse"));
       es.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);

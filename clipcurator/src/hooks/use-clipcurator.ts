@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useQueueStore } from "@/store/queue";
 import { useToast } from "@/hooks/use-toast";
+import { apiUrl } from "@/lib/constants";
 import type { ClipWithSource, Decision, ReviewRequest } from "@/types";
 
 // ─── Query keys ─────────────────────────────────────────────────────────────
@@ -49,7 +50,7 @@ export function useStats() {
         streams: number;
         streamsReady: number;
         streamsFailed: number;
-      }>("/api/stats"),
+      }>(apiUrl("/api/stats")),
     refetchInterval: 3000,
   });
 }
@@ -59,7 +60,7 @@ export function useStreams() {
   return useQuery({
     queryKey: qk.streams,
     queryFn: () =>
-      fetchJson<{ sources: any[] }>("/api/streams"),
+      fetchJson<{ sources: any[] }>(apiUrl("/api/streams")),
     refetchInterval: 2000,
   });
 }
@@ -69,7 +70,7 @@ export function useSubmitStream() {
   const { toast } = useToast();
   return useMutation({
     mutationFn: (url: string) =>
-      fetchJson<{ source: any }>("/api/streams", {
+      fetchJson<{ source: any }>(apiUrl("/api/streams"), {
         method: "POST",
         body: JSON.stringify({ url }),
       }),
@@ -96,7 +97,7 @@ export function useReprocessStream() {
   const { toast } = useToast();
   return useMutation({
     mutationFn: (id: string) =>
-      fetchJson<{ ok: boolean }>(`/api/streams/${id}/reprocess`, {
+      fetchJson<{ ok: boolean }>(apiUrl(`/api/streams/${id}/reprocess`), {
         method: "POST",
       }),
     onSuccess: () => {
@@ -130,7 +131,7 @@ export function useLoadNextClip() {
   const { toast } = useToast();
   return useMutation({
     mutationFn: () =>
-      fetchJson<QueueNextResponse>("/api/queue/next"),
+      fetchJson<QueueNextResponse>(apiUrl("/api/queue/next")),
     onMutate: () => setLoading(true),
     onSuccess: (data) => {
       setCurrentClip(data.clip, data.videoUrl, data.poster);
@@ -162,7 +163,7 @@ export function useSubmitReview() {
         finalStart: args.finalStart,
         finalEnd: args.finalEnd,
       };
-      return fetchJson<{ clip: any }>(`/api/queue/${args.clipId}/review`, {
+      return fetchJson<{ clip: any }>(apiUrl(`/api/queue/${args.clipId}/review`), {
         method: "POST",
         body: JSON.stringify(body),
       });
@@ -198,7 +199,7 @@ export function useClips(params: Record<string, string | number>) {
       const qs = new URLSearchParams();
       for (const [k, v] of Object.entries(params)) qs.set(k, String(v));
       return fetchJson<{ items: ClipWithSource[]; total: number; page: number; pageSize: number }>(
-        `/api/clips?${qs.toString()}`
+        apiUrl(`/api/clips?${qs.toString()}`)
       );
     },
     refetchInterval: 4000,
@@ -209,7 +210,7 @@ export function useClips(params: Record<string, string | number>) {
 export function useJobs() {
   return useQuery({
     queryKey: qk.jobs,
-    queryFn: () => fetchJson<{ jobs: any[] }>("/api/jobs"),
+    queryFn: () => fetchJson<{ jobs: any[] }>(apiUrl("/api/jobs")),
     refetchInterval: 1500,
   });
 }
@@ -219,7 +220,7 @@ export function useSeedDemo() {
   const qc = useQueryClient();
   const { toast } = useToast();
   return useMutation({
-    mutationFn: () => fetchJson<{ ok: boolean; enqueued: number }>("/api/seed", { method: "POST" }),
+    mutationFn: () => fetchJson<{ ok: boolean; enqueued: number }>(apiUrl("/api/seed"), { method: "POST" }),
     onSuccess: (data) => {
       toast({
         title: "Demo data loaded",
