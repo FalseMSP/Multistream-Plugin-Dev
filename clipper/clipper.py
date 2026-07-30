@@ -267,7 +267,46 @@ def analyze_audio(video_path: str) -> list[dict]:
 
     log.info(f"[librosa] Analyzing audio from {video_path}")
 
-    y, sr = librosa.load(video_path, sr=16000, mono=True)
+    # Extract audio to a temporary 16kHz mono WAV using FFmpeg first.
+    # librosa's default backends (soundfile/audioread) often can't decode
+    # AAC audio inside MP4 containers — especially Twitch VODs. By
+    # pre-extracting to WAV with FFmpeg, we sidestep the entire
+    # PySoundFile/audioread failure path.
+    import tempfile as _tempfile
+    import subprocess as _subprocess
+    wav_path = None
+    try:
+        with _tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir="/tmp") as f:
+            wav_path = f.name
+        log.info(f"[librosa] Extracting audio to WAV: {wav_path}")
+        proc = _subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn",              # no video
+                "-acodec", "pcm_s16le",
+                "-ar", "16000",     # 16kHz
+                "-ac", "1",         # mono
+                wav_path,
+            ],
+            capture_output=True,
+            timeout=300,  # 5 min max for extraction
+        )
+        if proc.returncode != 0:
+            err = proc.stderr.decode()[-500:]
+            log.warning(f"[librosa] FFmpeg extraction failed, falling back to librosa direct: {err}")
+            wav_path = None
+
+        if wav_path and _Path(wav_path).exists() and _Path(wav_path).stat().st_size > 0:
+            y, sr = librosa.load(wav_path, sr=16000, mono=True)
+        else:
+            # Fallback: try loading the video directly (may fail on AAC)
+            y, sr = librosa.load(video_path, sr=16000, mono=True)
+    finally:
+        if wav_path and _Path(wav_path).exists():
+            try:
+                _Path(wav_path).unlink()
+            except Exception:
+                pass
 
     hop_length = int(sr * 0.5)
     rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
@@ -477,7 +516,15 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
     whisper_segments = run_whisper(str(local_path))
 
     log.info(f"[analyze] Starting librosa audio analysis for {source_id}")
-    audio_peaks = analyze_audio(str(local_path))
+    # Wrap in try/except — audio analysis is best-effort. If it fails (e.g.
+    # FFmpeg missing, corrupted audio), we still get clips from Whisper text
+    # + chat velocity. Without this, a librosa failure kills the whole job
+    # and all the Whisper work is wasted.
+    try:
+        audio_peaks = analyze_audio(str(local_path))
+    except Exception as e:
+        log.warning(f"[analyze] librosa audio analysis failed (continuing with text-only): {e}")
+        audio_peaks = []
 
     chat_file = VOD_DIR / source_id / "chat.json"
     chat_data = []

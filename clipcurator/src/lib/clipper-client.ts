@@ -4,15 +4,41 @@
 // multipart endpoints (backing track upload) send FormData.
 // Timeouts are generous because yt-dlp downloads, Whisper transcription,
 // and FFmpeg rendering can each take minutes on a long VOD.
+//
+// IMPORTANT: Node.js's built-in fetch (undici) has a default bodyTimeout of
+// 5 minutes (300s) that silently overrides AbortSignal.timeout(). For long
+// operations like Whisper transcription on a 2-hour VOD (can take 30+ min),
+// we need to disable undici's internal timeout. We do this by importing
+// undici directly and passing a custom Agent with headersTimeout and
+// bodyTimeout set to 0 (disabled).
 
 import type { Platform, SubtitleStyle } from "@/types";
 
 const CLIPPER_URL =
   process.env.CLIPPER_URL || "http://localhost:8100";
 
-// 10 minutes — long enough for a 2-hour VOD download on a slow connection,
-// short enough that a truly stuck process gets killed.
-const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
+// 30 minutes — Whisper 'tiny' on CPU is ~0.5× realtime, so a 2-hour VOD
+// takes ~1 hour. 30 min covers most VODs; if you regularly process longer
+// content, bump this.
+const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+
+// Lazy-load undici only on Node.js (not Edge runtime). On Edge, the default
+// fetch timeout behavior is different and AbortSignal.timeout() works.
+let _dispatcher: unknown = undefined;
+async function getDispatcher(): Promise<unknown> {
+  if (_dispatcher !== undefined) return _dispatcher;
+  try {
+    // undici is bundled with Node.js 18+
+    const undici = await import("undici");
+    _dispatcher = new undici.Agent({
+      headersTimeout: 0,  // disable header timeout
+      bodyTimeout: 0,     // disable body timeout
+    });
+  } catch {
+    _dispatcher = null; // undici not available — use default fetch
+  }
+  return _dispatcher;
+}
 
 export class ClipperError extends Error {
   constructor(
@@ -32,12 +58,20 @@ async function clipperPost<T>(
 ): Promise<T> {
   let res: Response;
   try {
-    res = await fetch(`${CLIPPER_URL}${path}`, {
+    const dispatcher = await getDispatcher();
+    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
-    });
+    };
+    // undici-specific option — ignored by browser/edge fetch
+    if (dispatcher) {
+      (fetchOptions as { dispatcher?: unknown }).dispatcher = dispatcher;
+    }
+    // fetch is global; the dispatcher option is recognized by undici's
+    // Node.js fetch implementation
+    res = await fetch(`${CLIPPER_URL}${path}`, fetchOptions as RequestInit);
   } catch (err) {
     throw new ClipperError(
       err instanceof Error
