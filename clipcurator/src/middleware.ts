@@ -10,16 +10,6 @@ import { NextRequest, NextResponse } from "next/server";
  *
  * The actual session validation (is the token in the in-memory store?)
  * happens in the API routes via requireAuth() from src/lib/require-auth.ts.
- * This means:
- *
- *   - Page routes: middleware checks cookie presence → redirect to /login
- *     if missing. (A present-but-invalid cookie would let the page render,
- *     but every API call would 401 and the client-side fetchJson handler
- *     would then redirect to /login. Slight redundancy, acceptable UX.)
- *
- *   - API routes: middleware checks cookie presence → 401 if missing.
- *     The route handler then calls requireAuth() to validate the session
- *     against the in-memory store.
  *
  * If DASHBOARD_PASSWORD is not set, all requests are allowed (open access,
  * same as the dashboard).
@@ -28,6 +18,14 @@ import { NextRequest, NextResponse } from "next/server";
  *   /login            — the login page itself
  *   /api/auth/*       — login, logout, check endpoints
  *   /_next, /favicon  — static assets
+ *   /vod, /vods       — VOD video files (served by clipper via rewrite)
+ *   /clip, /clips     — rendered clip files (served by clipper via rewrite)
+ *   /backing          — backing track audio files (served by clipper via rewrite)
+ *
+ * Video/audio file paths skip auth because:
+ *   1. The <video> element can't handle a redirect to /login (gets HTML, fails silently)
+ *   2. The videoUrl is only returned by /api/queue/next which already requires auth
+ *   3. The source IDs in the paths are CUIDs — not guessable
  */
 
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD ?? "";
@@ -42,12 +40,20 @@ const SKIP_PREFIXES = [
   "/robots.txt",
   "/logo.svg",
   "/api/auth",
+  // Static file paths — served by clipper via next.config.ts rewrites.
+  // These MUST skip auth because <video>/<audio> elements can't handle
+  // redirects to /login (they'd get HTML instead of the media file).
+  "/vod",
+  "/vods",
+  "/clip",
+  "/clips",
+  "/backing",
 ];
 
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // Skip auth for login page, auth API, and static assets
+  // Skip auth for login page, auth API, static assets, and media files
   if (SKIP_PREFIXES.some((p) => pathname.startsWith(p))) {
     return NextResponse.next();
   }
@@ -58,11 +64,8 @@ export async function middleware(request: NextRequest) {
   }
 
   // Lightweight cookie presence check.
-  // (Real session validation happens in the API route via requireAuth().)
   const sessionCookie = request.cookies.get(SESSION_COOKIE_NAME)?.value;
   if (sessionCookie) {
-    // Cookie present — let the request through. API routes will validate
-    // the token against the in-memory session store.
     return NextResponse.next();
   }
 
@@ -76,8 +79,6 @@ export async function middleware(request: NextRequest) {
   }
 
   // For page routes: redirect to /login (same origin, basePath-aware).
-  // request.nextUrl.clone() preserves the basePath — setting pathname to
-  // "/login" produces a redirect to /clipcurator/login.
   const loginUrl = request.nextUrl.clone();
   loginUrl.pathname = "/login";
   loginUrl.search = "";
@@ -86,10 +87,6 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  // Match all request paths except static internals.
-  // Note: middleware always runs on the Edge runtime in Next.js — do NOT
-  // set `runtime` here (it's only valid on route handlers / pages, and
-  // setting it on middleware causes a compile error).
   matcher: [
     "/((?!_next/static|_next/image|favicon.ico|robots.txt|logo.svg).*)",
   ],
