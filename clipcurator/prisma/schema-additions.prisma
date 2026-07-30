@@ -2,10 +2,10 @@
 
 model TwitchChannel {
   id            String   @id @default(cuid())
-  channelName   String   @unique  // lowercase Twitch username
-  displayName   String?             // original case display name
+  channelName   String   @unique
+  displayName   String?
   isLive        Boolean  @default(false)
-  autoIngest    Boolean  @default(true)  // auto-download VOD when stream ends
+  autoIngest    Boolean  @default(true)
   lastChecked   DateTime @default(now())
   lastIngestedAt DateTime?
   lastVodUrl    String?
@@ -17,9 +17,15 @@ model ClipReviewFeedback {
   id              String   @id @default(cuid())
   clipId          String
   sourceId        String
-  accepted        Boolean  // true = published, false = rejected
+  label           Int      // 0=accept, 1=reject_bad, 2=not_interested
   engagementScore Float
-  features        String   // JSON: {chatVelocity, audioScore, textScore, ...}
-  channel         String?  // CHANNEL_A or CHANNEL_B (null if rejected)
+  features        String   // JSON
+  channel         String?
+  // YouTube analytics feedback
+  retentionScore  Float?   // average view percentage (0-1)
+  openingRetention Float?  // retention at first 10% of video
+  viewCount       Int?
+  likeCount       Int?
+  fetchedAt       DateTime?
   createdAt       DateTime @default(now())
 }
