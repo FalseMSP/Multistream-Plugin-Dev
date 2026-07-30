@@ -93,11 +93,41 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 # isn't on PATH.
 import sys as _sys
 from pathlib import Path as _Path
+import shutil as _shutil
+
 _VENV_BIN = _Path(_sys.executable).parent
 YTDLP_BIN = str(_VENV_BIN / "yt-dlp")
 if not _Path(YTDLP_BIN).exists():
     YTDLP_BIN = "yt-dlp"  # fallback to PATH lookup
 log.info(f"[clipper] yt-dlp binary: {YTDLP_BIN}")
+
+# Resolve ffmpeg + ffprobe binary paths. ffmpeg is a system binary (not
+# installed via pip), so it's NOT in the venv's bin/. We check common
+# system paths, then fall back to shutil.which() (PATH lookup), then
+# to the bare command name. This avoids [Errno 2] when the systemd
+# service doesn't have /usr/bin on PATH.
+def _resolve_binary(name: str) -> str:
+    """Find a binary in venv/bin, common system paths, or PATH."""
+    # 1. Check venv/bin (for pip-installed CLIs like yt-dlp)
+    venv_path = _VENV_BIN / name
+    if venv_path.exists():
+        return str(venv_path)
+    # 2. Check common system paths
+    for p in ["/usr/bin", "/usr/local/bin", "/bin", "/snap/bin"]:
+        candidate = _Path(p) / name
+        if candidate.exists():
+            return str(candidate)
+    # 3. Use shutil.which() (respects PATH)
+    which = _shutil.which(name)
+    if which:
+        return which
+    # 4. Fall back to bare name (will fail with [Errno 2] if not on PATH)
+    return name
+
+FFMPEG_BIN = _resolve_binary("ffmpeg")
+FFPROBE_BIN = _resolve_binary("ffprobe")
+log.info(f"[clipper] ffmpeg binary: {FFMPEG_BIN}")
+log.info(f"[clipper] ffprobe binary: {FFPROBE_BIN}")
 
 app = FastAPI(title="ClipCurator Clipper", version="2.0.0")
 
@@ -235,7 +265,7 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
     log.info(f"[download] Optimizing for web playback (moving moov atom to front)")
     faststart_path = out_dir / "master_faststart.mp4"
     faststart_cmd = [
-        "ffmpeg", "-y",
+        FFMPEG_BIN, "-y",
         "-i", str(out_path),
         "-c", "copy",           # no re-encoding — just copy streams
         "-movflags", "+faststart",  # move moov to front
@@ -333,7 +363,7 @@ def analyze_audio(video_path: str) -> list[dict]:
         log.info(f"[librosa] Extracting audio to WAV: {wav_path}")
         proc = _subprocess.run(
             [
-                "ffmpeg", "-y", "-i", str(video_path),
+                FFMPEG_BIN, "-y", "-i", str(video_path),
                 "-vn",              # no video
                 "-acodec", "pcm_s16le",
                 "-ar", "16000",     # 16kHz
@@ -780,7 +810,7 @@ async def render_clip(
     duration = final_end_sec - final_start_sec
 
     # Build FFmpeg command — base video cut
-    cmd = ["ffmpeg", "-y"]
+    cmd = [FFMPEG_BIN, "-y"]
 
     # Input 0: source VOD
     cmd.extend(["-ss", str(final_start_sec), "-i", str(local_source)])
@@ -1104,7 +1134,7 @@ async def api_upload_backing_track(
     duration_sec = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ffprobe", "-v", "quiet", "-print_format", "json",
+            FFPROBE_BIN, "-v", "quiet", "-print_format", "json",
             "-show_format", str(out_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
