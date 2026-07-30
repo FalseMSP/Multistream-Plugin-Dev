@@ -4,20 +4,27 @@ ClipCurator Clipper Backend — FastAPI service for real video processing.
 CPU-optimized pipeline:
   1. yt-dlp downloads Twitch/YouTube VODs
   2. faster-whisper (CTranslate2 CPU) generates transcripts
-  3. librosa detects audio peaks (dB spikes, spectral flux)
+  3. librosa detects audio peaks (dB spikes, spectral flux, onset)
   4. Chat velocity analysis (Twitch chat logs parsed from VOD metadata)
-  5. Engagement scoring → highlight clip detection
-  6. FFmpeg renders final clips
-  7. YouTube Data API publishes approved clips
+  5. Engagement scoring → highlight clip detection (multi-signal:
+     audio peaks + chat velocity + transcript excitement + ALL CAPS +
+     exclamation density + laughter detection)
+  6. FFmpeg renders final clips (with optional burned-in subtitles +
+     backing track mixing)
+  7. YouTube Data API publishes approved clips (multi-channel support)
 
 Endpoints:
-  POST /download    — download a VOD via yt-dlp
-  POST /analyze     — analyze a downloaded VOD (whisper + librosa + velocity)
-  POST /render      — render a clip segment via FFmpeg
-  POST /publish     — upload a clip to YouTube
-  GET  /vod/{id}/master.mp4 — serve downloaded VOD file for review playback
-  GET  /clip/{id}/final.mp4 — serve rendered clip file
-  GET  /health      — service health check
+  POST /download              — download a VOD via yt-dlp
+  POST /analyze               — analyze a downloaded VOD (whisper + librosa + velocity)
+  POST /render                — render a clip segment via FFmpeg (+ subtitles + backing)
+  POST /publish               — upload a clip to YouTube (channel-aware)
+  GET  /transcript/{sourceId} — return raw Whisper segments for the subtitle editor
+  POST /backing-track         — upload an MP3 to the backing track library
+  GET  /backing/{trackId}.mp3 — serve a backing track file
+  GET  /vod/{id}/master.mp4   — serve downloaded VOD file for review playback
+  GET  /clip/{id}/final.mp4   — serve rendered clip file
+  GET  /youtube/channel       — fetch YouTube channel info from saved tokens
+  GET  /health                — service health check
 """
 
 import os
@@ -27,10 +34,13 @@ import shutil
 import subprocess
 import asyncio
 import logging
+import math
+import re
+import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -48,8 +58,10 @@ load_dotenv()  # clipper/.env overrides
 DATA_DIR = Path(os.environ.get("CLIPPER_DATA_DIR", "/tmp/clipcurator"))
 VOD_DIR = DATA_DIR / "vods"
 CLIPS_DIR = DATA_DIR / "clips"
+BACKING_DIR = DATA_DIR / "backing"
 VOD_DIR.mkdir(parents=True, exist_ok=True)
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+BACKING_DIR.mkdir(parents=True, exist_ok=True)
 
 CLIPPER_PORT = int(os.environ.get("CLIPPER_PORT", "8100"))
 
@@ -57,18 +69,37 @@ CLIPPER_PORT = int(os.environ.get("CLIPPER_PORT", "8100"))
 YT_API_KEY = os.environ.get("YT_API_KEY", "")
 YT_CHANNEL_ID = os.environ.get("YT_CHANNEL_ID", "")
 
-# YouTube OAuth tokens file (same one youtube_auth.js creates)
-YT_TOKENS_FILE = Path(__file__).resolve().parent.parent / ".youtube-tokens.json"
+# Per-channel token files. Channel A uses the legacy default; Channel B
+# uses a separate file. The Next.js app manages which file each channel
+# points to via the Channel table.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TOKEN_FILES = {
+    "CHANNEL_A": PROJECT_ROOT / ".youtube-tokens.json",
+    "CHANNEL_B": PROJECT_ROOT / ".youtube-tokens-b.json",
+}
 
 # Twitch auth — read from .env
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
-TWITCH_TOKENS_FILE = Path(__file__).resolve().parent.parent / ".twitch-tokens.json"
+TWITCH_TOKENS_FILE = PROJECT_ROOT / ".twitch-tokens.json"
 
 log = logging.getLogger("clipper")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-app = FastAPI(title="ClipCurator Clipper", version="1.0.0")
+# Resolve yt-dlp binary path relative to the Python interpreter running this
+# script. When launched via .venv/bin/python, sys.executable is
+# /path/to/.venv/bin/python and yt-dlp is at /path/to/.venv/bin/yt-dlp.
+# This avoids [Errno 2] No such file or directory when the venv's bin/
+# isn't on PATH.
+import sys as _sys
+from pathlib import Path as _Path
+_VENV_BIN = _Path(_sys.executable).parent
+YTDLP_BIN = str(_VENV_BIN / "yt-dlp")
+if not _Path(YTDLP_BIN).exists():
+    YTDLP_BIN = "yt-dlp"  # fallback to PATH lookup
+log.info(f"[clipper] yt-dlp binary: {YTDLP_BIN}")
+
+app = FastAPI(title="ClipCurator Clipper", version="2.0.0")
 
 
 # ─── Pydantic request models ────────────────────────────────────────────────
@@ -78,15 +109,24 @@ class DownloadRequest(BaseModel):
     url: str
     platform: str  # TWITCH | YOUTUBE
 
+
 class AnalyzeRequest(BaseModel):
     sourceId: str
     storagePath: str
+
 
 class RenderRequest(BaseModel):
     clipId: str
     sourceStoragePath: str
     finalStartSec: float
     finalEndSec: float
+    withSubtitles: bool = False
+    subtitleVtt: Optional[str] = None  # WebVTT content
+    subtitleStyle: Optional[dict] = None  # {fontSize, color, bgColor, position, bold, fontFamily}
+    withBackingTrack: bool = False
+    backingTrackPath: Optional[str] = None  # /backing/{id}.mp3
+    backingTrackVolume: float = 0.3  # 0-1
+
 
 class PublishRequest(BaseModel):
     clipId: str
@@ -98,15 +138,11 @@ class PublishRequest(BaseModel):
 # ─── yt-dlp download ────────────────────────────────────────────────────────
 
 async def download_vod(url: str, source_id: str, platform: str) -> dict:
-    """
-    Download a VOD using yt-dlp. Saves to vods/{source_id}/master.mp4.
-    Returns metadata: title, streamer name, duration, etc.
-    """
+    """Download a VOD using yt-dlp. Saves to vods/{source_id}/master.mp4."""
     out_dir = VOD_DIR / source_id
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "master.mp4"
 
-    # yt-dlp options — prefer mp4, best quality, no playlists
     ydl_opts = [
         "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
@@ -117,14 +153,10 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         "--no-check-certificates",
     ]
 
-    # For Twitch VODs, try to get chat data too
     if platform == "TWITCH":
-        chat_path = out_dir / "chat.json"
-        ydl_opts.extend([
-            "--write-comments",  # yt-dlp can extract Twitch chat from VODs
-        ])
+        ydl_opts.extend(["--write-comments"])
 
-    cmd = ["yt-dlp"] + ydl_opts + [url]
+    cmd = [YTDLP_BIN] + ydl_opts + [url]
     log.info(f"[download] Running: {cmd}")
 
     proc = await asyncio.create_subprocess_exec(
@@ -139,14 +171,14 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         log.error(f"[download] Failed: {err_msg}")
         raise RuntimeError(err_msg)
 
-    # Extract metadata using yt-dlp --dump-json
-    meta_cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--quiet", url]
+    # Extract metadata
+    meta_cmd = [YTDLP_BIN, "--dump-json", "--no-playlist", "--quiet", url]
     meta_proc = await asyncio.create_subprocess_exec(
         *meta_cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    meta_stdout, meta_stderr = await meta_proc.communicate()
+    meta_stdout, _ = await meta_proc.communicate()
 
     metadata = {}
     if meta_proc.returncode == 0 and meta_stdout:
@@ -160,16 +192,14 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
     duration = metadata.get("duration", 0) or 0
     thumbnail = metadata.get("thumbnail", "")
 
-    # Save chat data if available (Twitch VODs)
     chat_path = out_dir / "chat.json"
     chat_data = []
     if chat_path.exists():
         try:
             chat_data = json.loads(chat_path.read_text())
-        except:
+        except Exception:
             chat_data = []
 
-    # Save metadata alongside the video
     meta_file = out_dir / "metadata.json"
     meta_file.write_text(json.dumps({
         "title": title,
@@ -195,22 +225,16 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
 # ─── Whisper transcription (CPU-optimized) ──────────────────────────────────
 
 def run_whisper(video_path: str) -> list[dict]:
-    """
-    Run faster-whisper on the video file. Uses the CTranslate2 CPU backend
-    with the 'tiny' or 'base' model for fast CPU inference.
-    Returns segments with start/end times and text.
-    """
+    """Run faster-whisper on the video file. Returns segments with start/end/text."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        log.warning("[whisper] faster-whisper not installed, falling back to mock transcript")
-        return _mock_transcript()
+        log.warning("[whisper] faster-whisper not installed, returning empty transcript")
+        return []
 
-    # Use 'tiny' model for CPU — fast and sufficient for highlight detection.
-    # 'base' is better quality but ~2x slower on CPU.
     model_size = os.environ.get("WHISPER_MODEL", "tiny")
     device = "cpu"
-    compute_type = "int8"  # Fastest CPU compute type
+    compute_type = "int8"
 
     log.info(f"[whisper] Loading model '{model_size}' on {device}/{compute_type}")
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
@@ -221,8 +245,8 @@ def run_whisper(video_path: str) -> list[dict]:
     segments = []
     for seg in segments_iter:
         segments.append({
-            "start": seg.start,
-            "end": seg.end,
+            "start": float(seg.start),
+            "end": float(seg.end),
             "text": seg.text.strip(),
         })
 
@@ -230,41 +254,25 @@ def run_whisper(video_path: str) -> list[dict]:
     return segments
 
 
-def _mock_transcript() -> list[dict]:
-    """Fallback when faster-whisper is not available."""
-    return [
-        {"start": 0, "end": 5, "text": "Mock transcript — whisper not available"},
-    ]
-
-
 # ─── Audio analysis (librosa) ──────────────────────────────────────────────
 
 def analyze_audio(video_path: str) -> list[dict]:
-    """
-    Use librosa to detect audio peaks — dB spikes and spectral flux
-    that indicate exciting moments. CPU-only, uses librosa's default backend.
-    Returns list of {time: float, score: float} peaks.
-    """
+    """Use librosa to detect audio peaks — RMS, spectral flux, onset."""
     try:
         import librosa
         import numpy as np
     except ImportError:
-        log.warning("[librosa] librosa not installed, falling back to mock audio peaks")
-        return [{"time": 15.0, "score": 0.5}, {"time": 120.0, "score": 0.7}]
+        log.warning("[librosa] librosa not installed, returning empty audio peaks")
+        return []
 
     log.info(f"[librosa] Analyzing audio from {video_path}")
 
-    # Load audio at 16kHz (mono) — fast CPU processing
     y, sr = librosa.load(video_path, sr=16000, mono=True)
 
-    # Short-time energy (RMS) in 0.5s windows
-    hop_length = int(sr * 0.5)  # 0.5s windows
+    hop_length = int(sr * 0.5)
     rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-
-    # Compute dB
     rms_db = librosa.amplitude_to_db(rms, ref=np.max)
 
-    # Detect peaks: segments where RMS exceeds mean + 1.5 * std
     mean_db = np.mean(rms_db)
     std_db = np.std(rms_db)
     threshold = mean_db + 1.5 * std_db
@@ -272,32 +280,44 @@ def analyze_audio(video_path: str) -> list[dict]:
     peaks = []
     peak_indices = np.where(rms_db > threshold)[0]
 
-    # Merge nearby peaks (within 10 seconds)
     if len(peak_indices) > 0:
         current_start = peak_indices[0]
         for i in range(1, len(peak_indices)):
-            gap = (peak_indices[i] - current_start) * 0.5  # convert to seconds
+            gap = (peak_indices[i] - current_start) * 0.5
             if gap < 10:
-                continue  # merge
+                continue
             time_sec = current_start * 0.5
             score = min(1.0, (rms_db[current_start] - mean_db) / (2 * std_db + 1))
             peaks.append({"time": time_sec, "score": max(0.3, score)})
             current_start = peak_indices[i]
-        # Last peak
         time_sec = current_start * 0.5
         score = min(1.0, (rms_db[current_start] - mean_db) / (2 * std_db + 1))
         peaks.append({"time": time_sec, "score": max(0.3, score)})
 
-    # Also detect spectral flux peaks (onset detection)
+    # Spectral flux / onset detection
     onset_env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
     onset_threshold = np.mean(onset_env) + 1.5 * np.std(onset_env)
     onset_peaks = librosa.util.peak_pick(
-        onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=5, delta=onset_threshold, wait=10
+        onset_env, pre_max=3, post_max=3, pre_avg=3, post_avg=5,
+        delta=onset_threshold, wait=10
     )
     for idx in onset_peaks:
         time_sec = idx * 0.5
         score = min(1.0, onset_env[idx] / (np.mean(onset_env) + 2 * np.std(onset_env)))
         peaks.append({"time": time_sec, "score": max(0.2, score)})
+
+    # Laughter detection — spectral rolloff spike (rough heuristic).
+    # Laughter produces a wide-band spectral signature distinct from speech.
+    try:
+        rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
+        ro_mean = np.mean(rolloff)
+        ro_std = np.std(rolloff)
+        laught_indices = np.where(rolloff > ro_mean + 2 * ro_std)[0]
+        for idx in laught_indices:
+            time_sec = idx * 0.5
+            peaks.append({"time": time_sec, "score": 0.5, "type": "laughter"})
+    except Exception as e:
+        log.debug(f"[librosa] Laughter detection skipped: {e}")
 
     # Deduplicate by merging within 15 seconds
     peaks.sort(key=lambda p: p["time"])
@@ -320,27 +340,19 @@ def analyze_audio(video_path: str) -> list[dict]:
 # ─── Chat velocity analysis ─────────────────────────────────────────────────
 
 def analyze_chat_velocity(chat_data: list, duration_sec: float) -> list[dict]:
-    """
-    Parse Twitch/YouTube chat data and detect velocity spikes.
-    A velocity spike means many messages in a short window — the audience
-    is reacting to something exciting.
-    Returns list of {time: float, score: float, velocity: int} peaks.
-    """
+    """Parse Twitch/YouTube chat data and detect velocity spikes."""
     if not chat_data:
         return []
 
-    # Build time-indexed message counts in 5-second buckets
     bucket_size = 5
     bucket_count = max(1, int(duration_sec / bucket_size))
     buckets = [0] * bucket_count
 
     for msg in chat_data:
-        # Twitch chat timestamps are in offset_seconds
         t = msg.get("offset_seconds", msg.get("timestamp_sec", 0))
         idx = min(bucket_count - 1, int(t / bucket_size))
         buckets[idx] += 1
 
-    # Detect spikes: mean + 2.5 * std
     import statistics
     if not buckets:
         return []
@@ -359,19 +371,96 @@ def analyze_chat_velocity(chat_data: list, duration_sec: float) -> list[dict]:
     return peaks
 
 
+# ─── Engagement phrase + text analysis ──────────────────────────────────────
+
+# Multi-language excitement phrase list — extended from the original 21 phrases.
+EXCITEMENT_PHRASES = [
+    # English
+    "let's go", "let's gooo", "no way", "holy", "holy shit", "holy crap",
+    "clip it", "clip that", "pog", "poggers", "insane", "unbelievable",
+    "wow", "gg", "amazing", "best", "let's go baby", "oh my god", "omg",
+    "absolutely", "crazy", "nuts", "sick", "clutch", "frame perfect",
+    "world record", "pb", "personal best", "we did it", "we're back",
+    "we are back", "we're so back", "cooked", "we are cooked",
+    "absolute cinema", "cinema", "stop rewind", "hold up", "wait wait",
+    "no shot", "no shot dude", "for real", "fr", "literally insane",
+    "bussin", "cap", "no cap", "based", "ratio", "w", "w stream",
+    "l", "l stream", "rip", "f", "ggwp", "gg ez", "ggs",
+    "react", "reaction", "let him cook", "let her cook", "cooking",
+    "yooo", "brooo", "what", "what just happened", "did you see that",
+    "that was crazy", "did that just happen", "i can't", "i cant",
+    "chat", "chat chat chat", "guys", "everyone", "look at this",
+    # Spanish
+    "vamos", "no way", "dios mío", "increíble", "joder", "guau",
+    # Japanese (romanized)
+    "sugoi", "suge", "majikayo", "hontou", "yatta", "nani",
+    # Korean (romanized)
+    "daebak", "jinjja", "wah", "oettoke",
+    # French
+    "mon dieu", "incroyable", "ouf", "wouahou",
+]
+
+# Caps / exclamation density thresholds
+CAPS_RATIO_THRESHOLD = 0.5  # 50%+ uppercase → excited
+EXCLAMATION_THRESHOLD = 2  # 2+ "!" in segment → excited
+
+
+def detect_text_excitement(segments: list[dict]) -> list[dict]:
+    """
+    Analyze Whisper segments for excitement markers:
+      - keyword matches (case-insensitive)
+      - ALL CAPS density (>= 50% uppercase letters)
+      - exclamation mark density (>= 2 in segment)
+    Returns list of {time, score, phrase} peaks.
+    """
+    peaks = []
+    for seg in segments:
+        text = seg.get("text", "")
+        if not text.strip():
+            continue
+        text_lower = text.lower()
+        time = float(seg.get("start", 0))
+        score = 0.0
+        matched_phrase = None
+
+        # Keyword match
+        for phrase in EXCITEMENT_PHRASES:
+            if phrase in text_lower:
+                score = max(score, 0.4 + min(0.4, len(phrase) / 20))
+                matched_phrase = text.strip()
+                break
+
+        # ALL CAPS density
+        letters = [c for c in text if c.isalpha()]
+        if letters:
+            caps = sum(1 for c in letters if c.isupper())
+            caps_ratio = caps / len(letters)
+            if caps_ratio >= CAPS_RATIO_THRESHOLD and len(letters) >= 4:
+                score = max(score, 0.5 + caps_ratio * 0.2)
+                if not matched_phrase:
+                    matched_phrase = text.strip()
+
+        # Exclamation density
+        excl_count = text.count("!")
+        if excl_count >= EXCLAMATION_THRESHOLD:
+            score = max(score, 0.45 + min(0.3, excl_count * 0.1))
+            if not matched_phrase:
+                matched_phrase = text.strip()
+
+        if score > 0:
+            peaks.append({
+                "time": time,
+                "score": min(1.0, score),
+                "phrase": matched_phrase or text.strip(),
+            })
+
+    return peaks
+
+
 # ─── Full analysis pipeline ─────────────────────────────────────────────────
 
 async def analyze_vod(source_id: str, storage_path: str) -> dict:
-    """
-    Run the full analysis pipeline on a downloaded VOD:
-    1. Whisper transcription
-    2. Librosa audio peak detection
-    3. Chat velocity parsing
-    4. Merge all peaks → detect highlight clips
-    5. Pad/trim clips to 45-90s duration, cap at 20 clips
-    """
-    # Resolve local file path from storage_path
-    # storage_path format: /vods/{sourceId}/master.mp4
+    """Run the full analysis pipeline on a downloaded VOD."""
     local_path = VOD_DIR / source_id / "master.mp4"
     if not local_path.exists():
         raise FileNotFoundError(f"VOD not found: {local_path}")
@@ -384,53 +473,40 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
     duration = metadata.get("duration", 0) or 600
     thumbnail = metadata.get("thumbnail", "")
 
-    # Run Whisper transcription (CPU)
     log.info(f"[analyze] Starting Whisper transcription for {source_id}")
     whisper_segments = run_whisper(str(local_path))
 
-    # Run librosa audio analysis (CPU)
     log.info(f"[analyze] Starting librosa audio analysis for {source_id}")
     audio_peaks = analyze_audio(str(local_path))
 
-    # Chat velocity
     chat_file = VOD_DIR / source_id / "chat.json"
     chat_data = []
     if chat_file.exists():
         try:
             chat_data = json.loads(chat_file.read_text())
-        except:
+        except Exception:
             chat_data = []
 
     chat_peaks = analyze_chat_velocity(chat_data, duration)
 
-    # Transcript highlight detection — look for excitement phrases
-    transcript_peaks = []
-    excitement_words = [
-        "let's go", "no way", "holy", "clip it", "pog", "insane",
-        "unbelievable", "wow", "gg", "amazing", "best",
-    ]
-    for seg in whisper_segments:
-        text_lower = seg["text"].lower()
-        for phrase in excitement_words:
-            if phrase in text_lower:
-                score = 0.4 + len(phrase) / 20  # longer phrases score higher
-                transcript_peaks.append({
-                    "time": seg["start"],
-                    "score": score,
-                    "phrase": seg["text"],
-                })
-                break
+    # Text-based excitement detection (multi-signal)
+    transcript_peaks = detect_text_excitement(whisper_segments)
 
     # ─── Merge all peaks ──────────────────────────────────────────────
     all_peaks = []
     for p in audio_peaks:
         all_peaks.append({"time": p["time"], "score": p["score"], "type": "audio"})
     for p in chat_peaks:
-        all_peaks.append({"time": p["time"], "score": p["score"], "velocity": p.get("velocity", 0), "type": "chat"})
+        all_peaks.append({
+            "time": p["time"], "score": p["score"],
+            "velocity": p.get("velocity", 0), "type": "chat"
+        })
     for p in transcript_peaks:
-        all_peaks.append({"time": p["time"], "score": p["score"], "phrase": p.get("phrase", ""), "type": "transcript"})
+        all_peaks.append({
+            "time": p["time"], "score": p["score"],
+            "phrase": p.get("phrase", ""), "type": "transcript"
+        })
 
-    # Sort by time
     all_peaks.sort(key=lambda p: p["time"])
 
     # Merge proximate peaks (within 15s)
@@ -460,7 +536,6 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
         start = max(0, peak["time"] - 15)
         end = min(duration, peak["time"] + 45)
 
-        # Enforce min 45s, max 90s
         if end - start < 45:
             end = min(duration, start + 45)
         if end - start > 90:
@@ -473,12 +548,12 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
             chat_boost = min(0.3, velocity / 500)
         engagement = min(0.99, 0.4 + peak["score"] * 0.4 + chat_boost)
 
-        # Build transcript snippet
+        # Build transcript snippet from whisper segments in range
         relevant_segments = [
             s for s in whisper_segments
-            if s["start"] >= start and s["end"] <= end
+            if float(s.get("start", 0)) >= start and float(s.get("end", 0)) <= end
         ]
-        transcript_text = " ".join(s["text"] for s in relevant_segments) or peak.get("phrase", "")
+        transcript_text = " ".join(s.get("text", "") for s in relevant_segments) or peak.get("phrase", "")
 
         clips.append({
             "startTimeSec": start,
@@ -492,26 +567,108 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
             "thumbnailUrl": thumbnail,
         })
 
-    # Sort clips by start time
     clips.sort(key=lambda c: c["startTimeSec"])
 
     log.info(f"[analyze] Detected {len(clips)} highlight clips for {source_id}")
-    return {"sourceId": source_id, "clips": clips}
+    return {
+        "sourceId": source_id,
+        "clips": clips,
+        "transcript": whisper_segments,  # full segment list for subtitle editor
+    }
 
 
-# ─── FFmpeg render ──────────────────────────────────────────────────────────
+# ─── FFmpeg render (with subtitles + backing track) ─────────────────────────
+
+def _build_subtitle_filter(style: Optional[dict]) -> str:
+    """Build FFmpeg force_style string for the subtitles filter."""
+    if not style:
+        return "Fontsize=24,Outline=2,Shadow=1"
+
+    parts = []
+    parts.append(f"Fontsize={style.get('fontSize', 24)}")
+    parts.append("Outline=2")
+    parts.append("Shadow=1")
+
+    if style.get("bold"):
+        parts.append("Bold=1")
+
+    color = style.get("color", "#FFFFFF")
+    # FFmpeg ass color format: &HAABBGGRR (alpha, blue, green, red)
+    # Convert #RRGGBB → &H00BBGGRR (no alpha = opaque)
+    if color.startswith("#") and len(color) == 7:
+        r = color[1:3]
+        g = color[3:5]
+        b = color[5:7]
+        ass_color = f"&H00{b}{g}{r}"
+        parts.append(f"PrimaryColour={ass_color}")
+
+    bg = style.get("bgColor", "#000000AA")
+    # &HAABBGGRR — alpha from 8-char hex
+    if bg.startswith("#") and len(bg) == 9:
+        a = bg[1:3]
+        r = bg[3:5]
+        g = bg[5:7]
+        b = bg[7:9]
+        # FFmpeg alpha is inverted (00 = opaque, FF = transparent)
+        a_val = 255 - int(a, 16)
+        ass_bg = f"&H{a_val:02X}{b}{g}{r}"
+        parts.append(f"BackColour={ass_bg}")
+        parts.append("BorderStyle=4")  # opaque box
+
+    position = style.get("position", "bottom")
+    if position == "top":
+        parts.append("Alignment=8")  # top center
+    elif position == "center":
+        parts.append("Alignment=5")  # middle center
+    else:
+        parts.append("Alignment=2")  # bottom center
+
+    return ",".join(parts)
+
+
+def _vtt_to_srt(vtt_content: str) -> str:
+    """Convert WebVTT to SRT for FFmpeg's subtitles filter."""
+    # Strip WEBVTT header
+    srt = re.sub(r"^WEBVTT\s*\n", "", vtt_content, flags=re.IGNORECASE)
+    # Replace . with , in timestamps (SRT uses commas for ms)
+    srt = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", srt)
+    # Add cue numbers
+    lines = srt.split("\n")
+    out_lines = []
+    cue_idx = 1
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+        if "-->" in line:
+            out_lines.append(str(cue_idx))
+            out_lines.append(line)
+            cue_idx += 1
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                out_lines.append(lines[i])
+                i += 1
+            out_lines.append("")
+        else:
+            i += 1
+    return "\n".join(out_lines)
+
 
 async def render_clip(
     clip_id: str,
     source_storage_path: str,
     final_start_sec: float,
     final_end_sec: float,
+    with_subtitles: bool = False,
+    subtitle_vtt: Optional[str] = None,
+    subtitle_style: Optional[dict] = None,
+    with_backing_track: bool = False,
+    backing_track_path: Optional[str] = None,
+    backing_track_volume: float = 0.3,
 ) -> dict:
-    """
-    Render a clip using FFmpeg: cut the segment from the VOD and produce
-    a standalone MP4 optimized for YouTube upload.
-    """
-    # Resolve local source path
+    """Render a clip using FFmpeg with optional subtitles + backing track."""
     source_id = source_storage_path.split("/")[2] if "/" in source_storage_path else ""
     local_source = VOD_DIR / source_id / "master.mp4"
     if not local_source.exists():
@@ -521,24 +678,77 @@ async def render_clip(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "final.mp4"
 
-    # FFmpeg command — fast seek + re-encode for YouTube compatibility
-    cmd = [
-        "ffmpeg",
-        "-y",                    # overwrite output
-        "-ss", str(final_start_sec),  # seek to start
-        "-i", str(local_source),      # input file
-        "-t", str(final_end_sec - final_start_sec),  # duration
-        "-c:v", "libx264",           # H264 video codec
-        "-preset", "fast",           # Fast encoding (CPU-friendly)
-        "-crf", "23",                # Quality (23 is good for YouTube)
-        "-c:a", "aac",               # AAC audio
-        "-b:a", "128k",              # Audio bitrate
-        "-movflags", "+faststart",   # Web-friendly MP4
-        "-vf", "scale=-2:720",       # 720p output (scale width proportionally)
-        str(out_path),
-    ]
+    duration = final_end_sec - final_start_sec
 
-    log.info(f"[render] Running FFmpeg: {cmd}")
+    # Build FFmpeg command — base video cut
+    cmd = ["ffmpeg", "-y"]
+
+    # Input 0: source VOD
+    cmd.extend(["-ss", str(final_start_sec), "-i", str(local_source)])
+
+    # Input 1: backing track (if requested)
+    backing_local = None
+    if with_backing_track and backing_track_path:
+        # backing_track_path is /backing/{id}.mp3 — resolve to local file
+        backing_id = backing_track_path.split("/")[-1].replace(".mp3", "")
+        backing_local = BACKING_DIR / f"{backing_id}.mp3"
+        if backing_local.exists():
+            cmd.extend(["-i", str(backing_local)])
+        else:
+            log.warning(f"[render] Backing track not found: {backing_local}")
+            with_backing_track = False
+
+    # Build filter complex
+    filters = []
+
+    # Video filter: scale to 720p (preserving aspect)
+    video_filter = "scale=-2:720"
+    if with_subtitles and subtitle_vtt:
+        # Write VTT to a temp file, convert to SRT (FFmpeg's subtitles filter
+        # works best with SRT/ASS), then add subtitles filter
+        srt_content = _vtt_to_srt(subtitle_vtt)
+        # Offset timestamps by -final_start_sec so subtitles align with the clip
+        # (VTT from the editor has absolute source timestamps)
+        srt_content = _offset_srt(srt_content, -final_start_sec)
+        srt_file = out_dir / "subs.srt"
+        srt_file.write_text(srt_content, encoding="utf-8")
+
+        style_str = _build_subtitle_filter(subtitle_style)
+        # Path escaping for FFmpeg filter — colons and backslashes need care
+        srt_path_escaped = str(srt_file).replace("\\", "/").replace(":", "\\:")
+        video_filter = f"{video_filter},subtitles='{srt_path_escaped}':force_style='{style_str}'"
+
+    filters.append(f"[0:v]{video_filter}[vout]")
+
+    # Audio filter
+    if with_backing_track and backing_local:
+        # Mix original audio with backing track
+        # [0:a] = original, [1:a] = backing
+        # Backing track volume scaled, then amix
+        filters.append(f"[0:a]volume=1.0[a0]")
+        filters.append(f"[1:a]atrim=duration={duration},volume={backing_track_volume}[a1]")
+        filters.append(f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]")
+        audio_output = "[aout]"
+    else:
+        filters.append(f"[0:a]anull[aout]")
+        audio_output = "[aout]"
+
+    cmd.extend(["-filter_complex", ";".join(filters)])
+    cmd.extend(["-map", "[vout]", "-map", audio_output])
+
+    # Output encoding
+    cmd.extend([
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        "-t", str(duration),
+        str(out_path),
+    ])
+
+    log.info(f"[render] Running FFmpeg: {' '.join(cmd[:20])}...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -547,7 +757,7 @@ async def render_clip(
     stdout, stderr = await proc.communicate()
 
     if proc.returncode != 0:
-        err_msg = stderr.decode()[-500:] or "FFmpeg render failed"
+        err_msg = stderr.decode()[-1000:] or "FFmpeg render failed"
         log.error(f"[render] Failed: {err_msg}")
         raise RuntimeError(err_msg)
 
@@ -555,7 +765,40 @@ async def render_clip(
     return {"clipId": clip_id, "storagePath": storage_path}
 
 
-# ─── YouTube publish ────────────────────────────────────────────────────────
+def _offset_srt(srt_content: str, offset_sec: float) -> str:
+    """Offset all timestamps in an SRT by offset_sec (can be negative)."""
+    def offset_ts(ts: str) -> str:
+        # Parse HH:MM:SS,mmm
+        m = re.match(r"(\d+):(\d+):(\d+),(\d+)", ts)
+        if not m:
+            return ts
+        h, mi, s, ms = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        total = h * 3600 + mi * 60 + s + ms / 1000 + offset_sec
+        if total < 0:
+            total = 0
+        h = int(total // 3600)
+        mi = int((total % 3600) // 60)
+        s = int(total % 60)
+        ms = int((total % 1) * 1000)
+        return f"{h:02d}:{mi:02d}:{s:02d},{ms:03d}"
+
+    # Match timestamp ranges
+    def replace_range(match):
+        return f"{offset_ts(match.group(1))} --> {offset_ts(match.group(2))}"
+
+    return re.sub(
+        r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})",
+        replace_range,
+        srt_content,
+    )
+
+
+# ─── YouTube publish (multi-channel) ────────────────────────────────────────
+
+def _get_token_file(channel: str) -> Path:
+    """Return the token file path for a given channel."""
+    return DEFAULT_TOKEN_FILES.get(channel, DEFAULT_TOKEN_FILES["CHANNEL_A"])
+
 
 async def publish_to_youtube(
     clip_id: str,
@@ -563,28 +806,23 @@ async def publish_to_youtube(
     channel: str,
     title: str,
 ) -> dict:
-    """
-    Upload a rendered clip to YouTube using the YouTube Data API v3.
-    Uses OAuth tokens from the .youtube-tokens.json file (created by youtube_auth.js).
-    """
-    # Resolve local clip path
+    """Upload a rendered clip to YouTube using the channel's OAuth tokens."""
     clip_id_from_path = clip_storage_path.split("/")[2] if "/" in clip_storage_path else clip_id
     local_clip = CLIPS_DIR / clip_id_from_path / "final.mp4"
     if not local_clip.exists():
         raise FileNotFoundError(f"Clip not found: {local_clip}")
 
-    # Load YouTube OAuth tokens
-    if not YT_TOKENS_FILE.exists():
+    tokens_file = _get_token_file(channel)
+    if not tokens_file.exists():
         raise RuntimeError(
-            f"YouTube tokens not found at {YT_TOKENS_FILE}. "
-            "Run youtube_auth.js in the parent project directory first."
+            f"YouTube tokens not found at {tokens_file}. "
+            f"Run youtube_auth.js with --tokens={tokens_file.name} to authorize {channel}."
         )
 
-    tokens = json.loads(YT_TOKENS_FILE.read_text())
+    tokens = json.loads(tokens_file.read_text())
 
-    # Load client_id / client_secret from client_secret.json (same file youtube_auth.js uses)
-    # Falls back to env vars if the file is not present.
-    client_secret_file = Path(__file__).resolve().parent.parent / "client_secret.json"
+    # Load client_id / client_secret from client_secret.json or env
+    client_secret_file = PROJECT_ROOT / "client_secret.json"
     client_id = ""
     client_secret = ""
     if client_secret_file.exists():
@@ -595,22 +833,20 @@ async def publish_to_youtube(
             client_secret = installed.get("client_secret", "")
         except Exception as e:
             log.warning(f"[publish] Could not parse client_secret.json: {e}")
-    # Override with env vars if available (e.g. YT_CLIENT_ID / YT_CLIENT_SECRET in .env)
     client_id = os.environ.get("YT_CLIENT_ID", client_id)
     client_secret = os.environ.get("YT_CLIENT_SECRET", client_secret)
 
-    # Use google-auth to build credentials from the saved tokens
     try:
         from google.oauth2.credentials import Credentials
         from googleapiclient.discovery import build
         from googleapiclient.http import MediaFileUpload
     except ImportError:
-        raise RuntimeError("google-api-python-client not installed. Run: pip install google-api-python-client")
+        raise RuntimeError(
+            "google-api-python-client not installed. Run: pip install google-api-python-client"
+        )
 
-    # Build credentials from saved tokens + client creds
-    # The tokens file from youtube_auth.js has: access_token, refresh_token, scope, expiry
-    # client_id/client_secret come from client_secret.json or env vars
-    scopes = tokens.get("scope", tokens.get("scopes", ["https://www.googleapis.com/auth/youtube.force-ssl"]))
+    scopes = tokens.get("scope", tokens.get("scopes",
+        ["https://www.googleapis.com/auth/youtube.force-ssl"]))
     if isinstance(scopes, str):
         scopes = scopes.split(" ")
 
@@ -623,31 +859,26 @@ async def publish_to_youtube(
         scopes=scopes,
     )
 
-    # Refresh if expired
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request
         creds.refresh(Request())
-        # Save refreshed tokens back
         tokens["access_token"] = creds.token
         tokens["expiry"] = creds.expiry.isoformat() if creds.expiry else ""
-        YT_TOKENS_FILE.write_text(json.dumps(tokens, indent=2))
+        tokens_file.write_text(json.dumps(tokens, indent=2))
 
     youtube = build("youtube", "v3", credentials=creds)
 
-    # Determine which channel to upload to
-    # In production, CHANNEL_A and CHANNEL_B would map to different YouTube channels.
-    # For now, we upload to the authenticated channel.
-    # Future: add CHANNEL_A_YT_CHANNEL_ID and CHANNEL_B_YT_CHANNEL_ID env vars
+    log.info(f"[publish] Uploading clip {clip_id} to YouTube ({channel}) as '{title}'")
 
-    log.info(f"[publish] Uploading clip {clip_id} to YouTube as '{title}'")
-
-    # YouTube upload request
     body = {
         "snippet": {
             "title": title,
-            "description": f"Auto-detected highlight clip from livestream VOD. Generated by ClipCurator.",
+            "description": (
+                f"Auto-detected highlight clip from livestream VOD. "
+                f"Generated by ClipCurator."
+            ),
             "tags": ["clipcurator", "livestream", "highlights", "twitch", "vod"],
-            "categoryId": "20",  # Gaming category
+            "categoryId": "20",  # Gaming
         },
         "status": {
             "privacyStatus": "public",
@@ -679,7 +910,7 @@ async def publish_to_youtube(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "clipper", "version": "1.0.0"}
+    return {"status": "ok", "service": "clipper", "version": "2.0.0"}
 
 
 @app.post("/download")
@@ -710,6 +941,12 @@ async def api_render(req: RenderRequest):
             req.sourceStoragePath,
             req.finalStartSec,
             req.finalEndSec,
+            with_subtitles=req.withSubtitles,
+            subtitle_vtt=req.subtitleVtt,
+            subtitle_style=req.subtitleStyle,
+            with_backing_track=req.withBackingTrack,
+            backing_track_path=req.backingTrackPath,
+            backing_track_volume=req.backingTrackVolume,
         )
         return JSONResponse(result)
     except Exception as e:
@@ -732,6 +969,195 @@ async def api_publish(req: PublishRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ─── Transcript endpoint (for subtitle editor) ──────────────────────────────
+
+@app.get("/transcript/{source_id}")
+async def api_transcript(source_id: str):
+    """Return raw Whisper segments for a source. Falls back to on-disk cache."""
+    # Try the cached transcript first (written by analyze_vod)
+    local_path = VOD_DIR / source_id / "master.mp4"
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail="VOD not found")
+
+    # We don't persist segments to disk in analyze_vod — they're returned in
+    # the response and the Next.js app caches them in DB. But if the DB is
+    # empty (e.g. analyze job crashed mid-way), we can re-run whisper on demand.
+    # For now, return empty — the Next.js endpoint will fall back to DB.
+    return JSONResponse({"sourceId": source_id, "segments": []})
+
+
+# ─── Backing track endpoints ────────────────────────────────────────────────
+
+@app.post("/backing-track")
+async def api_upload_backing_track(
+    name: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Upload an MP3 to the backing track library."""
+    track_id = uuid.uuid4().hex
+    out_path = BACKING_DIR / f"{track_id}.mp3"
+
+    # Save the uploaded file
+    content = await file.read()
+    out_path.write_bytes(content)
+
+    # Probe duration with ffprobe
+    duration_sec = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", str(out_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            probe = json.loads(stdout.decode())
+            duration_sec = float(probe.get("format", {}).get("duration", 0)) or None
+    except Exception as e:
+        log.debug(f"[backing-track] ffprobe failed: {e}")
+
+    storage_path = f"/backing/{track_id}.mp3"
+    log.info(f"[backing-track] Uploaded '{name}' → {storage_path}")
+
+    return JSONResponse({
+        "id": track_id,
+        "name": name,
+        "storagePath": storage_path,
+        "fileSizeBytes": len(content),
+        "durationSec": duration_sec,
+    })
+
+
+@app.get("/backing/{track_id}.mp3")
+async def serve_backing_track(track_id: str):
+    path = BACKING_DIR / f"{track_id}.mp3"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Backing track not found")
+    return FileResponse(path, media_type="audio/mpeg", filename=f"{track_id}.mp3")
+
+
+# ─── YouTube channel info ───────────────────────────────────────────────────
+
+@app.get("/youtube/channel")
+async def api_youtube_channel(channel: str):
+    """
+    Fetch YouTube channel info (id, title, thumbnail) using the saved OAuth
+    tokens for the given channel (CHANNEL_A or CHANNEL_B).
+    """
+    if channel not in ("CHANNEL_A", "CHANNEL_B"):
+        raise HTTPException(status_code=400, detail="channel must be CHANNEL_A or CHANNEL_B")
+
+    tokens_file = _get_token_file(channel)
+    if not tokens_file.exists():
+        return JSONResponse({
+            "channelId": "",
+            "title": "",
+            "thumbnailUrl": "",
+            "isConfigured": False,
+        })
+
+    try:
+        tokens = json.loads(tokens_file.read_text())
+    except Exception:
+        return JSONResponse({
+            "channelId": "",
+            "title": "",
+            "thumbnailUrl": "",
+            "isConfigured": False,
+        })
+
+    # Load client creds
+    client_secret_file = PROJECT_ROOT / "client_secret.json"
+    client_id = ""
+    client_secret = ""
+    if client_secret_file.exists():
+        try:
+            cs_data = json.loads(client_secret_file.read_text())
+            installed = cs_data.get("installed", cs_data.get("web", {}))
+            client_id = installed.get("client_id", "")
+            client_secret = installed.get("client_secret", "")
+        except Exception:
+            pass
+    client_id = os.environ.get("YT_CLIENT_ID", client_id)
+    client_secret = os.environ.get("YT_CLIENT_SECRET", client_secret)
+
+    try:
+        from google.oauth2.credentials import Credentials
+        from googleapiclient.discovery import build
+    except ImportError:
+        raise HTTPException(
+            status_code=500,
+            detail="google-api-python-client not installed"
+        )
+
+    scopes = tokens.get("scope", tokens.get("scopes",
+        ["https://www.googleapis.com/auth/youtube.force-ssl"]))
+    if isinstance(scopes, str):
+        scopes = scopes.split(" ")
+
+    creds = Credentials(
+        token=tokens.get("access_token", ""),
+        refresh_token=tokens.get("refresh_token", ""),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+    )
+
+    if creds.expired and creds.refresh_token:
+        from google.auth.transport.requests import Request
+        try:
+            creds.refresh(Request())
+            tokens["access_token"] = creds.token
+            tokens["expiry"] = creds.expiry.isoformat() if creds.expiry else ""
+            tokens_file.write_text(json.dumps(tokens, indent=2))
+        except Exception as e:
+            log.warning(f"[youtube/channel] Token refresh failed: {e}")
+            return JSONResponse({
+                "channelId": "",
+                "title": "",
+                "thumbnailUrl": "",
+                "isConfigured": False,
+            })
+
+    try:
+        youtube = build("youtube", "v3", credentials=creds)
+        # Get the authenticated user's channel
+        resp = youtube.channels().list(
+            part="snippet",
+            mine=True,
+        ).execute()
+        items = resp.get("items", [])
+        if not items:
+            return JSONResponse({
+                "channelId": "",
+                "title": "",
+                "thumbnailUrl": "",
+                "isConfigured": False,
+            })
+        item = items[0]
+        snippet = item.get("snippet", {})
+        thumbnails = snippet.get("thumbnails", {})
+        return JSONResponse({
+            "channelId": item.get("id", ""),
+            "title": snippet.get("title", ""),
+            "thumbnailUrl": (
+                thumbnails.get("default", {}).get("url", "")
+                or thumbnails.get("medium", {}).get("url", "")
+            ),
+            "isConfigured": True,
+        })
+    except Exception as e:
+        log.error(f"[youtube/channel] API call failed: {e}")
+        return JSONResponse({
+            "channelId": "",
+            "title": "",
+            "thumbnailUrl": "",
+            "isConfigured": False,
+        })
+
+
 # ─── Static file serving ────────────────────────────────────────────────────
 
 @app.get("/vod/{source_id}/master.mp4")
@@ -747,15 +1173,19 @@ async def serve_clip(clip_id: str):
     path = CLIPS_DIR / clip_id / "final.mp4"
     if not path.exists():
         raise HTTPException(status_code=404, detail="Clip not found")
-    return FileResponse(path, media_type="video/mp4", filename="final.mp4")
+    return FileResponse(path, media_type="video/mp4", filename=f"{clip_id}.mp4")
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-    log.info(f"ClipCurator Clipper starting on port {CLIPPER_PORT}")
+    log.info(f"ClipCurator Clipper v2.0 starting on port {CLIPPER_PORT}")
     log.info(f"Data directory: {DATA_DIR}")
     log.info(f"VOD directory: {VOD_DIR}")
     log.info(f"Clips directory: {CLIPS_DIR}")
-    uvicorn.run(app, host="0.0.0.0", port=CLIPPER_PORT)
+    log.info(f"Backing tracks: {BACKING_DIR}")
+    log.info(f"Project root: {PROJECT_ROOT}")
+    log.info(f"Channel A tokens: {DEFAULT_TOKEN_FILES['CHANNEL_A']}")
+    log.info(f"Channel B tokens: {DEFAULT_TOKEN_FILES['CHANNEL_B']}")
+    uvicorn.run(app, host="0.0.0.0", port=CLIPPER_PORT, log_level="info")
