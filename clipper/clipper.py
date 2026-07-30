@@ -1076,12 +1076,9 @@ async def api_upload_backing_track(
     })
 
 
-@app.get("/backing/{track_id}.mp3")
-async def serve_backing_track(track_id: str):
-    path = BACKING_DIR / f"{track_id}.mp3"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Backing track not found")
-    return FileResponse(path, media_type="audio/mpeg", filename=f"{track_id}.mp3")
+# (Backing track files are now served via StaticFiles mount at /backing —
+# see the "Static file serving" section below. This gives HTTP Range support
+# for audio playback in the browser.)
 
 
 # ─── YouTube channel info ───────────────────────────────────────────────────
@@ -1205,22 +1202,23 @@ async def api_youtube_channel(channel: str):
         })
 
 
-# ─── Static file serving ────────────────────────────────────────────────────
+# ─── Static file serving (with HTTP Range support for video playback) ────────
+#
+# Video players (Chrome, Firefox, Safari) require HTTP 206 Partial Content
+# responses to seek, determine duration, and play media. FastAPI's
+# FileResponse does NOT support range requests — it returns the whole file
+# as 200 OK, which causes "no video with supported format and MIME type"
+# or playback failures.
+#
+# Fix: use StaticFiles mounts, which support range requests natively.
+# The path structure matches what the Next.js rewrite rules expect:
+#   /vod/{sourceId}/master.mp4  → VOD_DIR / {sourceId} / master.mp4
+#   /clip/{clipId}/final.mp4    → CLIPS_DIR / {clipId} / final.mp4
+#   /backing/{trackId}.mp3      → BACKING_DIR / {trackId}.mp3
 
-@app.get("/vod/{source_id}/master.mp4")
-async def serve_vod(source_id: str):
-    path = VOD_DIR / source_id / "master.mp4"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="VOD not found")
-    return FileResponse(path, media_type="video/mp4", filename="master.mp4")
-
-
-@app.get("/clip/{clip_id}/final.mp4")
-async def serve_clip(clip_id: str):
-    path = CLIPS_DIR / clip_id / "final.mp4"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Clip not found")
-    return FileResponse(path, media_type="video/mp4", filename=f"{clip_id}.mp4")
+app.mount("/vod", StaticFiles(directory=str(VOD_DIR), check_dir=False), name="vod-files")
+app.mount("/clip", StaticFiles(directory=str(CLIPS_DIR), check_dir=False), name="clip-files")
+app.mount("/backing", StaticFiles(directory=str(BACKING_DIR), check_dir=False), name="backing-files")
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
