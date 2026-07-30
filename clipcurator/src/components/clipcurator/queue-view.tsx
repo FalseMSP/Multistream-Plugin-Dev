@@ -64,6 +64,7 @@ import {
   useSubmitReview,
   useRenderPreview,
   useBackingTracks,
+  usePeekNextClip,
 } from "@/hooks/use-clipcurator";
 import { VideoProvider, useVideo } from "./video-context";
 import { TimelineTrimmer } from "./timeline-trimmer";
@@ -110,6 +111,7 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
   const submitReview = useSubmitReview();
   const renderPreview = useRenderPreview();
   const video = useVideo();
+  const peekNext = usePeekNextClip();
 
   // Local VTT state — populated by the SubtitleEditor's onVttChange callback.
   const [subtitleVtt, setSubtitleVtt] = React.useState<string | null>(null);
@@ -202,10 +204,47 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
   React.useEffect(() => {
     if (currentClip && videoUrl) {
       video.reload();
-      const t = setTimeout(() => {
-        video.seek(currentClip.suggestedStart);
-      }, 250);
-      return () => clearTimeout(t);
+
+      // Seek to the clip's suggested start time once metadata is loaded.
+      // We can't use video.seek() directly because the <video> element's
+      // duration is Infinity until the moov atom is parsed — setting
+      // currentTime before that throws or silently fails.
+      //
+      // Solution: attach a one-time 'loadedmetadata' listener that performs
+      // the seek. This fires when the browser has read enough of the file
+      // to know the duration and sample tables.
+      const el = video.videoRef.current;
+      if (!el) return;
+
+      const seekOnce = () => {
+        try {
+          el.currentTime = currentClip.suggestedStart;
+        } catch {
+          // If this still fails, try again on 'canplay' (even more data loaded)
+          el.addEventListener(
+            "canplay",
+            () => {
+              try {
+                el.currentTime = currentClip.suggestedStart;
+              } catch {
+                /* give up — user can click the timeline */
+              }
+            },
+            { once: true }
+          );
+        }
+      };
+
+      // If metadata is already loaded (fast path), seek immediately.
+      if (el.readyState >= 1 && Number.isFinite(el.duration)) {
+        seekOnce();
+      } else {
+        el.addEventListener("loadedmetadata", seekOnce, { once: true });
+      }
+
+      return () => {
+        el.removeEventListener("loadedmetadata", seekOnce);
+      };
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentClip?.id, videoUrl]);
@@ -564,6 +603,10 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
       </div>
 
       <div className="h-20 lg:hidden" aria-hidden />
+
+      {/* Hidden preloader — buffers the next clip's video in the background
+          so playback starts instantly when the user advances. */}
+      <NextClipPreloader src={peekNext.data?.videoUrl ?? null} />
     </div>
   );
 }
@@ -579,7 +622,7 @@ function VideoPlayer({ src, poster }: { src: string; poster: string }) {
         poster={poster || undefined}
         controls
         playsInline
-        preload="metadata"
+        preload="auto"
         className="aspect-video w-full bg-black"
       />
       {!isPlaying && (
@@ -597,6 +640,35 @@ function VideoPlayer({ src, poster }: { src: string; poster: string }) {
         </button>
       )}
     </div>
+  );
+}
+
+// ── Hidden preloader for the next clip ────────────────────────────────────
+// Renders a hidden <video preload="auto"> that buffers the next clip's
+// video file in the background. When the user advances to the next clip,
+// the browser already has it cached → instant playback, no loading spinner.
+//
+// The video is muted + hidden + 1x1px so the browser doesn't try to render
+// it visibly. It just downloads the file into the HTTP cache.
+function NextClipPreloader({ src }: { src: string | null }) {
+  if (!src) return null;
+  return (
+    <video
+      src={src}
+      preload="auto"
+      muted
+      playsInline
+      aria-hidden
+      style={{
+        position: "fixed",
+        width: "1px",
+        height: "1px",
+        left: "-9999px",
+        top: "-9999px",
+        opacity: 0,
+        pointerEvents: "none",
+      }}
+    />
   );
 }
 
