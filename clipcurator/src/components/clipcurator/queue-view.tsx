@@ -194,58 +194,74 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
     video.seek(currentClip.suggestedStart);
   }, [currentClip, setTrim, video]);
 
-  // Reload listeners when a new clip / videoUrl arrives; seek to suggested start.
-  // IMPORTANT: `video` is intentionally excluded from the deps array.
-  // The `video` object from useVideo() changes identity on every timeupdate
-  // event (because currentTime is in its memo deps). If we include it here,
-  // this effect re-runs every ~250ms, calls video.reload(), resets the
-  // video element, and the playhead never advances — causing "jittering".
-  // We only want to reload when the clip ID or URL actually changes.
+  // Reload + seek when a new clip loads.
+  // IMPORTANT: `video` is intentionally excluded from deps — it changes
+  // identity on every timeupdate, which would cause infinite reload loops.
   React.useEffect(() => {
-    if (currentClip && videoUrl) {
-      video.reload();
+    if (!currentClip || !videoUrl) return;
 
-      // Seek to the clip's suggested start time once metadata is loaded.
-      // We can't use video.seek() directly because the <video> element's
-      // duration is Infinity until the moov atom is parsed — setting
-      // currentTime before that throws or silently fails.
-      //
-      // Solution: attach a one-time 'loadedmetadata' listener that performs
-      // the seek. This fires when the browser has read enough of the file
-      // to know the duration and sample tables.
-      const el = video.videoRef.current;
-      if (!el) return;
+    const el = video.videoRef.current;
+    if (!el) return;
 
-      const seekOnce = () => {
-        try {
-          el.currentTime = currentClip.suggestedStart;
-        } catch {
-          // If this still fails, try again on 'canplay' (even more data loaded)
-          el.addEventListener(
-            "canplay",
-            () => {
-              try {
-                el.currentTime = currentClip.suggestedStart;
-              } catch {
-                /* give up — user can click the timeline */
-              }
-            },
-            { once: true }
-          );
-        }
-      };
+    // The target seek time — captured once per clip load.
+    const targetTime = currentClip.suggestedStart;
+    let seeked = false;
 
-      // If metadata is already loaded (fast path), seek immediately.
-      if (el.readyState >= 1 && Number.isFinite(el.duration)) {
-        seekOnce();
-      } else {
-        el.addEventListener("loadedmetadata", seekOnce, { once: true });
+    // Seek to the clip's suggested start. We try multiple events because
+    // browsers are inconsistent about when currentTime can be set:
+    //   - loadedmetadata: moov atom parsed, duration known
+    //   - canplay: enough data buffered to start playback
+    //   - canplaythrough: enough data for uninterrupted playback
+    // We seek on the FIRST of these that works, then stop.
+    const doSeek = () => {
+      if (seeked) return;
+      if (!Number.isFinite(el.duration) || el.duration === 0) {
+        // Duration not ready yet — wait for the next event
+        return;
       }
+      try {
+        el.currentTime = targetTime;
+        seeked = true;
+        console.log(`[queue] Seeked to ${targetTime}s (duration: ${el.duration}s)`);
+      } catch (e) {
+        console.warn(`[queue] Seek to ${targetTime}s failed`, e);
+      }
+    };
 
-      return () => {
-        el.removeEventListener("loadedmetadata", seekOnce);
-      };
+    // Reset the video element for the new clip
+    video.reload();
+
+    // Try seeking on multiple events. The first one that succeeds wins.
+    // Using { once: false } because we want to try on each event until
+    // one succeeds (doSeek checks the `seeked` flag).
+    const onLoadedMetadata = () => doSeek();
+    const onCanPlay = () => doSeek();
+    const onDurationChange = () => doSeek();
+
+    el.addEventListener("loadedmetadata", onLoadedMetadata);
+    el.addEventListener("canplay", onCanPlay);
+    el.addEventListener("durationchange", onDurationChange);
+
+    // Also try immediately in case metadata is already loaded
+    if (el.readyState >= 1 && Number.isFinite(el.duration)) {
+      doSeek();
     }
+
+    // Fallback: try seeking after a short delay (covers edge cases where
+    // events fire before the element is fully ready)
+    const fallbackTimer = setTimeout(() => {
+      if (!seeked) {
+        console.log(`[queue] Fallback seek to ${targetTime}s`);
+        doSeek();
+      }
+    }, 500);
+
+    return () => {
+      el.removeEventListener("loadedmetadata", onLoadedMetadata);
+      el.removeEventListener("canplay", onCanPlay);
+      el.removeEventListener("durationchange", onDurationChange);
+      clearTimeout(fallbackTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentClip?.id, videoUrl]);
 
