@@ -31,17 +31,33 @@ const nextConfig: NextConfig = {
   // so the browser can load them without CORS issues.
   // Note: these paths are relative to basePath, so /vod/... actually
   // means /clipcurator/vod/... in the browser.
+  //
+  // IMPORTANT: storagePath in the DB is "/vods/{id}/master.mp4" (plural),
+  // but the clipper's endpoint is "/vod/{id}/master.mp4" (singular).
+  // We add rewrite rules for BOTH plural and singular to handle this
+  // mismatch without needing to migrate existing DB rows.
   async rewrites() {
     const clipperUrl = process.env.CLIPPER_URL || "http://localhost:8100";
     return [
+      // VOD files (plural storagePath → singular clipper endpoint)
+      {
+        source: "/vods/:path*",
+        destination: `${clipperUrl}/vod/:path*`,
+      },
       {
         source: "/vod/:path*",
         destination: `${clipperUrl}/vod/:path*`,
+      },
+      // Clip files (plural storagePath → singular clipper endpoint)
+      {
+        source: "/clips/:path*",
+        destination: `${clipperUrl}/clip/:path*`,
       },
       {
         source: "/clip/:path*",
         destination: `${clipperUrl}/clip/:path*`,
       },
+      // Backing tracks
       {
         source: "/backing/:path*",
         destination: `${clipperUrl}/backing/:path*`,
