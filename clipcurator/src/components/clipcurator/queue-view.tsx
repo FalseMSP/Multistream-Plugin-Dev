@@ -572,6 +572,7 @@ function VideoPlayer({ src, poster }: { src: string; poster: string }) {
         poster={poster || undefined}
         controls
         playsInline
+        preload="metadata"
         className="aspect-video w-full bg-black"
       />
       {!isPlaying && (

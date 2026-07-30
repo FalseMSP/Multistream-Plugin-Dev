@@ -210,6 +210,58 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         "url": url,
     }, indent=2))
 
+    # ─── Move moov atom to the front of the file (web optimization) ──────
+    #
+    # MP4 files from yt-dlp often have the moov atom (metadata: duration,
+    # track info, sample tables) at the END of the file. The browser MUST
+    # read moov before it can determine duration, seek, or start playback.
+    #
+    # For a 1.5GB VOD with moov at the end, the browser has to:
+    #   1. Range-request the last few MB to read moov
+    #   2. Parse metadata
+    #   3. Range-request the beginning to start playing
+    #
+    # If any step fails or is slow, the player stalls silently — no error,
+    # no log, just a frozen video element. This is the #1 cause of
+    # "video loads but doesn't play" in web-based video editors.
+    #
+    # ffmpeg -movflags +faststart moves moov to the front, enabling
+    # progressive download (browser reads metadata immediately, can seek
+    # anywhere, starts playing as soon as the first bytes arrive).
+    # This is what YouTube, Vimeo, and every video platform do.
+    #
+    # -c copy means no re-encoding — just remux into a new container.
+    # Takes ~30-60s for a 1.5GB file on SSD, minimal CPU.
+    log.info(f"[download] Optimizing for web playback (moving moov atom to front)")
+    faststart_path = out_dir / "master_faststart.mp4"
+    faststart_cmd = [
+        "ffmpeg", "-y",
+        "-i", str(out_path),
+        "-c", "copy",           # no re-encoding — just copy streams
+        "-movflags", "+faststart",  # move moov to front
+        "-loglevel", "warning",
+        str(faststart_path),
+    ]
+    fs_proc = await asyncio.create_subprocess_exec(
+        *faststart_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    fs_stdout, fs_stderr = await fs_proc.communicate()
+
+    if fs_proc.returncode == 0 and faststart_path.exists():
+        # Replace the original with the faststart version
+        out_path.unlink()
+        faststart_path.rename(out_path)
+        log.info(f"[download] Web optimization complete — moov atom moved to front")
+    else:
+        err = fs_stderr.decode()[-500:] if fs_stderr else "unknown error"
+        log.warning(f"[download] faststart optimization failed (non-fatal): {err}")
+        # Clean up partial file if it exists
+        if faststart_path.exists():
+            faststart_path.unlink()
+        # Continue with the original file — it will still work, just slower to start
+
     storage_path = f"/vods/{source_id}/master.mp4"
 
     return {

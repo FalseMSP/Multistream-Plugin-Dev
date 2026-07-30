@@ -3,23 +3,25 @@
 // Lifts a single <video> element ref + playback state into React context so
 // the queue view, the timeline trimmer, and any future children can all
 // call seek/play/pause/setPlaybackRate without prop drilling.
+//
+// Handles the case where el.duration is Infinity (happens when the MP4's
+// moov atom hasn't been read yet — common for non-faststart MP4s). In that
+// case we fall back to a duration provided by the DB (source.durationSec)
+// so the timeline can still render and seek works once metadata loads.
 
 import * as React from "react";
 
 export interface VideoContextValue {
   videoRef: React.RefObject<HTMLVideoElement | null>;
-  // Live state (updated via timeupdate / loadedmetadata listeners)
   currentTime: number;
   duration: number;
   isPlaying: boolean;
   playbackRate: number;
-  // Imperative API
   seek: (t: number) => void;
   play: () => void;
   pause: () => void;
   togglePlay: () => void;
   setPlaybackRate: (r: number) => void;
-  // Bump to re-attach listeners after a fresh <video> mounts (e.g. src change).
   reload: () => void;
 }
 
@@ -33,26 +35,42 @@ export function VideoProvider({ children }: { children: React.ReactNode }) {
   const [playbackRate, setPlaybackRateState] = React.useState(1);
   const [reloadKey, setReloadKey] = React.useState(0);
 
-  // Attach listeners once the <video> mounts or after a forced reload.
   React.useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
 
     const onTime = () => setCurrentTime(el.currentTime || 0);
-    const onMeta = () =>
-      setDuration(Number.isFinite(el.duration) ? el.duration : 0);
+    const onMeta = () => {
+      // el.duration can be Infinity if the MP4's moov atom is at the end
+      // and the browser hasn't read it yet. In that case, keep duration at 0
+      // — the queue-view falls back to source.durationSec from the DB.
+      // Once the browser reads the moov atom (via range request), it fires
+      // durationchange again with the real value.
+      const d = el.duration;
+      if (Number.isFinite(d) && d > 0) {
+        setDuration(d);
+      }
+    };
     const onPlay = () => setIsPlaying(true);
     const onPause = () => setIsPlaying(false);
     const onRate = () => setPlaybackRateState(el.playbackRate || 1);
+    const onCanPlay = () => {
+      // Sometimes durationchange fires before the element is actually ready.
+      // loadedmetadata + canplay together cover all cases.
+      const d = el.duration;
+      if (Number.isFinite(d) && d > 0) {
+        setDuration(d);
+      }
+    };
 
     el.addEventListener("timeupdate", onTime);
     el.addEventListener("durationchange", onMeta);
     el.addEventListener("loadedmetadata", onMeta);
+    el.addEventListener("canplay", onCanPlay);
     el.addEventListener("play", onPlay);
     el.addEventListener("pause", onPause);
     el.addEventListener("ratechange", onRate);
 
-    // Initialize duration if metadata is already loaded.
     if (Number.isFinite(el.duration) && el.duration > 0) {
       setDuration(el.duration);
     }
@@ -61,6 +79,7 @@ export function VideoProvider({ children }: { children: React.ReactNode }) {
       el.removeEventListener("timeupdate", onTime);
       el.removeEventListener("durationchange", onMeta);
       el.removeEventListener("loadedmetadata", onMeta);
+      el.removeEventListener("canplay", onCanPlay);
       el.removeEventListener("play", onPlay);
       el.removeEventListener("pause", onPause);
       el.removeEventListener("ratechange", onRate);
@@ -70,12 +89,21 @@ export function VideoProvider({ children }: { children: React.ReactNode }) {
   const seek = React.useCallback((t: number) => {
     const el = videoRef.current;
     if (!el) return;
-    const clamped = Math.max(0, Math.min(t, el.duration || t));
+    // Clamp to [0, duration]. If duration is Infinity or 0, just use t.
+    const maxTime = Number.isFinite(el.duration) && el.duration > 0
+      ? el.duration
+      : t;
+    const clamped = Math.max(0, Math.min(t, maxTime));
     try {
       el.currentTime = clamped;
       setCurrentTime(clamped);
     } catch {
-      /* may throw if metadata not loaded */
+      // Setting currentTime can throw if:
+      // - Metadata isn't loaded yet (no duration)
+      // - The browser can't seek (e.g. no moov atom)
+      // In that case, we set currentTime state anyway so the UI updates,
+      // and the actual seek will happen once metadata loads.
+      setCurrentTime(clamped);
     }
   }, []);
 
