@@ -35,7 +35,13 @@ export async function GET() {
   const queueLength = await db.clip.count({ where: { status: "PENDING" } });
 
   // Real VOD file path — served by clipper.py via the next.config.ts rewrite.
-  const videoUrl = clip.source?.storagePath ?? null;
+  // IMPORTANT: <video src> does NOT auto-prepend basePath the way <Link> and
+  // <Image> do. We must manually prepend it here, otherwise the browser
+  // requests /vods/... at the Next.js root (no /clipcurator prefix) and
+  // gets a 404 HTML page → "no video with supported format and MIME type".
+  const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "/clipcurator";
+  const storagePath = clip.source?.storagePath ?? null;
+  const videoUrl = storagePath ? `${basePath}${storagePath}` : null;
   const poster = clip.thumbnailUrl ?? "";
 
   const payload: {

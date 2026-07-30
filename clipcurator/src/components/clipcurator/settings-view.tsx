@@ -42,7 +42,7 @@ import {
   useUploadBackingTrack,
   useDeleteBackingTrack,
 } from "@/hooks/use-clipcurator";
-import { CHANNEL_DEFAULTS } from "@/lib/constants";
+import { CHANNEL_DEFAULTS, API_BASE } from "@/lib/constants";
 import type { Channel, ChannelId } from "@/types";
 
 export function SettingsView() {
@@ -336,7 +336,7 @@ function BackingTrackSection() {
                   </p>
                 </div>
                 <a
-                  href={`/clipcurator${t.storagePath}`}
+                  href={`${API_BASE}${t.storagePath}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="text-zinc-500 hover:text-zinc-300"
