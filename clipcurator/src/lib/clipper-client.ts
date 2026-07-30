@@ -2,16 +2,17 @@
 //
 // Every function maps 1:1 to a FastAPI endpoint. POST endpoints send JSON;
 // multipart endpoints (backing track upload) send FormData.
-// Timeouts are generous because yt-dlp downloads, Whisper transcription,
-// and FFmpeg rendering can each take minutes on a long VOD.
 //
 // IMPORTANT: Node.js's built-in fetch (undici) has a default bodyTimeout of
-// 5 minutes (300s) that silently overrides AbortSignal.timeout(). For long
-// operations like Whisper transcription on a 2-hour VOD (can take 30+ min),
-// we need to disable undici's internal timeout. We do this by importing
-// undici directly and passing a custom Agent with headersTimeout and
-// bodyTimeout set to 0 (disabled).
+// 5 minutes (300s) that silently kills long-running requests like Whisper
+// transcription on a 2-hour VOD (can take 30+ min). We can't import undici
+// directly from Next.js (it's not exposed as an importable module).
+//
+// Solution: use node:http directly for POST requests. node:http has no
+// built-in timeout — we control it entirely via a manual timer.
 
+import http from "node:http";
+import { URL } from "node:url";
 import type { Platform, SubtitleStyle } from "@/types";
 
 const CLIPPER_URL =
@@ -21,24 +22,6 @@ const CLIPPER_URL =
 // takes ~1 hour. 30 min covers most VODs; if you regularly process longer
 // content, bump this.
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
-
-// Lazy-load undici only on Node.js (not Edge runtime). On Edge, the default
-// fetch timeout behavior is different and AbortSignal.timeout() works.
-let _dispatcher: unknown = undefined;
-async function getDispatcher(): Promise<unknown> {
-  if (_dispatcher !== undefined) return _dispatcher;
-  try {
-    // undici is bundled with Node.js 18+
-    const undici = await import("undici");
-    _dispatcher = new undici.Agent({
-      headersTimeout: 0,  // disable header timeout
-      bodyTimeout: 0,     // disable body timeout
-    });
-  } catch {
-    _dispatcher = null; // undici not available — use default fetch
-  }
-  return _dispatcher;
-}
 
 export class ClipperError extends Error {
   constructor(
@@ -51,27 +34,68 @@ export class ClipperError extends Error {
   }
 }
 
+// Low-level POST using node:http — no undici, no hidden bodyTimeout.
+// The only timeout is our own `timeoutMs` via a manual timer.
+function httpPost(
+  url: string,
+  bodyJson: string,
+  timeoutMs: number
+): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const options = {
+      hostname: parsed.hostname,
+      port: parsed.port || 80,
+      path: parsed.pathname + parsed.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(bodyJson),
+      },
+    };
+
+    const req = http.request(options, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        resolve({ status: res.statusCode ?? 0, body: data });
+      });
+    });
+
+    req.on("error", (err) => {
+      reject(err);
+    });
+
+    // Manual timeout — kills the request if no response within timeoutMs
+    const timer = setTimeout(() => {
+      req.destroy(new Error(`Request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    // Clear the timer once the response starts arriving
+    req.on("response", () => {
+      clearTimeout(timer);
+    });
+
+    req.write(bodyJson);
+    req.end();
+  });
+}
+
 async function clipperPost<T>(
   path: string,
   body: unknown,
   timeoutMs = DEFAULT_TIMEOUT_MS
 ): Promise<T> {
-  let res: Response;
+  let result: { status: number; body: string };
   try {
-    const dispatcher = await getDispatcher();
-    const fetchOptions: RequestInit & { dispatcher?: unknown } = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    };
-    // undici-specific option — ignored by browser/edge fetch
-    if (dispatcher) {
-      (fetchOptions as { dispatcher?: unknown }).dispatcher = dispatcher;
-    }
-    // fetch is global; the dispatcher option is recognized by undici's
-    // Node.js fetch implementation
-    res = await fetch(`${CLIPPER_URL}${path}`, fetchOptions as RequestInit);
+    result = await httpPost(
+      `${CLIPPER_URL}${path}`,
+      JSON.stringify(body),
+      timeoutMs
+    );
   } catch (err) {
     throw new ClipperError(
       err instanceof Error
@@ -82,20 +106,31 @@ async function clipperPost<T>(
     );
   }
 
-  if (!res.ok) {
-    const errBody = await res.json().catch(() => ({}));
-    const detail =
-      (errBody as { detail?: string })?.detail ?? res.statusText;
-    throw new ClipperError(detail, path, res.status);
+  if (result.status < 200 || result.status >= 300) {
+    let detail: string;
+    try {
+      const errBody = JSON.parse(result.body);
+      detail = errBody.detail ?? result.body;
+    } catch {
+      detail = result.body || `HTTP ${result.status}`;
+    }
+    throw new ClipperError(detail, path, result.status);
   }
 
-  return res.json() as Promise<T>;
+  try {
+    return JSON.parse(result.body) as T;
+  } catch {
+    // Some endpoints return empty body on success
+    return {} as T;
+  }
 }
 
 async function clipperGet<T>(
   path: string,
   timeoutMs = DEFAULT_TIMEOUT_MS
 ): Promise<T> {
+  // For GET requests, use fetch with AbortSignal — GETs are short (health,
+  // channel info, transcript) so the 5-min undici timeout isn't an issue.
   let res: Response;
   try {
     res = await fetch(`${CLIPPER_URL}${path}`, {
@@ -134,7 +169,7 @@ export interface DownloadResponse {
   title: string;
   streamerName: string;
   durationSec: number;
-  storagePath: string; // /vods/{sourceId}/master.mp4
+  storagePath: string;
   thumbnailUrl: string;
 }
 
@@ -164,7 +199,7 @@ export interface AnalyzedClip {
 export interface AnalyzeResponse {
   sourceId: string;
   clips: AnalyzedClip[];
-  transcript: TranscriptSegment[]; // full Whisper segments — for subtitle editor
+  transcript: TranscriptSegment[];
 }
 
 export interface TranscriptSegment {
@@ -174,8 +209,8 @@ export interface TranscriptSegment {
 }
 
 export function analyzeVod(req: AnalyzeRequest): Promise<AnalyzeResponse> {
-  // Whisper + librosa can be very slow on a 3-hour VOD. Give it 30 min.
-  return clipperPost<AnalyzeResponse>("/analyze", req, 30 * 60 * 1000);
+  // Whisper + librosa can be very slow on a 3-hour VOD. Give it 60 min.
+  return clipperPost<AnalyzeResponse>("/analyze", req, 60 * 60 * 1000);
 }
 
 // ─── Render ─────────────────────────────────────────────────────────────────
@@ -186,15 +221,15 @@ export interface RenderRequest {
   finalStartSec: number;
   finalEndSec: number;
   withSubtitles: boolean;
-  subtitleVtt?: string;       // WebVTT content (only if withSubtitles)
+  subtitleVtt?: string;
   subtitleStyle?: SubtitleStyle;
   withBackingTrack: boolean;
-  backingTrackPath?: string;  // /backing/{id}.mp3 (only if withBackingTrack)
-  backingTrackVolume?: number; // 0-1, default 0.3
+  backingTrackPath?: string;
+  backingTrackVolume?: number;
 }
 export interface RenderResponse {
   clipId: string;
-  storagePath: string; // /clips/{clipId}/final.mp4
+  storagePath: string;
 }
 
 export function renderClip(req: RenderRequest): Promise<RenderResponse> {
@@ -206,7 +241,7 @@ export function renderClip(req: RenderRequest): Promise<RenderResponse> {
 export interface PublishRequest {
   clipId: string;
   clipStoragePath: string;
-  channel: string; // CHANNEL_A | CHANNEL_B — clipper uses this to pick token file
+  channel: string;
   title: string;
 }
 export interface PublishResponse {
@@ -217,7 +252,7 @@ export interface PublishResponse {
 export function publishToYoutube(
   req: PublishRequest
 ): Promise<PublishResponse> {
-  return clipperPost<PublishResponse>("/publish", req, 30 * 60 * 1000);
+  return clipperPost<PublishResponse>("/publish", req, 60 * 60 * 1000);
 }
 
 // ─── Transcript ─────────────────────────────────────────────────────────────
@@ -249,6 +284,7 @@ export async function uploadBackingTrack(
   formData.append("name", name);
   formData.append("file", file);
 
+  // FormData uploads use fetch (short request, no undici timeout issue)
   const res = await fetch(`${CLIPPER_URL}/backing-track`, {
     method: "POST",
     body: formData,
