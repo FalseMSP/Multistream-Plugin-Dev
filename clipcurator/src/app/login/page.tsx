@@ -5,13 +5,19 @@
 // This route is NOT behind auth (the middleware skips /login).
 // After successful login, redirect to the home page (or the `redirect`
 // query param if present).
+//
+// IMPORTANT: In Next.js 16, useSearchParams() requires a <Suspense>
+// boundary around the component that calls it. Without it, the page
+// throws during SSR and renders blank — which looks like "the login
+// prompt never appears". We wrap the inner component in <Suspense>.
 
 import * as React from "react";
+import { Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import { LoginView } from "@/components/clipcurator/login-view";
 import { apiUrl } from "@/lib/constants";
 
-export default function LoginPage() {
+function LoginRedirectHandler() {
   const searchParams = useSearchParams();
   const redirectPath = searchParams.get("redirect") || "/";
 
@@ -22,4 +28,18 @@ export default function LoginPage() {
   }, [redirectPath]);
 
   return <LoginView onLogin={onLogin} />;
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-screen items-center justify-center bg-background">
+          <div className="text-sm text-zinc-500">Loading…</div>
+        </div>
+      }
+    >
+      <LoginRedirectHandler />
+    </Suspense>
+  );
 }
