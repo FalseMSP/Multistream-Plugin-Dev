@@ -286,11 +286,18 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         log.info(f"[download] Web optimization complete — moov atom moved to front")
     else:
         err = fs_stderr.decode()[-500:] if fs_stderr else "unknown error"
-        log.warning(f"[download] faststart optimization failed (non-fatal): {err}")
-        # Clean up partial file if it exists
+        # MANDATORY: faststart is required for the video player to seek.
+        # Without moov at the front, the browser can't determine duration
+        # or seek to arbitrary positions — the playhead snaps back to 0
+        # whenever the user tries to skip ahead. This makes the clip
+        # unreviewable, so we fail the download instead of producing a
+        # broken file.
         if faststart_path.exists():
             faststart_path.unlink()
-        # Continue with the original file — it will still work, just slower to start
+        raise RuntimeError(
+            f"faststart optimization failed — video would not be seekable. "
+            f"FFmpeg error: {err}"
+        )
 
     storage_path = f"/vods/{source_id}/master.mp4"
 
@@ -1284,23 +1291,164 @@ async def api_youtube_channel(channel: str):
         })
 
 
-# ─── Static file serving (with HTTP Range support for video playback) ────────
+# ─── Static file serving (with full HTTP Range support for video playback) ───
 #
 # Video players (Chrome, Firefox, Safari) require HTTP 206 Partial Content
-# responses to seek, determine duration, and play media. FastAPI's
-# FileResponse does NOT support range requests — it returns the whole file
-# as 200 OK, which causes "no video with supported format and MIME type"
-# or playback failures.
+# responses to seek, determine duration, and play media. Without range
+# support, the browser downloads the whole file but can't seek — the
+# playhead snaps back to 0 whenever you try to skip ahead.
 #
-# Fix: use StaticFiles mounts, which support range requests natively.
-# The path structure matches what the Next.js rewrite rules expect:
-#   /vod/{sourceId}/master.mp4  → VOD_DIR / {sourceId} / master.mp4
-#   /clip/{clipId}/final.mp4    → CLIPS_DIR / {clipId} / final.mp4
-#   /backing/{trackId}.mp3      → BACKING_DIR / {trackId}.mp3
+# We implement a custom range-aware file handler instead of using
+# StaticFiles, because:
+#   1. StaticFiles range support depends on the Starlette version
+#   2. We need to set Accept-Ranges: bytes explicitly
+#   3. We need to handle the path structure /vod/{sourceId}/master.mp4
+#      where {sourceId} is a subdirectory
+#
+# This handler supports:
+#   - GET with Range: bytes=start-end → 206 Partial Content
+#   - GET without Range → 200 OK (full file)
+#   - HEAD requests (for metadata probing)
+#   - Content-Length, Content-Range, Accept-Ranges headers
+#   - Proper MIME types for mp4, mp3, wav
 
-app.mount("/vod", StaticFiles(directory=str(VOD_DIR), check_dir=False), name="vod-files")
-app.mount("/clip", StaticFiles(directory=str(CLIPS_DIR), check_dir=False), name="clip-files")
-app.mount("/backing", StaticFiles(directory=str(BACKING_DIR), check_dir=False), name="backing-files")
+import os as _os
+from fastapi.responses import StreamingResponse
+
+# MIME type map
+_MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".webm": "video/webm",
+}
+
+def _get_mime_type(filename: str) -> str:
+    ext = _os.path.splitext(filename)[1].lower()
+    return _MIME_TYPES.get(ext, "application/octet-stream")
+
+
+def _serve_file_with_range(file_path: _Path, request: Request):
+    """
+    Serve a file with HTTP Range request support.
+    Returns 206 Partial Content if Range header is present, 200 OK otherwise.
+    """
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    file_size = file_path.stat().st_size
+    mime_type = _get_mime_type(str(file_path))
+
+    # Parse Range header
+    range_header = request.headers.get("range", "")
+    if range_header:
+        # Parse "bytes=start-end"
+        range_match = re.match(r"bytes=(\d*)-(\d*)", range_header)
+        if range_match:
+            start_str, end_str = range_match.group(1), range_match.group(2)
+            start = int(start_str) if start_str else 0
+            end = int(end_str) if end_str else file_size - 1
+            # Clamp to file size
+            end = min(end, file_size - 1)
+            content_length = end - start + 1
+
+            def file_iterator():
+                with open(file_path, "rb") as f:
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk_size = min(1024 * 1024, remaining)  # 1MB chunks
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+
+            headers = {
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Content-Type": mime_type,
+                "Cache-Control": "public, max-age=3600",
+            }
+
+            return StreamingResponse(
+                file_iterator(),
+                status_code=206,
+                headers=headers,
+            )
+
+    # No Range header — return full file
+    def full_iterator():
+        with open(file_path, "rb") as f:
+            while True:
+                data = f.read(1024 * 1024)  # 1MB chunks
+                if not data:
+                    break
+                yield data
+
+    return StreamingResponse(
+        full_iterator(),
+        status_code=200,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Type": mime_type,
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
+# File-serving routes — use the custom range handler
+@app.get("/vod/{source_id}/master.mp4")
+async def serve_vod(source_id: str, request: Request):
+    path = VOD_DIR / source_id / "master.mp4"
+    return _serve_file_with_range(path, request)
+
+
+@app.head("/vod/{source_id}/master.mp4")
+async def head_vod(source_id: str, request: Request):
+    path = VOD_DIR / source_id / "master.mp4"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="VOD not found")
+    return JSONResponse(
+        content={},
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(path.stat().st_size),
+            "Content-Type": "video/mp4",
+        },
+    )
+
+
+@app.get("/clip/{clip_id}/final.mp4")
+async def serve_clip(clip_id: str, request: Request):
+    path = CLIPS_DIR / clip_id / "final.mp4"
+    return _serve_file_with_range(path, request)
+
+
+@app.head("/clip/{clip_id}/final.mp4")
+async def head_clip(clip_id: str, request: Request):
+    path = CLIPS_DIR / clip_id / "final.mp4"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Clip not found")
+    return JSONResponse(
+        content={},
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(path.stat().st_size),
+            "Content-Type": "video/mp4",
+        },
+    )
+
+
+@app.get("/backing/{track_id}.mp3")
+async def serve_backing(track_id: str, request: Request):
+    path = BACKING_DIR / f"{track_id}.mp3"
+    return _serve_file_with_range(path, request)
 
 
 # ─── Startup ─────────────────────────────────────────────────────────────────
