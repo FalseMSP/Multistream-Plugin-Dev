@@ -86,6 +86,18 @@ TWITCH_TOKENS_FILE = PROJECT_ROOT / ".twitch-tokens.json"
 log = logging.getLogger("clipper")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# ─── Neural network v2 + feature extractor + YouTube analytics ───────────────
+from clip_scorer import ClipScorer
+from feature_extractor import extract_motion_score, extract_scene_count, extract_clap_score
+from youtube_analytics import fetch_retention_curve, fetch_video_stats
+from twitch_watcher import TwitchWatcher
+
+_MODEL_PATH = DATA_DIR / "clip_scorer_model.json"
+scorer = ClipScorer(model_path=str(_MODEL_PATH))
+log.info(f"[clipper] Neural network v2 initialized — {scorer.stats()}")
+
+_twitch_watcher = None
+
 # Resolve yt-dlp binary path relative to the Python interpreter running this
 # script. When launched via .venv/bin/python, sys.executable is
 # /path/to/.venv/bin/python and yt-dlp is at /path/to/.venv/bin/yt-dlp.
@@ -329,7 +341,7 @@ def run_whisper(video_path: str) -> list[dict]:
     model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
     log.info(f"[whisper] Transcribing {video_path}")
-    segments_iter, info = model.transcribe(video_path, beam_size=1, vad_filter=True)
+    segments_iter, info = model.transcribe(video_path, beam_size=1, vad_filter=True, word_timestamps=True)
 
     segments = []
     for seg in segments_iter:
@@ -628,6 +640,20 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
     # Text-based excitement detection (multi-signal)
     transcript_peaks = detect_text_excitement(whisper_segments)
 
+    # ─── Extract advanced features (v2) ──────────────────────────────
+    log.info(f"[analyze] Extracting advanced features for {source_id}")
+    motion_score = 0.0
+    try:
+        motion_score = await extract_motion_score(str(local_path), sample_fps=1.0)
+    except Exception as e:
+        log.warning(f"[analyze] Motion score extraction failed: {e}")
+    scene_count = 0
+    try:
+        scene_count = await extract_scene_count(str(local_path))
+    except Exception as e:
+        log.warning(f"[analyze] Scene detection failed: {e}")
+    log.info(f"[analyze] Advanced features: motion={motion_score:.3f}, scenes={scene_count}")
+
     # ─── Merge all peaks ──────────────────────────────────────────────
     all_peaks = []
     for p in audio_peaks:
@@ -645,12 +671,12 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
 
     all_peaks.sort(key=lambda p: p["time"])
 
-    # Merge proximate peaks (within 15s)
+    # Merge proximate peaks (within 60s — aggressive diversity gap)
     merged = []
     if all_peaks:
         current = all_peaks[0].copy()
         for p in all_peaks[1:]:
-            if p["time"] - current["time"] < 15:
+            if p["time"] - current["time"] < 60:
                 current["score"] = max(current["score"], p["score"])
                 if "velocity" in p:
                     current["velocity"] = max(current.get("velocity", 0), p["velocity"])
@@ -662,9 +688,9 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
                 current = p.copy()
         merged.append(current)
 
-    # Sort by score, cap at 20 clips
+    # Sort by score, cap at 8 clips (aggressive cutting)
     merged.sort(key=lambda p: p["score"], reverse=True)
-    top_peaks = merged[:20]
+    top_peaks = merged[:8]
 
     # ─── Build clip windows ──────────────────────────────────────────
     clips = []
@@ -677,12 +703,40 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
         if end - start > 90:
             end = start + 90
 
-        # Engagement score: weighted blend
-        chat_boost = 0
+        # ─── Extract features for the neural network (v2 — 12 features) ───
         velocity = peak.get("velocity", 0)
-        if velocity > 0:
-            chat_boost = min(0.3, velocity / 500)
-        engagement = min(0.99, 0.4 + peak["score"] * 0.4 + chat_boost)
+        audio_score = peak.get("score", 0)
+        text_score = min(1.0, len(peak.get("phrase", "")) / 40) if peak.get("phrase") else 0
+        clip_transcript_text = transcript_text
+        letters_list = [c for c in clip_transcript_text if c.isalpha()]
+        caps_ratio_val = (sum(1 for c in letters_list if c.isupper()) / len(letters_list)) if letters_list else 0
+        excl_count = clip_transcript_text.count("!")
+
+        # CLAP score (optional — 0 if not installed)
+        clap_score_val = 0.0
+        try:
+            clap_score_val = await extract_clap_score(
+                str(local_path), clip_transcript_text, start, end
+            )
+        except Exception as e:
+            log.debug(f"[analyze] CLAP extraction skipped: {e}")
+
+        # Score with the neural network (v2 — 12 features)
+        clip_features = {
+            "chatVelocity": velocity,
+            "audioScore": audio_score,
+            "textScore": text_score,
+            "capsRatio": caps_ratio_val,
+            "exclamationCount": excl_count,
+            "laughterScore": peak.get("laughter_score", 0),
+            "duration": end - start,
+            "motionScore": motion_score,
+            "sceneCount": scene_count,
+            "clapScore": clap_score_val,
+            "llmViralScore": 0,  # filled in later by LLM scoring
+            "openingRetention": 0,  # filled in later by YouTube analytics
+        }
+        engagement = scorer.predict(clip_features)
 
         # Build transcript snippet from whisper segments in range
         relevant_segments = [
@@ -1451,10 +1505,87 @@ async def serve_backing(track_id: str, request: Request):
     return _serve_file_with_range(path, request)
 
 
+# ─── Feedback endpoint (3-class, with retention support) ─────────────────────
+
+class FeedbackRequest(BaseModel):
+    clipId: str
+    sourceId: str
+    accepted: bool = True  # legacy field (true=accept, false=reject_bad)
+    label: int = None  # 0=accept, 1=reject_bad, 2=not_interested (overrides accepted)
+    retentionScore: float = None  # from YouTube analytics
+    features: dict
+
+
+@app.post("/feedback")
+async def api_feedback(req: FeedbackRequest):
+    """Receive review feedback and train the neural network (3-class)."""
+    try:
+        # Determine label
+        if req.label is not None:
+            label = req.label
+        else:
+            label = 0 if req.accepted else 1
+
+        # If retention score is provided, use train_with_retention
+        if req.retentionScore is not None:
+            scorer.train_with_retention(req.features, req.retentionScore)
+            log.info(
+                f"[feedback] Trained on retention for clip {req.clipId} "
+                f"(retention={req.retentionScore:.2%})"
+            )
+        else:
+            scorer.train(req.features, label)
+            log.info(
+                f"[feedback] Trained on clip {req.clipId} "
+                f"(label={label}) — total: {scorer.stats()['training_count']}"
+            )
+
+        return JSONResponse({"ok": True, "stats": scorer.stats()})
+    except Exception as e:
+        log.error(f"[feedback] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/scorer/stats")
+async def api_scorer_stats():
+    """Return neural network training statistics."""
+    return JSONResponse(scorer.stats())
+
+
+# ─── YouTube analytics fetch endpoint ────────────────────────────────────────
+
+@app.get("/analytics/fetch")
+async def api_fetch_analytics(video_id: str, channel: str):
+    """Fetch retention curve + view stats for a published clip."""
+    try:
+        retention = await fetch_retention_curve(video_id, channel)
+        stats = await fetch_video_stats(video_id, channel)
+        return JSONResponse({
+            "videoId": video_id,
+            "retention": retention,
+            "stats": stats,
+        })
+    except Exception as e:
+        log.error(f"[analytics/fetch] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ─── Startup ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Start Twitch auto-ingest watcher in background
+    _twitch_watcher = TwitchWatcher()
+    import threading
+    def _run_watcher():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(_twitch_watcher.start())
+    watcher_thread = threading.Thread(target=_run_watcher, daemon=True)
+    watcher_thread.start()
+    log.info("[clipper] Twitch auto-ingest watcher started")
+
     log.info(f"ClipCurator Clipper v2.0 starting on port {CLIPPER_PORT}")
     log.info(f"Data directory: {DATA_DIR}")
     log.info(f"VOD directory: {VOD_DIR}")
