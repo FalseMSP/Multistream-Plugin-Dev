@@ -86,6 +86,19 @@ TWITCH_TOKENS_FILE = PROJECT_ROOT / ".twitch-tokens.json"
 log = logging.getLogger("clipper")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# Resolve yt-dlp binary path relative to the Python interpreter running this
+# script. When launched via .venv/bin/python, sys.executable is
+# /path/to/.venv/bin/python and yt-dlp is at /path/to/.venv/bin/yt-dlp.
+# This avoids [Errno 2] No such file or directory when the venv's bin/
+# isn't on PATH.
+import sys as _sys
+from pathlib import Path as _Path
+_VENV_BIN = _Path(_sys.executable).parent
+YTDLP_BIN = str(_VENV_BIN / "yt-dlp")
+if not _Path(YTDLP_BIN).exists():
+    YTDLP_BIN = "yt-dlp"  # fallback to PATH lookup
+log.info(f"[clipper] yt-dlp binary: {YTDLP_BIN}")
+
 app = FastAPI(title="ClipCurator Clipper", version="2.0.0")
 
 
@@ -143,7 +156,7 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
     if platform == "TWITCH":
         ydl_opts.extend(["--write-comments"])
 
-    cmd = ["yt-dlp"] + ydl_opts + [url]
+    cmd = [YTDLP_BIN] + ydl_opts + [url]
     log.info(f"[download] Running: {cmd}")
 
     proc = await asyncio.create_subprocess_exec(
@@ -159,7 +172,7 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         raise RuntimeError(err_msg)
 
     # Extract metadata
-    meta_cmd = ["yt-dlp", "--dump-json", "--no-playlist", "--quiet", url]
+    meta_cmd = [YTDLP_BIN, "--dump-json", "--no-playlist", "--quiet", url]
     meta_proc = await asyncio.create_subprocess_exec(
         *meta_cmd,
         stdout=asyncio.subprocess.PIPE,
