@@ -498,3 +498,16 @@ export function useDeleteStream() {
     },
   });
 }
+
+export function usePeekNextClip() {
+  return useQuery({
+    queryKey: ["queue", "peek"] as const,
+    queryFn: () =>
+      fetchJson<{
+        clip: ClipWithSource | null;
+        videoUrl: string | null;
+        poster: string;
+      }>(apiUrl("/api/queue/peek")),
+    refetchInterval: 5000,
+  });
+}
