@@ -28,8 +28,12 @@ log = logging.getLogger("twitch-watcher")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CLIPPER_URL = os.environ.get("CLIPPER_URL", "http://localhost:8100")
 CLIPCURATOR_URL = os.environ.get("CLIPCURATOR_INTERNAL_URL", "http://localhost:3001/clipcurator")
+CLIPCURATOR_INTERNAL_API_KEY = os.environ.get("CLIPCURATOR_INTERNAL_API_KEY", "")
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "")
+
+# Path to the SQLite DB (for direct read when the API is behind auth)
+_DB_PATH = PROJECT_ROOT / "clipcurator" / "db" / "custom.db"
 
 # State file — persists channel live/offline state across restarts
 STATE_FILE = Path(os.environ.get("CLIPPER_DATA_DIR", "/tmp/clipcurator")) / "twitch_watcher_state.json"
@@ -105,25 +109,28 @@ class TwitchWatcher:
 
     async def _get_watched_channels(self) -> list:
         """
-        Fetch the list of watched channel names from ClipCurator's API.
-        Returns list of channel names (lowercase).
+        Fetch the list of watched channel names directly from the SQLite DB.
+        Returns list of channel names (lowercase) with autoIngest=true.
         """
         try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{CLIPCURATOR_URL}/api/twitch-channels",
-                    timeout=10,
-                )
-                if resp.status_code != 200:
-                    log.warning(f"[twitch-watcher] Failed to fetch channels: {resp.status_code}")
-                    return []
+            import sqlite3
+            import asyncio
 
-                data = resp.json()
-                channels = data.get("channels", [])
-                # Only watch channels with autoIngest=true
-                return [ch["channelName"].lower() for ch in channels if ch.get("autoIngest")]
+            def _query():
+                if not _DB_PATH.exists():
+                    return []
+                conn = sqlite3.connect(str(_DB_PATH))
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT channelName FROM TwitchChannel WHERE autoIngest = 1"
+                )
+                rows = cursor.fetchall()
+                conn.close()
+                return [row["channelName"].lower() for row in rows]
+
+            return await asyncio.to_thread(_query)
         except Exception as e:
-            log.warning(f"[twitch-watcher] Failed to fetch watched channels: {e}")
+            log.warning(f"[twitch-watcher] Failed to read channels from DB: {e}")
             return []
 
     async def _check_channel_live(self, channel_name: str, token: str) -> dict:
@@ -221,17 +228,25 @@ class TwitchWatcher:
             return None
 
     async def _submit_vod(self, vod_url: str):
-        """Submit a VOD URL to ClipCurator's stream submission API."""
+        """
+        Submit a VOD URL to ClipCurator for processing.
+        Calls the clipper's /download endpoint directly (bypasses the
+        Next.js API + auth) since we're already running inside the clipper.
+        """
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    f"{CLIPCURATOR_URL}/api/streams",
-                    json={"url": vod_url},
+                    f"{CLIPPER_URL}/download",
+                    json={
+                        "sourceId": f"twitch_auto_{int(time.time())}",
+                        "url": vod_url,
+                        "platform": "TWITCH",
+                    },
                     timeout=30,
                 )
-                if resp.status_code == 201:
+                if resp.status_code == 200:
                     data = resp.json()
-                    log.info(f"[twitch-watcher] Auto-submitted {vod_url} → source {data.get('source', {}).get('id', 'unknown')}")
+                    log.info(f"[twitch-watcher] Auto-submitted {vod_url} → {data.get('storagePath', 'unknown')}")
                 else:
                     log.warning(f"[twitch-watcher] Submit failed: {resp.status_code} {resp.text}")
         except Exception as e:

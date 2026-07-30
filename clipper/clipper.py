@@ -703,20 +703,27 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
         if end - start > 90:
             end = start + 90
 
+        # Build transcript snippet from whisper segments in range
+        # (MUST come before NN scoring — NN uses transcript for caps/excl features)
+        relevant_segments = [
+            s for s in whisper_segments
+            if float(s.get("start", 0)) >= start and float(s.get("end", 0)) <= end
+        ]
+        transcript_text = " ".join(s.get("text", "") for s in relevant_segments) or peak.get("phrase", "")
+
         # ─── Extract features for the neural network (v2 — 12 features) ───
         velocity = peak.get("velocity", 0)
         audio_score = peak.get("score", 0)
         text_score = min(1.0, len(peak.get("phrase", "")) / 40) if peak.get("phrase") else 0
-        clip_transcript_text = transcript_text
-        letters_list = [c for c in clip_transcript_text if c.isalpha()]
+        letters_list = [c for c in transcript_text if c.isalpha()]
         caps_ratio_val = (sum(1 for c in letters_list if c.isupper()) / len(letters_list)) if letters_list else 0
-        excl_count = clip_transcript_text.count("!")
+        excl_count = transcript_text.count("!")
 
         # CLAP score (optional — 0 if not installed)
         clap_score_val = 0.0
         try:
             clap_score_val = await extract_clap_score(
-                str(local_path), clip_transcript_text, start, end
+                str(local_path), transcript_text, start, end
             )
         except Exception as e:
             log.debug(f"[analyze] CLAP extraction skipped: {e}")
@@ -737,13 +744,6 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
             "openingRetention": 0,  # filled in later by YouTube analytics
         }
         engagement = scorer.predict(clip_features)
-
-        # Build transcript snippet from whisper segments in range
-        relevant_segments = [
-            s for s in whisper_segments
-            if float(s.get("start", 0)) >= start and float(s.get("end", 0)) <= end
-        ]
-        transcript_text = " ".join(s.get("text", "") for s in relevant_segments) or peak.get("phrase", "")
 
         clips.append({
             "startTimeSec": start,
