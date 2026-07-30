@@ -193,6 +193,12 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
   }, [currentClip, setTrim, video]);
 
   // Reload listeners when a new clip / videoUrl arrives; seek to suggested start.
+  // IMPORTANT: `video` is intentionally excluded from the deps array.
+  // The `video` object from useVideo() changes identity on every timeupdate
+  // event (because currentTime is in its memo deps). If we include it here,
+  // this effect re-runs every ~250ms, calls video.reload(), resets the
+  // video element, and the playhead never advances — causing "jittering".
+  // We only want to reload when the clip ID or URL actually changes.
   React.useEffect(() => {
     if (currentClip && videoUrl) {
       video.reload();
@@ -201,7 +207,8 @@ function QueueViewInner({ onNavigate }: QueueViewProps) {
       }, 250);
       return () => clearTimeout(t);
     }
-  }, [currentClip, videoUrl, video]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentClip?.id, videoUrl]);
 
   // After a successful review, the store clears currentClip → load next.
   React.useEffect(() => {
@@ -826,11 +833,6 @@ function MetadataSidebar({
               )}
             >
               {formatTime(trimLen)}
-            </span>
-          </MetaItem>
-          <MetaItem icon={<MessageSquare className="size-3.5" />} label="Chat Peak">
-            <span className="font-mono">
-              {Math.round(clip.chatVelocity ?? 0)} msg/s
             </span>
           </MetaItem>
           <MetaItem icon={<User className="size-3.5" />} label="Streamer" full>
