@@ -2,10 +2,10 @@
 """
 pretrain.py v3 — Pre-train the clip scorer neural network on popular streamer clips.
 
-Fixes from v2:
-  - Fixed extract_motion_score async warning (was never awaited — now uses asyncio.run)
-  - Improved audio score extraction (was returning 0.00 for most clips — now uses dynamic range)
-  - Added aspect ratio detection (vertical vs horizontal — for layout recommendations)
+v3 fixes:
+  - Fixed extract_motion_score — now uses the SYNC version (feature_extractor.py was updated)
+  - Improved audio score extraction (dynamic range instead of peak ratio)
+  - Added aspect ratio detection (vertical vs horizontal)
   - Shorts-focused search terms
 """
 
@@ -14,14 +14,14 @@ import asyncio
 import json
 import os
 import sys
-import math
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from clip_scorer import ClipScorer
-from feature_extractor import extract_motion_score
+# Import the SYNC versions (no longer async)
+from feature_extractor import extract_motion_score, extract_scene_count
 
 import logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -123,10 +123,7 @@ def run_whisper_on_clip(video_path: str) -> list:
 
 
 def extract_audio_score(video_path: str) -> float:
-    """
-    Extract audio excitement score (0-1).
-    Uses dynamic range — exciting clips have loud peaks + quiet moments.
-    """
+    """Audio excitement score via dynamic range (loud peaks vs median)."""
     try:
         import librosa
         import numpy as np
@@ -150,32 +147,17 @@ def extract_audio_score(video_path: str) -> float:
         rms = librosa.feature.rms(y=y, hop_length=hop)[0]
         rms_db = librosa.amplitude_to_db(rms, ref=np.max)
 
-        # Dynamic range = difference between loud (p95) and median (p50)
         p95 = float(np.percentile(rms_db, 95))
         p50 = float(np.percentile(rms_db, 50))
-        dynamic_range = p95 - p50  # typically 5-20 dB for exciting clips
+        dynamic_range = p95 - p50
 
-        # Normalize: 0 dB = boring, 15+ dB = exciting
         return min(1.0, max(0.0, dynamic_range / 15.0))
     except Exception as e:
         log.debug(f"[pretrain] Audio failed: {e}")
         return 0.0
 
 
-def extract_motion_score_sync(video_path: str) -> float:
-    """
-    Extract motion score — properly awaits the async function.
-    FIXED: was using a broken event loop that never awaited.
-    """
-    try:
-        return asyncio.run(extract_motion_score(video_path, sample_fps=1.0))
-    except Exception as e:
-        log.debug(f"[pretrain] Motion failed: {e}")
-        return 0.0
-
-
 def detect_aspect_ratio(video_path: str) -> tuple:
-    """Returns (width, height). If width < height, it's vertical (9:16)."""
     try:
         import subprocess
         proc = subprocess.run(
@@ -194,9 +176,16 @@ def detect_aspect_ratio(video_path: str) -> tuple:
 
 
 def extract_features(clip_path: str, whisper_segments: list, clip_meta: dict = None) -> dict:
+    # Audio score (dynamic range — actually returns non-zero for exciting clips)
     audio_score = extract_audio_score(clip_path)
-    motion_score = extract_motion_score_sync(clip_path)
 
+    # Motion score — NOW SYNC, just call it directly (no asyncio.run needed!)
+    motion_score = extract_motion_score(clip_path, sample_fps=1.0)
+
+    # Scene count (also sync now)
+    scene_count = extract_scene_count(clip_path)
+
+    # Text features
     transcript = " ".join(s["text"] for s in whisper_segments)
     letters = [c for c in transcript if c.isalpha()]
     caps_ratio = (sum(1 for c in letters if c.isupper()) / len(letters)) if letters else 0
@@ -231,7 +220,7 @@ def extract_features(clip_path: str, whisper_segments: list, clip_meta: dict = N
         "laughterScore": 0,
         "duration": duration,
         "motionScore": motion_score,
-        "sceneCount": 0,
+        "sceneCount": scene_count,
         "clapScore": 0,
         "llmViralScore": 0,
         "openingRetention": 0,
@@ -314,7 +303,8 @@ async def main():
                 f"    ✓ [{'VERT' if clip.get('is_vertical') else 'HORZ'}] "
                 f"audio={features['audioScore']:.2f} "
                 f"motion={features['motionScore']:.2f} "
-                f"text={features['textScore']:.2f}"
+                f"text={features['textScore']:.2f} "
+                f"scenes={features['sceneCount']}"
             )
         except Exception as e:
             log.warning(f"    ✗ {e}")

@@ -7,43 +7,36 @@ Features:
   3. CLAP score — audio-text similarity (CLAP model, optional)
 
 All features are optional and fall back gracefully if dependencies
-are missing. This keeps the clipper lightweight on minimal servers.
+are missing. The motion score + scene count functions are SYNCHRONOUS
+(no async) to avoid event loop conflicts when called from both
+sync (pretrain) and async (clipper) contexts.
 """
 
-import asyncio
 import logging
-import math
 import os
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger("feature-extractor")
 
 
-async def extract_motion_score(video_path: str, sample_fps: float = 1.0) -> float:
+def extract_motion_score(video_path: str, sample_fps: float = 1.0) -> float:
     """
     Extract a motion score (0-1) by sampling frames and computing
     frame-to-frame difference energy.
 
-    Uses FFmpeg to extract frames at 1fps, then numpy to compute
-    the mean absolute difference between consecutive frames.
+    SYNCHRONOUS — uses subprocess.run() instead of asyncio.
+    Safe to call from both sync and async contexts.
 
     A high motion score indicates action-packed content (gameplay,
     fast movement). Low score indicates static content (talking head,
     menu screen).
-
-    Args:
-        video_path: Path to the video file
-        sample_fps: Frames per second to sample (default 1 = every 1s)
-
-    Returns:
-        Motion score 0-1 (normalized)
     """
-    import tempfile
-    import subprocess
-    import numpy as np
-
     try:
+        import numpy as np
+
         with tempfile.TemporaryDirectory() as tmpdir:
             # Extract frames at sample_fps using FFmpeg
             # Scale down to 64x36 (tiny) for fast comparison
@@ -51,20 +44,14 @@ async def extract_motion_score(video_path: str, sample_fps: float = 1.0) -> floa
                 "ffmpeg", "-y",
                 "-i", video_path,
                 "-vf", f"fps={sample_fps},scale=64:36",
-                "-pix_fmt", "gray",  # grayscale for speed
+                "-pix_fmt", "gray",
                 "-q:v", "2",
                 f"{tmpdir}/frame_%06d.jpg",
             ]
 
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-
+            proc = subprocess.run(cmd, capture_output=True, timeout=120)
             if proc.returncode != 0:
-                log.warning(f"[motion] FFmpeg failed: {stderr.decode()[-200:]}")
+                log.warning(f"[motion] FFmpeg failed: {proc.stderr.decode()[-200:]}")
                 return 0.0
 
             # Load frames and compute differences
@@ -74,8 +61,6 @@ async def extract_motion_score(video_path: str, sample_fps: float = 1.0) -> floa
 
             frames = []
             for f in frame_files:
-                # Read JPEG as raw grayscale array
-                # Use PIL if available, otherwise skip
                 try:
                     from PIL import Image
                     img = Image.open(f).convert("L")
@@ -107,24 +92,24 @@ async def extract_motion_score(video_path: str, sample_fps: float = 1.0) -> floa
             if not diffs:
                 return 0.0
 
-            mean_diff = np.mean(diffs)
+            mean_diff = float(np.mean(diffs))
             # Normalize: 0-50 range maps to 0-1
-            # (empirically, action scenes have ~30-50, static ~5-15)
             motion_score = min(1.0, mean_diff / 50.0)
 
             log.info(f"[motion] Score: {motion_score:.3f} (mean_diff: {mean_diff:.1f})")
-            return float(motion_score)
+            return motion_score
 
     except Exception as e:
         log.warning(f"[motion] Extraction failed: {e}")
         return 0.0
 
 
-async def extract_scene_count(video_path: str) -> int:
+def extract_scene_count(video_path: str) -> int:
     """
     Count scene changes using PySceneDetect (optional).
-
     Returns 0 if PySceneDetect is not installed.
+
+    SYNCHRONOUS — safe to call from any context.
     """
     try:
         from scenedetect import detect, ContentDetector
@@ -133,12 +118,7 @@ async def extract_scene_count(video_path: str) -> int:
         return 0
 
     try:
-        # Run in a thread to avoid blocking the event loop
-        scenes = await asyncio.to_thread(
-            detect,
-            video_path,
-            ContentDetector(threshold=27.0),
-        )
+        scenes = detect(video_path, ContentDetector(threshold=27.0))
         scene_count = len(scenes)
         log.info(f"[scenes] Detected {scene_count} scenes")
         return scene_count
@@ -157,8 +137,8 @@ async def extract_clap_score(
     Compute CLAP (Contrastive Language-Audio Pretraining) similarity
     score between the clip's audio and an excitement text prompt.
 
-    The score measures how similar the audio is to text like
-    "exciting viral gaming moment with laughter and cheering".
+    This one IS async because it loads a large model and does GPU/CPU inference.
+    Only called from the async clipper context.
 
     Returns 0.0 if CLAP is not installed or fails.
     Set CLIPPER_ENABLE_CLAP=false to disable entirely.
@@ -175,14 +155,13 @@ async def extract_clap_score(
         return 0.0
 
     try:
-        # Extract audio segment for this clip
         import tempfile
-        import subprocess
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_path = f.name
 
         duration = clip_end - clip_start
+        import asyncio
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y",
             "-ss", str(clip_start),
@@ -219,7 +198,6 @@ async def extract_clap_score(
         if sr != 48000:
             waveform = torchaudio.functional.resample(waveform, sr, 48000)
 
-        # Prompts for exciting vs boring content
         prompts = [
             "exciting viral gaming moment with laughter and cheering",
             "boring uneventful static gameplay",
@@ -234,7 +212,6 @@ async def extract_clap_score(
 
         with torch.no_grad():
             outputs = model(**inputs)
-            # logits_per_audio: (1, 2) — [exciting_score, boring_score]
             logits = outputs.logits_per_audio[0]
             probs = torch.softmax(logits, dim=0)
             exciting_prob = float(probs[0])
