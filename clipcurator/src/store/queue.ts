@@ -4,6 +4,13 @@ import { create } from "zustand";
 import type { ClipWithSource, SubtitleStyle } from "@/types";
 import { DEFAULT_SUBTITLE_STYLE } from "@/types";
 
+export type VideoLayout =
+  | "original"
+  | "vertical_center"
+  | "vertical_top"
+  | "vertical_bottom"
+  | "vertical_split";
+
 export interface QueueState {
   currentClip: ClipWithSource | null;
   videoUrl: string | null;
@@ -11,10 +18,8 @@ export interface QueueState {
   queueLength: number;
   isLoading: boolean;
   isSubmitting: boolean;
-  // Local trim state (mirrors what the timeline component is editing)
   trimStart: number;
   trimEnd: number;
-  // Live SSE-driven stats
   stats: {
     pending: number;
     inReview: number;
@@ -23,14 +28,13 @@ export interface QueueState {
     rejectedToday: number;
     failed: number;
   };
-  // Subtitle editor state
   withSubtitles: boolean;
   subtitleStyle: SubtitleStyle;
-  // Backing track state
   withBackingTrack: boolean;
   backingTrackId: string | null;
   backingTrackVolume: number;
-  // Actions are provided by hooks — store is purely state here.
+  layout: VideoLayout;
+  splitRatio: number;
   setCurrentClip: (clip: ClipWithSource | null, videoUrl: string | null, poster: string) => void;
   setQueueLength: (n: number) => void;
   setLoading: (b: boolean) => void;
@@ -42,6 +46,8 @@ export interface QueueState {
   setWithBackingTrack: (b: boolean) => void;
   setBackingTrackId: (id: string | null) => void;
   setBackingTrackVolume: (v: number) => void;
+  setLayout: (l: VideoLayout) => void;
+  setSplitRatio: (r: number) => void;
   reset: () => void;
 }
 
@@ -55,51 +61,36 @@ export const useQueueStore = create<QueueState>((set) => ({
   trimStart: 0,
   trimEnd: 0,
   stats: {
-    pending: 0,
-    inReview: 0,
-    publishing: 0,
-    publishedToday: 0,
-    rejectedToday: 0,
-    failed: 0,
+    pending: 0, inReview: 0, publishing: 0,
+    publishedToday: 0, rejectedToday: 0, failed: 0,
   },
   withSubtitles: false,
   subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
   withBackingTrack: false,
   backingTrackId: null,
   backingTrackVolume: 0.3,
+  layout: "original",
+  splitRatio: 0.3,
   setCurrentClip: (clip, videoUrl, poster) =>
-    set({
-      currentClip: clip,
-      videoUrl,
-      poster,
-      trimStart: clip?.suggestedStart ?? 0,
-      trimEnd: clip?.suggestedEnd ?? 0,
-    }),
+    set({ currentClip: clip, videoUrl, poster,
+      trimStart: clip?.suggestedStart ?? 0, trimEnd: clip?.suggestedEnd ?? 0 }),
   setQueueLength: (n) => set({ queueLength: n }),
   setLoading: (b) => set({ isLoading: b }),
   setSubmitting: (b) => set({ isSubmitting: b }),
   setTrim: (start, end) => set({ trimStart: start, trimEnd: end }),
-  setStats: (s) =>
-    set((state) => ({ stats: { ...state.stats, ...s } })),
+  setStats: (s) => set((state) => ({ stats: { ...state.stats, ...s } })),
   setWithSubtitles: (b) => set({ withSubtitles: b }),
-  setSubtitleStyle: (s) =>
-    set((state) => ({ subtitleStyle: { ...state.subtitleStyle, ...s } })),
+  setSubtitleStyle: (s) => set((state) => ({ subtitleStyle: { ...state.subtitleStyle, ...s } })),
   setWithBackingTrack: (b) => set({ withBackingTrack: b }),
   setBackingTrackId: (id) => set({ backingTrackId: id }),
-  setBackingTrackVolume: (v) =>
-    set({ backingTrackVolume: Math.min(1, Math.max(0, v)) }),
-  reset: () =>
-    set({
-      currentClip: null,
-      videoUrl: null,
-      poster: "",
-      trimStart: 0,
-      trimEnd: 0,
-      queueLength: 0,
-      withSubtitles: false,
-      subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
-      withBackingTrack: false,
-      backingTrackId: null,
-      backingTrackVolume: 0.3,
-    }),
+  setBackingTrackVolume: (v) => set({ backingTrackVolume: Math.min(1, Math.max(0, v)) }),
+  setLayout: (l) => set({ layout: l }),
+  setSplitRatio: (r) => set({ splitRatio: Math.min(0.5, Math.max(0.2, r)) }),
+  reset: () => set({
+    currentClip: null, videoUrl: null, poster: "",
+    trimStart: 0, trimEnd: 0, queueLength: 0,
+    withSubtitles: false, subtitleStyle: { ...DEFAULT_SUBTITLE_STYLE },
+    withBackingTrack: false, backingTrackId: null, backingTrackVolume: 0.3,
+    layout: "original", splitRatio: 0.3,
+  }),
 }));

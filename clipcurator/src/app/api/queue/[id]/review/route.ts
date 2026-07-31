@@ -6,13 +6,10 @@ import type { Decision } from "@/types";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// POST /api/queue/[id]/review — accept, reject, not-interested, or download
-//
-// decision values:
-//   "A" | "B"        → publish to channel A/B (trains NN as "accept")
-//   "REJECT"         → bad clip (trains NN as "reject_bad")
-//   "NOT_INTERESTED" → duplicate/already clipped (trains NN as "not_interested")
-//   "DOWNLOAD"       → render for download only (no training)
+// POST /api/queue/[id]/review
+// Body includes: decision, finalStart, finalEnd, withSubtitles, subtitleVtt,
+// subtitleStyle, withBackingTrack, backingTrackId, backingTrackVolume,
+// layout (new), splitRatio (new)
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -25,16 +22,21 @@ export async function POST(
     const finalEnd = Number(body?.finalEnd);
 
     const withSubtitles = Boolean(body?.withSubtitles);
-    const subtitleVtt: string | undefined =
-      typeof body?.subtitleVtt === "string" ? body.subtitleVtt : undefined;
+    const subtitleVtt = typeof body?.subtitleVtt === "string" ? body.subtitleVtt : undefined;
     const subtitleStyle = body?.subtitleStyle ?? undefined;
 
     const withBackingTrack = Boolean(body?.withBackingTrack);
-    const backingTrackId: string | null =
-      typeof body?.backingTrackId === "string" ? body.backingTrackId : null;
+    const backingTrackId = typeof body?.backingTrackId === "string" ? body.backingTrackId : null;
     const backingTrackVolume =
       typeof body?.backingTrackVolume === "number"
         ? Math.min(1, Math.max(0, body.backingTrackVolume))
+        : 0.3;
+
+    // Layout + splitRatio (new — for vertical video rendering)
+    const layout = typeof body?.layout === "string" ? body.layout : "original";
+    const splitRatio =
+      typeof body?.splitRatio === "number"
+        ? Math.min(0.5, Math.max(0.2, body.splitRatio))
         : 0.3;
 
     if (!decision || !["A", "B", "REJECT", "NOT_INTERESTED", "DOWNLOAD"].includes(decision)) {
@@ -55,13 +57,10 @@ export async function POST(
       return NextResponse.json({ error: "clip not found" }, { status: 404 });
     }
 
-    // ─── Send feedback to the neural network (3-class) ────────────────
-    // label: 0=accept, 1=reject_bad, 2=not_interested
+    // Send feedback to the neural network (3-class)
     if (["A", "B", "REJECT", "NOT_INTERESTED"].includes(decision)) {
       const label = decision === "A" || decision === "B" ? 0
-                  : decision === "REJECT" ? 1
-                  : 2;  // NOT_INTERESTED
-
+                  : decision === "REJECT" ? 1 : 2;
       try {
         const clipperUrl = process.env.CLIPPER_URL || "http://localhost:8100";
         const transcript = clip.transcript ?? "";
@@ -69,7 +68,6 @@ export async function POST(
         const caps = transcript.split("").filter((c) => c === c.toUpperCase() && /[A-Z]/.test(c));
         const capsRatio = letters.length > 0 ? caps.length / letters.length : 0;
 
-        // Extract LLM score from thumbnailUrl (stored as JSON blob)
         let llmScore = 0;
         try {
           const thumbData = JSON.parse(clip.thumbnailUrl ?? "{}");
@@ -83,12 +81,12 @@ export async function POST(
             clipId: clip.id,
             sourceId: clip.sourceId,
             accepted: label === 0,
-            label: label,  // 0=accept, 1=reject_bad, 2=not_interested
+            label,
             features: {
               chatVelocity: clip.chatVelocity ?? 0,
               audioScore: clip.engagementScore ?? 0,
               textScore: clip.peakPhrase ? Math.min(1, clip.peakPhrase.length / 40) : 0,
-              capsRatio: capsRatio,
+              capsRatio,
               exclamationCount: (transcript.match(/!/g) || []).length,
               laughterScore: 0,
               duration: finalEnd - finalStart,
@@ -96,24 +94,21 @@ export async function POST(
               sceneCount: 0,
               clapScore: 0,
               llmViralScore: llmScore,
-              openingRetention: 0,  // filled in later when YouTube data arrives
+              openingRetention: 0,
             },
           }),
           signal: AbortSignal.timeout(5000),
         });
-        console.log(`[review] Feedback sent to NN (label=${label}, decision=${decision})`);
       } catch (err) {
         console.warn("[review] Failed to send feedback:", err);
       }
     }
 
-    // ─── Handle the decision ──────────────────────────────────────────
     if (decision === "REJECT" || decision === "NOT_INTERESTED") {
       const updated = await db.clip.update({
         where: { id },
         data: {
-          status: decision === "REJECT" ? "REJECTED" : "REJECTED",
-          reviewerId: null,
+          status: "REJECTED",
           reviewedAt: new Date(),
           finalStartSec: finalStart,
           finalEndSec: finalEnd,
@@ -140,18 +135,25 @@ export async function POST(
       decision === "DOWNLOAD" ? "RENDERED" : decision === "A" ? "APPROVED_A" : "APPROVED_B";
     const channelId = decision === "A" ? "CHANNEL_A" : decision === "B" ? "CHANNEL_B" : null;
 
+    // Store layout + splitRatio in subtitleStyle field as JSON
+    // (reusing existing field since layout metadata doesn't have its own column)
+    const layoutMetadata = JSON.stringify({
+      ...(subtitleStyle || {}),
+      layout,
+      splitRatio,
+    });
+
     const updated = await db.clip.update({
       where: { id },
       data: {
         status: newStatus,
-        reviewerId: null,
         reviewedAt: new Date(),
         finalStartSec: finalStart,
         finalEndSec: finalEnd,
         publishedToChannelId: channelId,
         withSubtitles,
         subtitleVtt: withSubtitles ? subtitleVtt ?? null : null,
-        subtitleStyle: withSubtitles && subtitleStyle ? JSON.stringify(subtitleStyle) : null,
+        subtitleStyle: withSubtitles ? layoutMetadata : null,
         withBackingTrack,
         backingTrackId: withBackingTrack ? backingTrackId : null,
         backingTrackVolume,
