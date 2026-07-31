@@ -77,12 +77,21 @@ YTDLP_BIN = str(_VENV_BIN / "yt-dlp")
 if not Path(YTDLP_BIN).exists():
     YTDLP_BIN = "yt-dlp"
 
+# Cookies file — YouTube requires authentication for most downloads.
+# Place a cookies.txt file (Netscape format) in the clipper directory.
+# Export from your browser using: https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+CLIPPER_DIR = Path(__file__).resolve().parent
+COOKIES_FILE = CLIPPER_DIR / "cookies.txt"
+
 
 async def search_and_download_clips(search_term: str, count: int = 5) -> list:
     """Search YouTube for clips, download top results, return list of file paths."""
     clips = []
 
     out_template = str(PRETRAIN_DIR / "%(id)s.%(ext)s")
+
+    # yt-dlp search syntax: "ytsearch5:search term" (no spaces around the colon)
+    # The search term itself can have spaces — yt-dlp handles that fine.
     search_query = f"ytsearch{count}:{search_term}"
 
     cmd = [
@@ -93,9 +102,20 @@ async def search_and_download_clips(search_term: str, count: int = 5) -> list:
         "--no-warnings",
         "--quiet",
         "--no-check-certificates",
-        "--dump-json",
-        search_query,
     ]
+
+    # Add cookies if the file exists — YouTube blocks most downloads without them
+    if COOKIES_FILE.exists():
+        cmd.extend(["--cookies", str(COOKIES_FILE)])
+        log.info(f"[pretrain] Using cookies from: {COOKIES_FILE}")
+    else:
+        log.warning(
+            f"[pretrain] No cookies.txt found at {COOKIES_FILE} — "
+            f"YouTube may block downloads. Export cookies from your browser "
+            f"and save as clipper/cookies.txt"
+        )
+
+    cmd.extend(["--dump-json", search_query])
 
     log.info(f"[pretrain] Searching: '{search_term}' (top {count})")
     proc = await asyncio.create_subprocess_exec(

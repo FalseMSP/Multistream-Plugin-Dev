@@ -195,6 +195,13 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         "--no-check-certificates",
     ]
 
+    # Use cookies if available — YouTube and Twitch often require authentication.
+    # The cookies.txt file (Netscape format) should be in the clipper directory.
+    _cookies_file = Path(__file__).resolve().parent / "cookies.txt"
+    if _cookies_file.exists():
+        ydl_opts.extend(["--cookies", str(_cookies_file)])
+        log.info(f"[download] Using cookies from: {_cookies_file}")
+
     if platform == "TWITCH":
         ydl_opts.extend(["--write-comments"])
 
@@ -214,7 +221,10 @@ async def download_vod(url: str, source_id: str, platform: str) -> dict:
         raise RuntimeError(err_msg)
 
     # Extract metadata
-    meta_cmd = [YTDLP_BIN, "--dump-json", "--no-playlist", "--quiet", url]
+    meta_cmd = [YTDLP_BIN, "--dump-json", "--no-playlist", "--quiet"]
+    if _cookies_file.exists():
+        meta_cmd.extend(["--cookies", str(_cookies_file)])
+    meta_cmd.append(url)
     meta_proc = await asyncio.create_subprocess_exec(
         *meta_cmd,
         stdout=asyncio.subprocess.PIPE,
