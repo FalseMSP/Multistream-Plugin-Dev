@@ -96,7 +96,8 @@ async def search_and_download_clips(search_term: str, count: int = 5) -> list:
 
     cmd = [
         YTDLP_BIN,
-        "--format", "best[ext=mp4]/best",
+        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
         "--output", out_template,
         "--no-playlist",
         "--no-warnings",
