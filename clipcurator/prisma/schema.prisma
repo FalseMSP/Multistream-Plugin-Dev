@@ -144,3 +144,32 @@ model JobLog {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+
+model TwitchChannel {
+  id            String   @id @default(cuid())
+  channelName   String   @unique
+  displayName   String?
+  isLive        Boolean  @default(false)
+  autoIngest    Boolean  @default(true)
+  lastChecked   DateTime @default(now())
+  lastIngestedAt DateTime?
+  lastVodUrl    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model ClipReviewFeedback {
+  id              String   @id @default(cuid())
+  clipId          String
+  sourceId        String
+  label           Int
+  engagementScore Float
+  features        String
+  channel         String?
+  retentionScore  Float?
+  openingRetention Float?
+  viewCount       Int?
+  likeCount       Int?
+  fetchedAt       DateTime?
+  createdAt       DateTime @default(now())
+}
