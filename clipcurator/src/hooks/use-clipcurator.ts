@@ -511,3 +511,61 @@ export function usePeekNextClip() {
     refetchInterval: 5000,
   });
 }
+
+// ─── Twitch auto-ingest channels ────────────────────────────────────────────
+export function useTwitchChannels() {
+  return useQuery({
+    queryKey: ["twitch-channels"] as const,
+    queryFn: () => fetchJson<{ channels: any[] }>(apiUrl("/api/twitch-channels")),
+    refetchInterval: 10000,
+  });
+}
+
+export function useAddTwitchChannel() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (channelName: string) =>
+      fetchJson<{ channel: any }>(apiUrl("/api/twitch-channels"), {
+        method: "POST",
+        body: JSON.stringify({ channelName }),
+      }),
+    onSuccess: () => {
+      toast({ title: "Channel added", description: "Will auto-ingest VODs when stream ends." });
+      qc.invalidateQueries({ queryKey: ["twitch-channels"] });
+    },
+    onError: (err: Error) => {
+      toast({ title: "Failed to add channel", description: err.message, variant: "destructive" });
+    },
+  });
+}
+
+export function useDeleteTwitchChannel() {
+  const qc = useQueryClient();
+  const { toast } = useToast();
+  return useMutation({
+    mutationFn: (id: string) =>
+      fetchJson<{ ok: boolean }>(apiUrl(`/api/twitch-channels/${id}`), { method: "DELETE" }),
+    onSuccess: () => {
+      toast({ title: "Channel removed" });
+      qc.invalidateQueries({ queryKey: ["twitch-channels"] });
+    },
+    onError: (err: Error) => {
+      toast({ title: "Delete failed", description: err.message, variant: "destructive" });
+    },
+  });
+}
+
+export function useToggleTwitchAutoIngest() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (args: { id: string; autoIngest: boolean }) =>
+      fetchJson<{ channel: any }>(apiUrl(`/api/twitch-channels/${args.id}`), {
+        method: "PUT",
+        body: JSON.stringify({ autoIngest: args.autoIngest }),
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["twitch-channels"] });
+    },
+  });
+}
