@@ -96,27 +96,25 @@ async def search_and_download_clips(search_term: str, count: int = 5) -> list:
 
     cmd = [
         YTDLP_BIN,
-        "--format", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
+        # Most permissive format — "best" alone gets the best pre-merged file
+        "--format", "best",
         "--output", out_template,
         "--no-playlist",
         "--no-warnings",
-        "--quiet",
         "--no-check-certificates",
+        # --dump-json SIMULATES (doesn't download). Use --write-info-json
+        # to save metadata alongside the video file instead.
+        "--write-info-json",
+        # --no-progress to keep stdout clean
+        "--no-progress",
     ]
 
-    # Add cookies if the file exists — YouTube blocks most downloads without them
+    # Add cookies if the file exists
     if COOKIES_FILE.exists():
         cmd.extend(["--cookies", str(COOKIES_FILE)])
         log.info(f"[pretrain] Using cookies from: {COOKIES_FILE}")
-    else:
-        log.warning(
-            f"[pretrain] No cookies.txt found at {COOKIES_FILE} — "
-            f"YouTube may block downloads. Export cookies from your browser "
-            f"and save as clipper/cookies.txt"
-        )
 
-    cmd.extend(["--dump-json", search_query])
+    cmd.append(search_query)
 
     log.info(f"[pretrain] Searching: '{search_term}' (top {count})")
     proc = await asyncio.create_subprocess_exec(
@@ -130,13 +128,14 @@ async def search_and_download_clips(search_term: str, count: int = 5) -> list:
         log.warning(f"[pretrain] Search failed: {stderr.decode()[-200:]}")
         return []
 
-    for line in stdout.decode().strip().split("\n"):
-        if not line:
-            continue
+    # yt-dlp saves .info.json files alongside the video files.
+    # Parse them to get metadata + find the video file.
+    for info_file in PRETRAIN_DIR.glob("*.info.json"):
         try:
-            meta = json.loads(line)
+            meta = json.loads(info_file.read_text())
             clip_id = meta.get("id", "")
-            for ext in [".mp4", ".webm", ".mkv"]:
+            # Find the video file (any extension)
+            for ext in [".mp4", ".webm", ".mkv", ".m4a"]:
                 path = PRETRAIN_DIR / f"{clip_id}{ext}"
                 if path.exists():
                     clips.append({
@@ -146,7 +145,9 @@ async def search_and_download_clips(search_term: str, count: int = 5) -> list:
                         "view_count": meta.get("view_count", 0),
                     })
                     break
-        except json.JSONDecodeError:
+            # Clean up the info.json file
+            info_file.unlink()
+        except Exception:
             continue
 
     log.info(f"[pretrain] Downloaded {len(clips)} clips")
