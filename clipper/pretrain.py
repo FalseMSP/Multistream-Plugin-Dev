@@ -59,16 +59,17 @@ PRETRAIN_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_PATH = DATA_DIR / "clip_scorer_model.json"
 
-# Default search terms — popular streamers with viral clips
+# Default search terms — focused on YouTube Shorts (vertical, viral)
+# These search for short-form vertical clips that perform well on Shorts/TikTok
 DEFAULT_SEARCHES = [
-    "ishowspeed clips funny",
-    "xqc best moments",
-    "kai cenat highlights",
-    "twitch best clips 2024",
-    "streamer funny moments compilation",
-    "poki clips",
-    "asmongold reacts",
-    "critikal clips funny",
+    "ishowspeed shorts",
+    "xqc shorts funny",
+    "kai cenat shorts",
+    "twitch clips shorts viral",
+    "streamer funny shorts",
+    "poki shorts",
+    "asmongold shorts react",
+    "critikal shorts funny",
 ]
 
 # Resolve yt-dlp binary (same logic as clipper.py)
@@ -204,14 +205,14 @@ def extract_features(clip_path: str, whisper_segments: list) -> dict:
     except Exception as e:
         log.debug(f"[pretrain] Audio failed: {e}")
 
-    # Motion score
+    # Motion score — extract_motion_score is async, but we're in a sync
+    # context (called from extract_features which is not async). Use
+    # asyncio.run() instead of a manual event loop.
     motion_score = 0.0
     try:
-        loop = asyncio.new_event_loop()
-        motion_score = loop.run_until_complete(
+        motion_score = asyncio.run(
             extract_motion_score(clip_path, sample_fps=1.0)
         )
-        loop.close()
     except Exception as e:
         log.debug(f"[pretrain] Motion failed: {e}")
 

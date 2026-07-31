@@ -163,11 +163,18 @@ class RenderRequest(BaseModel):
     finalStartSec: float
     finalEndSec: float
     withSubtitles: bool = False
-    subtitleVtt: Optional[str] = None  # WebVTT content
-    subtitleStyle: Optional[dict] = None  # {fontSize, color, bgColor, position, bold, fontFamily}
+    subtitleVtt: Optional[str] = None
+    subtitleStyle: Optional[dict] = None
     withBackingTrack: bool = False
-    backingTrackPath: Optional[str] = None  # /backing/{id}.mp3
-    backingTrackVolume: float = 0.3  # 0-1
+    backingTrackPath: Optional[str] = None
+    backingTrackVolume: float = 0.3
+    # Vertical video layout (Shorts/TikTok format)
+    # "original" = keep source aspect ratio (no vertical transform)
+    # "vertical_center" = 9:16 with video centered, blurred background fill
+    # "vertical_top" = 9:16 with video at top (facecam at bottom)
+    # "vertical_bottom" = 9:16 with video at bottom (facecam at top)
+    # "vertical_split" = 9:16 with video on top half, facecam placeholder on bottom
+    layout: str = "original"
 
 
 class PublishRequest(BaseModel):
@@ -902,6 +909,100 @@ def _vtt_to_srt(vtt_content: str) -> str:
     return "\n".join(out_lines)
 
 
+def _build_video_filter(
+    layout: str,
+    with_subtitles: bool,
+    subtitle_vtt: Optional[str],
+    subtitle_style: Optional[dict],
+    srt_file: Optional[Path],
+    final_start_sec: float,
+) -> str:
+    """
+    Build the FFmpeg video filter chain based on the layout mode.
+
+    Layouts:
+      "original"        — scale to 720p, preserve aspect ratio
+      "vertical_center" — 9:16 (1080x1920), video centered, blurred background
+      "vertical_top"    — 9:16, video at top 70%, bottom 30% black (for facecam)
+      "vertical_bottom" — 9:16, video at bottom 70%, top 30% black (for facecam)
+      "vertical_split"  — 9:16, video on top 60%, bottom 40% black (facecam area)
+    """
+    if layout == "original" or layout is None:
+        # Original: scale to 720p preserving aspect
+        vf = "scale=-2:720"
+    elif layout == "vertical_center":
+        # 9:16 vertical with blurred background fill
+        # 1. Scale source to fit 1080 width (preserve aspect)
+        # 2. Create blurred scaled version for background
+        # 3. Overlay centered
+        vf = (
+            "split[v_main][v_bg];"
+            "[v_bg]scale=1080:1920,boxblur=20:20,setsar=1[v_bg_blurred];"
+            "[v_main]scale=1080:-2,setsar=1[v_main_scaled];"
+            "[v_bg_blurred][v_main_scaled]overlay=(W-w)/2:(H-h)/2[vout_pre_sub]"
+        )
+        # For vertical_center, we return the intermediate label
+        # Subtitles (if any) are applied after overlay
+        if with_subtitles and subtitle_vtt and srt_file:
+            srt_content = _vtt_to_srt(subtitle_vtt)
+            srt_content = _offset_srt(srt_content, -final_start_sec)
+            srt_file.write_text(srt_content, encoding="utf-8")
+            style_str = _build_subtitle_filter(subtitle_style)
+            srt_path_escaped = str(srt_file).replace("\\", "/").replace(":", "\\:")
+            vf += f";[vout_pre_sub]subtitles='{srt_path_escaped}':force_style='{style_str}'[vout]"
+        else:
+            vf += "[vout]"
+        return vf
+    elif layout in ("vertical_top", "vertical_bottom", "vertical_split"):
+        # Vertical with video positioned + black area for facecam
+        # Scale video to 1080 width, then pad to 1920 height
+        if layout == "vertical_top":
+            # Video at top, black at bottom
+            pad_y = "0"  # video starts at y=0
+        elif layout == "vertical_bottom":
+            # Video at bottom, black at top
+            pad_y = "-1"  # auto-center but we use pad with specific offset
+        else:  # vertical_split
+            # Video takes top 60% (1152px), bottom 40% (768px) for facecam
+            pad_y = "0"
+
+        vf = (
+            "scale=1080:-2,setsar=1[v_scaled];"
+            "[v_scaled]pad=1080:1920:0:"
+        )
+        if layout == "vertical_top":
+            vf += "0:color=black[vout_pre_sub]"
+        elif layout == "vertical_bottom":
+            vf += "(oh-ih):color=black[vout_pre_sub]"
+        else:  # vertical_split — video at top, facecam area at bottom
+            vf += "0:color=black[vout_pre_sub]"
+
+        if with_subtitles and subtitle_vtt and srt_file:
+            srt_content = _vtt_to_srt(subtitle_vtt)
+            srt_content = _offset_srt(srt_content, -final_start_sec)
+            srt_file.write_text(srt_content, encoding="utf-8")
+            style_str = _build_subtitle_filter(subtitle_style)
+            srt_path_escaped = str(srt_file).replace("\\", "/").replace(":", "\\:")
+            vf += f";[vout_pre_sub]subtitles='{srt_path_escaped}':force_style='{style_str}'[vout]"
+        else:
+            vf += "[vout]"
+        return vf
+    else:
+        # Unknown layout — fallback to original
+        vf = "scale=-2:720"
+
+    # Apply subtitles for original layout
+    if with_subtitles and subtitle_vtt and srt_file:
+        srt_content = _vtt_to_srt(subtitle_vtt)
+        srt_content = _offset_srt(srt_content, -final_start_sec)
+        srt_file.write_text(srt_content, encoding="utf-8")
+        style_str = _build_subtitle_filter(subtitle_style)
+        srt_path_escaped = str(srt_file).replace("\\", "/").replace(":", "\\:")
+        vf += f",subtitles='{srt_path_escaped}':force_style='{style_str}'"
+
+    return vf + "[vout]"
+
+
 async def render_clip(
     clip_id: str,
     source_storage_path: str,
@@ -913,8 +1014,9 @@ async def render_clip(
     with_backing_track: bool = False,
     backing_track_path: Optional[str] = None,
     backing_track_volume: float = 0.3,
+    layout: str = "original",
 ) -> dict:
-    """Render a clip using FFmpeg with optional subtitles + backing track."""
+    """Render a clip using FFmpeg with optional subtitles + backing track + vertical layout."""
     source_id = source_storage_path.split("/")[2] if "/" in source_storage_path else ""
     local_source = VOD_DIR / source_id / "master.mp4"
     if not local_source.exists():
@@ -926,16 +1028,12 @@ async def render_clip(
 
     duration = final_end_sec - final_start_sec
 
-    # Build FFmpeg command — base video cut
     cmd = [FFMPEG_BIN, "-y"]
-
-    # Input 0: source VOD
     cmd.extend(["-ss", str(final_start_sec), "-i", str(local_source)])
 
     # Input 1: backing track (if requested)
     backing_local = None
     if with_backing_track and backing_track_path:
-        # backing_track_path is /backing/{id}.mp3 — resolve to local file
         backing_id = backing_track_path.split("/")[-1].replace(".mp3", "")
         backing_local = BACKING_DIR / f"{backing_id}.mp3"
         if backing_local.exists():
@@ -944,33 +1042,25 @@ async def render_clip(
             log.warning(f"[render] Backing track not found: {backing_local}")
             with_backing_track = False
 
+    # Build video filter based on layout
+    srt_file = out_dir / "subs.srt"
+    video_filter = _build_video_filter(
+        layout, with_subtitles, subtitle_vtt, subtitle_style, srt_file, final_start_sec
+    )
+
     # Build filter complex
     filters = []
 
-    # Video filter: scale to 720p (preserving aspect)
-    video_filter = "scale=-2:720"
-    if with_subtitles and subtitle_vtt:
-        # Write VTT to a temp file, convert to SRT (FFmpeg's subtitles filter
-        # works best with SRT/ASS), then add subtitles filter
-        srt_content = _vtt_to_srt(subtitle_vtt)
-        # Offset timestamps by -final_start_sec so subtitles align with the clip
-        # (VTT from the editor has absolute source timestamps)
-        srt_content = _offset_srt(srt_content, -final_start_sec)
-        srt_file = out_dir / "subs.srt"
-        srt_file.write_text(srt_content, encoding="utf-8")
-
-        style_str = _build_subtitle_filter(subtitle_style)
-        # Path escaping for FFmpeg filter — colons and backslashes need care
-        srt_path_escaped = str(srt_file).replace("\\", "/").replace(":", "\\:")
-        video_filter = f"{video_filter},subtitles='{srt_path_escaped}':force_style='{style_str}'"
-
-    filters.append(f"[0:v]{video_filter}[vout]")
+    if layout == "original" or layout is None:
+        # Original: single input video filter
+        filters.append(f"[0:v]{video_filter}")
+    else:
+        # Vertical layouts: the filter chain already includes split + overlay
+        # We need to prefix with [0:v] only for the first part
+        filters.append(f"[0:v]{video_filter}")
 
     # Audio filter
     if with_backing_track and backing_local:
-        # Mix original audio with backing track
-        # [0:a] = original, [1:a] = backing
-        # Backing track volume scaled, then amix
         filters.append(f"[0:a]volume=1.0[a0]")
         filters.append(f"[1:a]atrim=duration={duration},volume={backing_track_volume}[a1]")
         filters.append(f"[a0][a1]amix=inputs=2:duration=first:dropout_transition=0[aout]")
@@ -994,7 +1084,7 @@ async def render_clip(
         str(out_path),
     ])
 
-    log.info(f"[render] Running FFmpeg: {' '.join(cmd[:20])}...")
+    log.info(f"[render] Layout: {layout}, FFmpeg: {' '.join(cmd[:25])}...")
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -1193,6 +1283,7 @@ async def api_render(req: RenderRequest):
             with_backing_track=req.withBackingTrack,
             backing_track_path=req.backingTrackPath,
             backing_track_volume=req.backingTrackVolume,
+            layout=req.layout,
         )
         return JSONResponse(result)
     except Exception as e:

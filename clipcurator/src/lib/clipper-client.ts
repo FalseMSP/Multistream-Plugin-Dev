@@ -226,6 +226,7 @@ export interface RenderRequest {
   withBackingTrack: boolean;
   backingTrackPath?: string;
   backingTrackVolume?: number;
+  layout?: string;  // "original" | "vertical_center" | "vertical_top" | "vertical_bottom" | "vertical_split"
 }
 export interface RenderResponse {
   clipId: string;
