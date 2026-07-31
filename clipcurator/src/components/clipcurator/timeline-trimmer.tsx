@@ -11,8 +11,8 @@
 //
 // Interaction:
 //   • click → seek
-//   • drag left handle → trimStart (clamped: [0, trimEnd - 30])
-//   • drag right handle → trimEnd (clamped: [trimStart + 30, duration])
+//   • drag left handle → trimStart (clamped: [0, trimEnd - 10])
+//   • drag right handle → trimEnd (clamped: [trimStart + 10, duration])
 //   • drag middle → move both together (preserves duration, clamped)
 //   • touch targets ≥44px (wide invisible handles + visible thin bar)
 
@@ -38,7 +38,7 @@ export interface TimelineTrimmerProps {
   onTrimChange: (start: number, end: number) => void;
 }
 
-const MIN_CLIP_LEN = 30; // seconds (matches /api/queue/[id]/review validation)
+const MIN_CLIP_LEN = 10; // seconds — reduced from 30 to allow tighter cuts
 
 // Deterministic seeded RNG so the waveform doesn't flicker on re-render.
 function seededWaveform(seed: number, count: number): number[] {
@@ -316,7 +316,7 @@ export function TimelineTrimmer({
             {formatTime(trimLen)}
           </span>{" "}
           <span className="text-zinc-500">
-            (min 0:{MIN_CLIP_LEN.toString().padStart(2, "0")}, ideal 45–90s)
+            (min 0:{MIN_CLIP_LEN.toString().padStart(2, "0")}, ideal 15–60s)
           </span>
         </div>
         <div className="text-xs text-zinc-400">

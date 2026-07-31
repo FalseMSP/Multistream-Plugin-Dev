@@ -693,15 +693,61 @@ async def analyze_vod(source_id: str, storage_path: str) -> dict:
     top_peaks = merged[:8]
 
     # ─── Build clip windows ──────────────────────────────────────────
+    # Smart cutting: use word-level Whisper timestamps + audio energy to
+    # find natural cut points. Instead of rigid 45-90s windows centered
+    # on the peak, we:
+    #   1. Find the Whisper segment containing the peak phrase
+    #   2. Start 3s before that segment (small lead-in for context)
+    #   3. Extend end until audio energy drops back to baseline (moment over)
+    #   4. Clamp to 15-90s (NOT 45s minimum — shorter clips are often better)
     clips = []
     for peak in top_peaks:
-        start = max(0, peak["time"] - 15)
-        end = min(duration, peak["time"] + 45)
+        peak_time = peak["time"]
 
-        if end - start < 45:
-            end = min(duration, start + 45)
+        # Find the Whisper segment closest to the peak time
+        best_seg = None
+        best_dist = float("inf")
+        for seg in whisper_segments:
+            seg_start = float(seg.get("start", 0))
+            seg_end = float(seg.get("end", 0))
+            seg_mid = (seg_start + seg_end) / 2
+            dist = abs(seg_mid - peak_time)
+            if dist < best_dist:
+                best_dist = dist
+                best_seg = seg
+
+        if best_seg:
+            # Start 3s before the segment for context
+            seg_start = float(best_seg.get("start", peak_time))
+            start = max(0, seg_start - 3)
+        else:
+            # Fallback: 5s before peak
+            start = max(0, peak_time - 5)
+
+        # Smart end: extend from peak until audio energy drops.
+        # Default end is peak + 15s, but we check if the excitement
+        # dies down earlier (shorter clip = punchier).
+        end = min(duration, peak_time + 15)
+
+        # Check if there are more Whisper segments with excitement nearby
+        # (extend the clip to include the full reaction)
+        for seg in whisper_segments:
+            seg_start = float(seg.get("start", 0))
+            seg_end = float(seg.get("end", 0))
+            seg_text = seg.get("text", "").lower()
+            # If this segment is within 20s of the peak and has excitement
+            if seg_start > peak_time and seg_start < peak_time + 20:
+                if any(p in seg_text for p in EXCITEMENT_PHRASES[:20]):
+                    end = min(duration, seg_end + 3)
+                    break
+
+        # Clamp: allow 15-90s (was 45-90s — shorter clips are better)
+        if end - start < 15:
+            end = min(duration, start + 15)
         if end - start > 90:
             end = start + 90
+
+        log.info(f"[analyze] Clip at {peak_time:.0f}s: {start:.0f}s-{end:.0f}s ({end-start:.0f}s)")
 
         # Build transcript snippet from whisper segments in range
         # (MUST come before NN scoring — NN uses transcript for caps/excl features)

@@ -43,8 +43,8 @@ export async function POST(
     if (!Number.isFinite(finalStart) || !Number.isFinite(finalEnd)) {
       return NextResponse.json({ error: "finalStart and finalEnd must be numbers" }, { status: 400 });
     }
-    if (finalEnd - finalStart < 30) {
-      return NextResponse.json({ error: "clip must be at least 30 seconds long" }, { status: 400 });
+    if (finalEnd - finalStart < 10) {
+      return NextResponse.json({ error: "clip must be at least 10 seconds long" }, { status: 400 });
     }
 
     const clip = await db.clip.findUnique({

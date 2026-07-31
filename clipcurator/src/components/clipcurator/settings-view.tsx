@@ -19,6 +19,9 @@ import {
   XCircle,
   Loader2,
   ExternalLink,
+  Twitch,
+  Plus,
+  Radio,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -41,6 +44,10 @@ import {
   useBackingTracks,
   useUploadBackingTrack,
   useDeleteBackingTrack,
+  useTwitchChannels,
+  useAddTwitchChannel,
+  useDeleteTwitchChannel,
+  useToggleTwitchAutoIngest,
 } from "@/hooks/use-clipcurator";
 import { CHANNEL_DEFAULTS, API_BASE } from "@/lib/constants";
 import type { Channel, ChannelId } from "@/types";
@@ -51,13 +58,165 @@ export function SettingsView() {
       <div className="mb-6">
         <h1 className="text-xl font-semibold text-zinc-100">Settings</h1>
         <p className="text-sm text-zinc-500">
-          Configure YouTube publishing channels and manage backing tracks.
+          Configure YouTube channels, Twitch auto-ingest, and backing tracks.
         </p>
       </div>
 
       <ChannelConfigSection />
+      <TwitchChannelSection />
       <BackingTrackSection />
     </div>
+  );
+}
+
+// ─── Twitch auto-ingest ─────────────────────────────────────────────────────
+
+function TwitchChannelSection() {
+  const { data, isLoading } = useTwitchChannels();
+  const addChannel = useAddTwitchChannel();
+  const [channelName, setChannelName] = React.useState("");
+
+  const channels = data?.channels ?? [];
+
+  const onAdd = () => {
+    const trimmed = channelName.trim();
+    if (!trimmed) return;
+    addChannel.mutate(trimmed, {
+      onSuccess: () => setChannelName(""),
+    });
+  };
+
+  return (
+    <Card className="mb-6 border-zinc-800 bg-card">
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Twitch className="size-4 text-purple-400" />
+          Twitch Auto-Ingest
+        </CardTitle>
+        <CardDescription>
+          Add Twitch channels to monitor. When a stream ends, ClipCurator
+          automatically downloads the VOD and processes it for clips.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {/* Add channel form */}
+        <div className="flex gap-2">
+          <Input
+            value={channelName}
+            onChange={(e) => setChannelName(e.target.value)}
+            placeholder="Twitch username (e.g. ishowspeed)"
+            className="h-9 flex-1"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") onAdd();
+            }}
+          />
+          <Button
+            size="sm"
+            onClick={onAdd}
+            disabled={addChannel.isPending || !channelName.trim()}
+          >
+            {addChannel.isPending ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Plus className="size-3.5" />
+            )}
+            Add
+          </Button>
+        </div>
+
+        {/* Channel list */}
+        {isLoading ? (
+          <div className="flex items-center gap-2 text-sm text-zinc-500">
+            <Loader2 className="size-4 animate-spin" />
+            Loading…
+          </div>
+        ) : channels.length === 0 ? (
+          <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
+            <Twitch className="size-8 text-zinc-700" />
+            <p className="text-sm text-zinc-500">
+              No Twitch channels being monitored.
+            </p>
+            <p className="text-xs text-zinc-600">
+              Add a channel above to auto-ingest VODs when streams end.
+            </p>
+          </div>
+        ) : (
+          <ul className="space-y-1.5">
+            {channels.map((ch: any) => (
+              <TwitchChannelRow key={ch.id} channel={ch} />
+            ))}
+          </ul>
+        )}
+
+        {/* Info box */}
+        <div className="rounded-md border border-zinc-800 bg-zinc-950/40 p-3 text-xs text-zinc-400">
+          <p className="mb-1 font-medium text-zinc-300">How auto-ingest works:</p>
+          <ol className="list-decimal space-y-0.5 pl-4">
+            <li>The watcher polls Twitch every 60 seconds</li>
+            <li>When a stream goes live → offline, it waits 5 minutes</li>
+            <li>Fetches the latest VOD URL via Twitch API</li>
+            <li>Auto-submits to ClipCurator for download + analysis</li>
+          </ol>
+          <p className="mt-2 text-zinc-500">
+            Requires <code className="rounded bg-zinc-800 px-1 text-emerald-300">TWITCH_CLIENT_ID</code> and{" "}
+            <code className="rounded bg-zinc-800 px-1 text-emerald-300">TWITCH_CLIENT_SECRET</code> in .env
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function TwitchChannelRow({ channel }: { channel: any }) {
+  const del = useDeleteTwitchChannel();
+  const toggle = useToggleTwitchAutoIngest();
+
+  return (
+    <li className="flex items-center gap-3 rounded-md border border-zinc-800/80 bg-zinc-950/40 px-3 py-2">
+      <Twitch className="size-4 shrink-0 text-purple-400" />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-zinc-200">
+          {channel.displayName ?? channel.channelName}
+        </p>
+        <p className="text-xs text-zinc-500">
+          {channel.isLive ? (
+            <span className="flex items-center gap-1 text-red-400">
+              <Radio className="size-3 animate-pulse" />
+              Live now
+            </span>
+          ) : (
+            "Offline"
+          )}
+          {channel.lastIngestedAt && (
+            <span className="ml-2">
+              · Last ingested: {new Date(channel.lastIngestedAt).toLocaleDateString()}
+            </span>
+          )}
+        </p>
+      </div>
+
+      {/* Auto-ingest toggle */}
+      <Button
+        size="sm"
+        variant={channel.autoIngest ? "default" : "outline"}
+        className="h-7 px-2 text-xs"
+        onClick={() => toggle.mutate({ id: channel.id, autoIngest: !channel.autoIngest })}
+        disabled={toggle.isPending}
+      >
+        {channel.autoIngest ? "Auto" : "Manual"}
+      </Button>
+
+      <Button
+        size="icon"
+        variant="ghost"
+        className="size-7 text-zinc-500 hover:text-rose-400"
+        onClick={() => del.mutate(channel.id)}
+        disabled={del.isPending}
+        aria-label="Remove channel"
+      >
+        <Trash2 className="size-3.5" />
+      </Button>
+    </li>
   );
 }
 
