@@ -110,6 +110,13 @@ function init() {
 }
 
 async function processMessage(msg) {
+  // Skip synthetic event notifications (subscribe, like, watch-streak, raid).
+  // These carry a `type` field and are NOT actual chat messages — a raider
+  // sharing a raid or a viewer sharing their watch streak hasn't "chatted",
+  // so they shouldn't be marked as seen or trigger a first-time-chatter embed.
+  // We pass them through untouched so other plugins/consumers still see them.
+  if (msg.type) return { message: msg };
+
   const isFirst = _checkAndMark(msg.platform, msg.username);
 
   if (!isFirst) {

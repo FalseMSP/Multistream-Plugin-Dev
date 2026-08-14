@@ -15,16 +15,17 @@ let   _nextId = 1;
 
 // Event type → display config (emoji + colour)
 const TYPE_CONFIG = {
-  follow:     { emoji: '💜', color: '#a970ff', label: 'Follow'     },
-  sub:        { emoji: '⭐', color: '#f5c518', label: 'Sub'        },
-  resub:      { emoji: '🔄', color: '#f5a623', label: 'Resub'      },
-  subgift:    { emoji: '🎁', color: '#ff6b6b', label: 'Gift Sub'   },
-  bits:       { emoji: '💎', color: '#00d4ff', label: 'Bits'       },
-  like:       { emoji: '👍', color: '#ff4444', label: 'Like'       },
-  subscribe:  { emoji: '🔔', color: '#ff0000', label: 'Subscribe'  },
-  redeem:     { emoji: '🎯', color: '#00e676', label: 'Redeem'     },
-  raid:       { emoji: '⚔️', color: '#ff9800', label: 'Raid'       },
-  default:    { emoji: '📌', color: '#ffffff', label: 'Event'      },
+  follow:        { emoji: '💜', color: '#a970ff', label: 'Follow'     },
+  sub:           { emoji: '⭐', color: '#f5c518', label: 'Sub'        },
+  resub:         { emoji: '🔄', color: '#f5a623', label: 'Resub'      },
+  subgift:       { emoji: '🎁', color: '#ff6b6b', label: 'Gift Sub'   },
+  bits:          { emoji: '💎', color: '#00d4ff', label: 'Bits'       },
+  like:          { emoji: '👍', color: '#ff4444', label: 'Like'       },
+  subscribe:     { emoji: '🔔', color: '#ff0000', label: 'Subscribe'  },
+  redeem:        { emoji: '🎯', color: '#00e676', label: 'Redeem'     },
+  raid:          { emoji: '⚔️', color: '#ff9800', label: 'Raid'       },
+  'watch-streak':{ emoji: '🔥', color: '#ff5722', label: 'Streak'     },
+  default:       { emoji: '📌', color: '#ffffff', label: 'Event'      },
 };
 
 function _push(type, username, detail) {
@@ -140,7 +141,8 @@ function init(context) {
   log.info('[event-feed] Plugin loaded.');
 }
 
-// processMessage handles events delivered as messages (YT subscribe, like)
+// processMessage handles events delivered as messages (YT subscribe, like,
+// Twitch raid, Twitch watch-streak share).
 async function processMessage(msg) {
   if (msg.platform === 'youtube') {
     if (msg.type === 'subscribe') {
@@ -152,6 +154,24 @@ async function processMessage(msg) {
       return { message: msg };
     }
   }
+
+  // Twitch raid (pushed by twitch.js raided handler with type:'raid').
+  // Show in the overlay event feed. We pass the message through so the
+  // index.js onMessage handler can still build the Discord chat-feed
+  // announcement — this overlay entry is additive, not a replacement.
+  if (msg.type === 'raid') {
+    const viewers = msg.viewers;
+    _push('raid', msg.username, viewers ? `${viewers} viewers` : null);
+    return { message: msg };
+  }
+
+  // Twitch watch-streak share (USERNOTICE msg-id=viewermilestone).
+  if (msg.type === 'watch-streak') {
+    const streak = msg.streak;
+    _push('watch-streak', msg.username, streak ? `${streak} streams` : null);
+    return { message: msg };
+  }
+
   return { message: msg };
 }
 

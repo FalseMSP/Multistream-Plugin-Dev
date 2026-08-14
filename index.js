@@ -102,6 +102,39 @@ async function main() {
       return;
     }
 
+    // Twitch watch-streak share (USERNOTICE msg-id=viewermilestone).
+    // A viewer clicked "Share Watch Streak" in the Twitch UI — announce it
+    // to the chat feed, mirroring the subscribe announcement above.
+    // The watch-streak plugin has already updated streaks.json + awarded
+    // points by the time the message reaches here (it runs earlier in the
+    // pipeline). We deliberately do NOT route this through sendDonation,
+    // so the gacha plugin's onDonation handler never sees it — no pull.
+    if (msg.type === 'watch-streak') {
+      const name   = msg.username ?? 'Someone';
+      const streak = msg.streak ?? '?';
+      discord.sendChat({
+        platform: msg.platform,
+        username: name,
+        message:  `🔥 ${name} is on a ${streak}-stream watch streak!`,
+      });
+      return;
+    }
+
+    // Twitch raid (tmi.js 'raided' event → queue.pushMessage with type:'raid').
+    // Announce the raid in the chat feed, mirroring the subscribe pattern.
+    // Same as watch-streak: routed via sendChat, NOT sendDonation, so the
+    // gacha plugin's onDonation handler never fires — no pull.
+    if (msg.type === 'raid') {
+      const name    = msg.username ?? 'Someone';
+      const viewers = msg.viewers ?? '?';
+      discord.sendChat({
+        platform: msg.platform,
+        username: name,
+        message:  `⚔️ ${name} is raiding with ${viewers} viewers!`,
+      });
+      return;
+    }
+
     // Like events have no chat text — route to sendDonation for a proper embed.
     if (msg.type === 'like') {
       discord.sendDonation(msg);

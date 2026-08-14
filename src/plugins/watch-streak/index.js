@@ -269,6 +269,13 @@ async function processMessage(msg) {
     return { message: msg };
   }
 
+  // ── Skip other synthetic event types (raid, subscribe, like) ────────────
+  // These are event notifications pushed via queue.pushMessage with a `type`
+  // field — they are NOT actual chat messages. Raiders, YT subscribers, and
+  // YT likers should not be credited with a watch-streak day just because
+  // their event passed through the message pipeline. Only credit real chat.
+  if (msg.type) return { message: msg };
+
   // ── Normal message — credit for today ────────────────────────────────────
   const newStreak = _credit(msg.username, msg.platform, today);
 

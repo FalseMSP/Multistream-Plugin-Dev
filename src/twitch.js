@@ -312,8 +312,17 @@ async function subscribeEventSub(broadcasterId, callbackUrl, secret, type, versi
   // A sub can be 'enabled' but pointing at a stale tunnel URL from a previous
   // run — in that case Twitch is sending events to a dead endpoint. We must
   // delete it and create a fresh one with the correct callback URL.
+  //
+  // Dedup matching: most subscription types key their condition on
+  // `broadcaster_user_id`, but `channel.raid` uses `to_broadcaster_user_id`
+  // (the channel being raided). We match either so the raid sub is correctly
+  // recognised as already-active on subsequent restarts.
+  const _matchesBroadcaster = (s) =>
+    s.condition?.broadcaster_user_id === broadcasterId
+    || s.condition?.to_broadcaster_user_id === broadcasterId;
+
   const activeMatch = existing?.data?.find(
-    s => s.condition?.broadcaster_user_id === broadcasterId
+    s => _matchesBroadcaster(s)
       && s.status === 'enabled'
       && s.transport?.callback === callbackUrl
   );
@@ -325,7 +334,7 @@ async function subscribeEventSub(broadcasterId, callbackUrl, secret, type, versi
   // Delete any enabled subs for this type that point at the wrong URL so
   // we don't accumulate orphaned subscriptions.
   const staleEnabled = existing?.data?.filter(
-    s => s.condition?.broadcaster_user_id === broadcasterId
+    s => _matchesBroadcaster(s)
       && s.status === 'enabled'
       && s.transport?.callback !== callbackUrl
   ) ?? [];
@@ -387,6 +396,18 @@ async function setupEventSub(callbackUrl, secret) {
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.follow', '2',
       { broadcaster_user_id: broadcasterId, moderator_user_id: broadcasterId });
+
+    // channel.raid v1: fires when ANY channel raids or is raided. We only want
+    // raids INTO this broadcaster's channel, so the condition keys on
+    // `to_broadcaster_user_id`. The event payload carries the raider's display
+    // name in `from_broadcaster_user_name` and the viewer count in `viewers`
+    // (which may be null if the raiding channel had no viewers).
+    //
+    // No extra OAuth scope is required for channel.raid beyond the standard
+    // moderator/broadcaster grant — the existing token setup is sufficient.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.raid', '1',
+      { to_broadcaster_user_id: broadcasterId });
 
   } catch (err) {
     log.warn('[Twitch] EventSub setup failed:', err.message);
@@ -468,6 +489,22 @@ function handleEventSubNotification(type, event, queue) {
         timestamp: new Date(event.followed_at ?? Date.now()),
       });
       log.info(`[Twitch] Follow: ${event.user_name}`);
+      break;
+
+    case 'channel.raid':
+      // EventSub fires for raids in both directions; we subscribed with
+      // `to_broadcaster_user_id` so we only receive raids INTO our channel.
+      // Push as a synthetic message (type:'raid') — NOT a donation — so the
+      // gacha plugin's onDonation handler never sees it and no pull fires.
+      // index.js's onMessage builds the ⚔️ announcement from this message.
+      queue.pushMessage({
+        platform: 'twitch',
+        username: event.from_broadcaster_user_name,
+        message:  `${event.from_broadcaster_user_name} raided with ${event.viewers ?? 0} viewers!`,
+        type:     'raid',
+        viewers:  Number(event.viewers) || 0,
+      });
+      log.info(`[Twitch] Raid: ${event.from_broadcaster_user_name} raided with ${event.viewers ?? 0} viewers`);
       break;
 
     default:
@@ -598,14 +635,24 @@ async function startTwitch(queue) {
     });
   });
 
-  // Bits and sub events are handled exclusively via EventSub webhooks
+  // Bits, sub, and raid events are handled exclusively via EventSub webhooks
   // (channel.cheer, channel.subscribe, channel.subscription.gift,
-  //  channel.subscription.message). IRC fallbacks removed to prevent
-  //  duplicate notifications.
+  //  channel.subscription.message, channel.raid). IRC fallbacks removed to
+  //  prevent duplicate notifications.
 
   // ── Raids ─────────────────────────────────────────────────────────────
+  // Raids are handled exclusively via the EventSub `channel.raid` webhook
+  // (see setupEventSub + handleEventSubNotification above) — same pattern
+  // as bits/subs. The IRC 'raided' event is kept only as a debug log so we
+  // can see raids arriving at the IRC layer even if EventSub is delayed or
+  // misconfigured; we deliberately do NOT push it to the queue, otherwise
+  // every raid would announce twice.
+  //
+  // If you don't have a public HTTPS URL set (PUBLIC_URL env var), EventSub
+  // can't be set up and raids will not announce at all — same limitation as
+  // bits/subs. Run behind a tunnel (cloudflared, ngrok, etc.) to enable.
   client.on('raided', (channel, username, viewers) => {
-    log.info(`[Twitch] Raid: ${username} raided ${channel} with ${viewers} viewers`);
+    log.info(`[Twitch] Raid (IRC log only — EventSub handles the announcement): ${username} raided ${channel} with ${viewers} viewers`);
   });
 
   // ── Mod / channel actions ─────────────────────────────────────────────
