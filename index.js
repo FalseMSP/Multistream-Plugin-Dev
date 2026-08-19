@@ -112,10 +112,21 @@ async function main() {
     if (msg.type === 'watch-streak') {
       const name   = msg.username ?? 'Someone';
       const streak = msg.streak ?? '?';
+      const announcement = `🔥 ${name} is on a ${streak}-stream watch streak!`;
       discord.sendChat({
         platform: msg.platform,
         username: name,
-        message:  `🔥 ${name} is on a ${streak}-stream watch streak!`,
+        message:  announcement,
+      });
+      // Also push to the dashboard's live chat column so it's visible there.
+      // The subscribe/like events above miss this (early return before
+      // pushChatMessage) — that's a pre-existing gap we're not fixing here.
+      // Raids + watch-streaks should be visible in the live chat feed.
+      dashboard.pushChatMessage({
+        platform: msg.platform,
+        username: name,
+        message:  announcement,
+        type:     'watch-streak',
       });
       return;
     }
@@ -127,10 +138,18 @@ async function main() {
     if (msg.type === 'raid') {
       const name    = msg.username ?? 'Someone';
       const viewers = msg.viewers ?? '?';
+      const announcement = `⚔️ ${name} is raiding with ${viewers} viewers!`;
       discord.sendChat({
         platform: msg.platform,
         username: name,
-        message:  `⚔️ ${name} is raiding with ${viewers} viewers!`,
+        message:  announcement,
+      });
+      // Also push to the dashboard's live chat column so it's visible there.
+      dashboard.pushChatMessage({
+        platform: msg.platform,
+        username: name,
+        message:  announcement,
+        type:     'raid',
       });
       return;
     }

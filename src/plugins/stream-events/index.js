@@ -12,7 +12,10 @@
  *     sub           — new subscriber
  *     resub         — resubscription (includes cumulative months)
  *     subgift       — gifted sub(s), quantity-aware
+ *     bits          — cheer
  *     redeem        — channel point redemption
+ *     raid          — incoming raid (via EventSub channel.raid)
+ *     watch-streak  — viewer shared their watch streak (via IRC USERNOTICE)
  *   YouTube:
  *     subscribe     — new subscriber
  *     video         — new video / WebSub push
@@ -111,6 +114,8 @@ dashboard.registerWidget('stream-events', {
       video:     '#ff6b6b',
       like:      '#ff9f43',
       superchat: '#ffd700',
+      raid:          '#ff9800',
+      'watch-streak': '#ff5722',
     };
 
     var ICONS = {
@@ -123,6 +128,8 @@ dashboard.registerWidget('stream-events', {
       video:     '🎬',
       like:      '👍',
       superchat: '💛',
+      raid:          '⚔️',
+      'watch-streak': '🔥',
     };
 
     el.innerHTML = data.events.map(function (e) {
@@ -220,7 +227,13 @@ function init(context) {
       detail: input || null });
   });
 
-  // ── queue.onMessage — YouTube events: subscribe, video, like, superchat ──
+  // ── queue.onMessage — YouTube events + Twitch raid/watch-streak ──────────
+  //
+  // Raids and watch-streak shares are pushed via queue.pushMessage (not
+  // pushDonation) so they bypass the gacha plugin's onDonation handler.
+  // That means we need to catch them here in onMessage, not in onDonation.
+  // YouTube events (subscribe, video, like, superchat) also flow through
+  // onMessage.
 
   queue.onMessage(msg => {
     const { type, platform, username, message, amount, currency } = msg ?? {};
@@ -254,6 +267,27 @@ function init(context) {
         return;
       }
       // Not a special YouTube event type — let it pass through for chat mirroring
+    }
+
+    // ── Twitch raid (pushed by twitch.js via queue.pushMessage) ──────────
+    // Raids are NOT pushed via queue.pushDonation — they use pushMessage
+    // with type:'raid' to avoid triggering the gacha plugin. Catch them
+    // here so they appear in the Stream Events feed.
+    if (platform === 'twitch' && type === 'raid') {
+      const viewers = msg.viewers;
+      _push({ type, platform, username, ts: _ts(),
+        label: `raided with ${viewers ?? '?'} viewers`,
+        detail: null });
+      return;
+    }
+
+    // ── Twitch watch-streak share (USERNOTICE msg-id=viewermilestone) ────
+    if (platform === 'twitch' && type === 'watch-streak') {
+      const streak = msg.streak;
+      _push({ type, platform, username, ts: _ts(),
+        label: `shared a ${streak ?? '?'}-stream watch streak`,
+        detail: null });
+      return;
     }
   });
 

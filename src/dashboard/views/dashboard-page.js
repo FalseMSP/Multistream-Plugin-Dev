@@ -736,10 +736,12 @@ function buildDashboardPage() {
     follow: '#9147ff', sub: '#00b5ad', resub: '#00b5ad', subgift: '#f2711c',
     redeem: '#fbbd08', bits: '#00d4aa',
     subscribe: '#ff0000', video: '#ff6b6b', like: '#ff9f43', superchat: '#ffd700',
+    raid: '#ff9800', 'watch-streak': '#ff5722',
   };
   const EVENT_ICONS = {
     follow: '👤', sub: '⭐', resub: '🔁', subgift: '🎁', redeem: '🏆', bits: '💎',
     subscribe: '📺', video: '🎬', like: '👍', superchat: '💛',
+    raid: '⚔️', 'watch-streak': '🔥',
   };
 
   const PLATFORM_COLORS = { youtube: '#FF0000', twitch: '#9146FF' };
