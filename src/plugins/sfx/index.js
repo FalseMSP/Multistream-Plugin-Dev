@@ -40,6 +40,8 @@ const SFX_MAP = {
   "Air Horn":          '/sfx/airhorn.mp3',
   "Mosquito":           '/sfx/mosquitos.mp3',
   "Sisyphus":           '/sfx/sisyphus.mp3',
+  "MI BOMBO":             '/sfx/mi-bombo.mp3',
+  "Ash Baby":            '/sfx/ash-baby.mp3',
 };
 
 const MASTER_VOLUME  = parseFloat(process.env.SFX_VOLUME       ?? '1.0');
