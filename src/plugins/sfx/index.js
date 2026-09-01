@@ -43,7 +43,9 @@ const SFX_MAP = {
   "MI BOMBO":             '/sfx/mi-bombo.mp3',
   "Ash Baby":            '/sfx/ash-baby.mp3',
   "This is actually crazy": '/sfx/this-is-actually-crazy.mp3',
-  "meow":                   '/sfx/meow.mp3'
+  "meow":                   '/sfx/meow.mp3',
+  "untitledscream":         '/sfx/untitledscream.mp3',
+  "yaoi":                  '/sfx/yaoi.mp3',
 };
 
 const MASTER_VOLUME  = parseFloat(process.env.SFX_VOLUME       ?? '1.0');

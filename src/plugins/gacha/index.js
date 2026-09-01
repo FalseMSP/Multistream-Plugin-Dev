@@ -37,14 +37,14 @@ const LOOT_TABLE = [
   // Epic
   { id: 'say-phrase',       label: 'Say a Phrase',                  rarity: 'epic',      icon: 'say-phrase',       odds:  3.00, premiumOdds: 9.00, redeem: 'Say a Phrase'          },
   { id: 'turn-model-180',   label: 'Turn Model 180°',               rarity: 'epic',      icon: 'turn-model-180',   odds:  2.00, premiumOdds: 9.00, redeem: 'Turn Model 180'        },
-  { id: 'custom-sfx',       label: 'Add Custom SFX',                rarity: 'epic',      icon: 'custom-sfx',       odds:  2.00, premiumOdds: 9.00, redeem: 'Add Custom SFX'        },
   { id: '1v1',              label: '1v1',                           rarity: 'epic',      icon: '1v1',              odds:  2.00, premiumOdds: 9.00, redeem: '1v1'                   },
   // Legendary
-  { id: 'choose-game',      label: 'Choose Game to Stream Tomorrow',rarity: 'legendary', icon: 'choose-game',      odds:  1.00, premiumOdds: 5.00, redeem: 'Choose Game to Stream Tomorrow' },
+  { id: 'custom-sfx',       label: 'Add Custom SFX',                rarity: 'legendary',      icon: 'custom-sfx',       odds:  1.00, premiumOdds: 3.00, redeem: 'Add Custom SFX'        },
   { id: 'free-art',         label: 'Free Art',                      rarity: 'legendary', icon: 'free-art',         odds:  1.00, premiumOdds: 5.00, redeem: 'Free Art'              },
   { id: 'free-art-3d',      label: 'Free Art (3D)',                 rarity: 'legendary', icon: 'free-art-3d',      odds:  1.00, premiumOdds: 5.00, redeem: 'Free Art (3D)'         },
   { id: 'mod',              label: 'Mod',                           rarity: 'legendary', icon: 'mod',              odds:  1.00, premiumOdds: 5.00, redeem: 'Mod'                   },
   // Mythic
+  { id: 'choose-game',      label: 'Choose Game to Stream Tomorrow',rarity: 'mythic', icon: 'choose-game',      odds:     0.10, premiumOdds: 1.00, redeem: 'Choose Game to Stream Tomorrow' },
   { id: 'custom-mc-mod',    label: 'Custom Minecraft Mod',          rarity: 'mythic',    icon: 'custom-mc-mod',    odds:  0.10, premiumOdds: 1.00, redeem: 'Custom Minecraft Mod'  },
   { id: 'shower-stream',    label: 'Shower Stream',                 rarity: 'mythic',    icon: 'shower-stream',    odds:  0.00001, premiumOdds: 0.0001, redeem: 'Shower Stream'         },
   // One of One
