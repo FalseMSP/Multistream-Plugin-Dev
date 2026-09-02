@@ -103,17 +103,27 @@ async function pushMessage(msg) {
 
   const { finalMsg, sideEffects } = await _getPipeline()(msg);
 
-  for (const fn of sideEffects) {
-    try { await fn(); }
-    catch (err) { log.error('[queue] sideEffect error:', err?.message ?? err); }
-  }
-
   if (finalMsg === null) {
     log.debug(`[queue] message suppressed | ${msg.platform} | ${msg.username}`);
+    // Suppressed messages can still have side effects (e.g. first-time-chatter's
+    // own Discord embed) — run them, but there's nothing to wait on afterwards.
+    for (const fn of sideEffects) {
+      Promise.resolve().then(fn).catch(err => log.error('[queue] sideEffect error:', err?.message ?? err));
+    }
     return;
   }
 
+  // Dispatch to consumers (Discord, overlay, dashboard) immediately.
+  // Side effects (Discord webhook sends, rate-limited to 2/sec, etc.) used to
+  // be awaited here BEFORE dispatch, which meant every chat message's arrival
+  // on the dashboard/overlay was delayed by however long those side effects
+  // took. They no longer block delivery — they run concurrently in the
+  // background instead.
   _dispatch(_messageHandlers, finalMsg, 'message');
+
+  for (const fn of sideEffects) {
+    Promise.resolve().then(fn).catch(err => log.error('[queue] sideEffect error:', err?.message ?? err));
+  }
 }
 
 /**

@@ -28,6 +28,7 @@ const {
   pushExternalRedeem,
 } = require('./src/overlay-server');
 const dashboard = require('./src/dashboard');
+const chatEmotes = require('./src/chat-emotes');
 
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
 process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err));
@@ -161,8 +162,30 @@ async function main() {
     }
 
     // Pipeline has already run in queue.pushMessage — msg is the filtered finalMsg.
-    discord.sendChat(msg);
-    dashboard.pushChatMessage(msg);
+    // suppressDiscord: a plugin (e.g. first-time-chatter) already sent its own
+    // Discord embed for this message as a sideEffect — sending it again here
+    // would double-post it.
+    if (!msg.suppressDiscord) discord.sendChat(msg);
+
+    // Build emote segments ONCE here, using the same builder the OBS overlay
+    // uses (src/chat-emotes.js), so the dashboard chat column renders emotes
+    // identically to the overlay instead of falling back to plain text.
+    //
+    // We also deliberately do NOT forward `thirdPartyEmotes` (the full
+    // BTTV/FFZ/7TV word→url map — hundreds of KB, shared across ALL Twitch
+    // messages) into the dashboard entry. Once segments are built we only
+    // need the small resulting segments array; keeping the raw map around
+    // was bloating every dashboard chat entry and, since pushChatMessage
+    // rebroadcasts the whole 200-message buffer on every new message, that
+    // bloat was multiplied 200x per update.
+    const { thirdPartyEmotes, ytEmotes, emotes, suppressDiscord, ...rest } = msg;
+    const segments = chatEmotes.buildSegments(
+      msg.message,
+      msg.platform === 'twitch' ? emotes : undefined,
+      msg.platform === 'youtube' ? (ytEmotes ?? emotes) : undefined,
+      thirdPartyEmotes,
+    );
+    dashboard.pushChatMessage({ ...rest, segments });
   });
   queue.onRedeem((redeem)    => {
     // Mirror redeems into the external pull API (GET /api/redeems).

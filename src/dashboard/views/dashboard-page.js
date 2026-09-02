@@ -1110,13 +1110,18 @@ function buildDashboardPage() {
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === 'widget') {
+        if (msg.type === 'chat-message' && msg.entry) {
+          // Lean, single-message update (see widget-registry.pushChatMessage).
+          // This is now the normal path for live chat — much cheaper than
+          // resending the whole message buffer per line, which used to add
+          // a big serialize/parse/dedupe cost (and therefore visible delay)
+          // to every single chat message on the dashboard.
+          pushChatMessages(msg.platform, [msg.entry]);
+        } else if (msg.type === 'widget') {
           invoke(msg.id, msg.data);
-          // Feed chat column from chat overlay widgets
-          const platform = CHAT_SECTION_IDS[msg.id];
-          if (platform && msg.data && Array.isArray(msg.data.messages)) {
-            pushChatMessages(platform, msg.data.messages);
-          }
+          // Chat overlay widgets are still bootstrapped from their full
+          // snapshot (see below, on connect/reload) but no longer drive the
+          // live per-message path — that's handled by 'chat-message' above.
           // Feed events tab from stream-events widget
           if (msg.id === 'stream-events' && msg.data && Array.isArray(msg.data.events)) {
             pushStreamEvents(msg.data.events);

@@ -23,6 +23,13 @@ const { broadcast } = require('./sse');
 /** @type {Map<string, { title: string, icon: string, order: number, render: string, data: * }>} */
 const _widgets = new Map();
 
+// Monotonic counter for auto-assigned chat message ids. `Date.now()` was
+// used previously, which collides whenever two messages arrive in the same
+// millisecond (common during raids/bot floods) — the dashboard's
+// `list.find(x => x.id === m.id)` dedup then silently drops the second
+// message.
+let _autoId = 0;
+
 /**
  * Register a dashboard widget.
  * @param {string} id     Unique widget id
@@ -69,22 +76,36 @@ function pushChatMessage(msg) {
   const widgetId = `chat-overlay-${msg.platform}`;
   const widget   = _widgets.get(widgetId);
 
-  // Assign a monotonic id if the message doesn't already have one
-  const entry = { ...msg, id: msg.id ?? Date.now() };
+  // Assign a monotonic id if the message doesn't already have one. Must stay
+  // numeric — the dashboard sorts the combined feed with `a.id - b.id`.
+  // Offset it far below Date.now() so auto-ids never collide with any
+  // upstream-provided numeric/timestamp ids.
+  const entry = { ...msg, id: msg.id ?? ++_autoId };
 
   if (widget) {
     const data     = widget.data ?? { messages: [] };
     const messages = [...(data.messages ?? []), entry].slice(-200);
-    updateWidget(widgetId, { ...data, messages });
+    widget.data = { ...data, messages };
   }
 
-  // Also push to the combined widget if it exists
+  // Also keep the combined widget's snapshot in sync if it exists.
   const combined = _widgets.get('chat-overlay-combined');
   if (combined) {
     const data     = combined.data ?? { messages: [] };
     const messages = [...(data.messages ?? []), entry].slice(-200);
-    updateWidget('chat-overlay-combined', { ...data, messages });
+    combined.data = { ...data, messages };
   }
+
+  // Broadcast just the ONE new message rather than re-sending the whole
+  // (up to 200-message) buffer on every chat line. Previously this called
+  // updateWidget() for both the per-platform and combined widgets, each of
+  // which broadcasts its *entire* stored `messages` array to every
+  // connected dashboard client — meaning a single chat line could push
+  // ~200 messages' worth of JSON (multiplied further when messages still
+  // carried the full third-party emote map) over SSE. The dashboard only
+  // ever needs the new message; `widget.data` above still holds the full
+  // snapshot for clients that connect/reload and need to bootstrap.
+  broadcast({ type: 'chat-message', platform: msg.platform, entry });
 }
 
 /** Returns the raw widget Map (used by the dashboard-page builder + /state route). */

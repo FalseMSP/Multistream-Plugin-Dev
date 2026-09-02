@@ -126,27 +126,39 @@ async function processMessage(msg) {
   log.info(`[first-time-chatter] First message from ${msg.username} on ${msg.platform}.`);
 
   // Tag the message so consumers (e.g. the dashboard) can highlight it.
-  const taggedMsg = { ...msg, firstTimer: true };
+  //
+  // suppressDiscord tells index.js's queue.onMessage handler to skip its own
+  // discord.sendChat(msg) call, since we're sending our own styled embed via
+  // sideEffect below. (The old `suppress: true` return value here did
+  // nothing — runPipeline only ever checked `result.message === null` to
+  // suppress, so the plain embed was ALWAYS also sent by index.js, causing
+  // every first-time chatter to get double-posted to Discord.)
+  const taggedMsg = { ...msg, firstTimer: true, suppressDiscord: true };
 
   const webhook = _getWebhook();
 
   if (!webhook) {
     log.warn('[first-time-chatter] No DISCORD_CHAT_WEBHOOK_URL — cannot send first-timer embed.');
-    return { message: taggedMsg }; // degrade gracefully: let the normal send happen
+    // No webhook to send our own embed with, so let the normal send happen.
+    return { message: { ...msg, firstTimer: true } };
   }
 
-  // Send our styled embed ourselves …
+  // Send our styled embed as a side effect instead of awaiting it inline.
+  // Awaiting it here used to block the entire pipeline (and therefore the
+  // dashboard/overlay dispatch) on a Discord API round-trip for every
+  // first-time chatter. Returning it as a sideEffect lets the message reach
+  // the dashboard/overlay immediately while the webhook call happens in the
+  // background (queue.pushMessage runs sideEffects without waiting on them).
   const embed = _buildFirstTimerEmbed(msg.platform, msg.username, msg.message);
-  try {
-    await webhook.send({ embeds: [embed] });
-  } catch (e) {
-    log.error('[first-time-chatter] Failed to send first-timer embed:', e.message);
-    return { message: taggedMsg }; // degrade gracefully
-  }
+  const sideEffect = async () => {
+    try {
+      await webhook.send({ embeds: [embed] });
+    } catch (e) {
+      log.error('[first-time-chatter] Failed to send first-timer embed:', e.message);
+    }
+  };
 
-  // Suppress the plain Discord chat send, but keep the tagged message
-  // flowing through the pipeline so the dashboard can highlight it.
-  return { message: taggedMsg, suppress: true };
+  return { message: taggedMsg, sideEffect };
 }
 
 // ── Export ────────────────────────────────────────────────────────────────
