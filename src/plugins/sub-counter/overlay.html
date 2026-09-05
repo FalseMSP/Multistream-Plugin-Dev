@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sub Counter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800&display=swap">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    background: transparent;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.4s ease, transform 0.4s ease;
+  }
+
+  .row.visible { opacity: 1; transform: translateY(0); }
+
+  .label {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.55);
+    text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  }
+
+  .count {
+    font-size: 26px;
+    font-weight: 800;
+    color: #ffffff;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.85);
+    transition: transform 0.25s ease;
+  }
+
+  .count.bump { transform: scale(1.12); }
+
+  .row.yt .label { color: rgba(255, 90, 90, 0.75); }
+</style>
+</head>
+<body>
+<div id="stack">
+  <div class="row yt" id="row-yt">
+    <span class="label">Subs</span>
+    <span class="count" id="count-yt">—</span>
+  </div>
+</div>
+
+<script>
+  const row   = document.getElementById('row-yt');
+  const count = document.getElementById('count-yt');
+  let last = null;
+
+  function fmt(n) {
+    return Number(n).toLocaleString('en-US');
+  }
+
+  function apply(data) {
+    if (!data || data.yt == null) return;
+    const val = data.yt;
+    row.classList.add('visible');
+    if (last !== val) {
+      count.textContent = fmt(val);
+      if (last !== null) {
+        count.classList.remove('bump');
+        void count.offsetWidth; // restart animation
+        count.classList.add('bump');
+      }
+      last = val;
+    }
+  }
+
+  function connect() {
+    const es = new EventSource('/sse');
+    es.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === 'section' && payload.id === 'sub-counter') apply(payload.data);
+      } catch (err) {
+        console.error('[sub-counter] parse error', err);
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>

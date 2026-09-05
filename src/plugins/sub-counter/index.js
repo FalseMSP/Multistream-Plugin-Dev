@@ -26,6 +26,11 @@
 
 const log       = require('../../logger');
 const dashboard = require('../../dashboard');
+const overlay   = require('../../overlay-server');
+const fs        = require('fs');
+const path      = require('path');
+
+const OVERLAY_HTML = path.resolve(__dirname, 'overlay.html');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -104,11 +109,34 @@ dashboard.registerWidget('sub-counter', {
 });
 
 function _notifyDashboard() {
-  dashboard.updateWidget('sub-counter', {
+  const data = {
     yt: _state[VOICE_CHANNEL_ID].count,
     tw: _state[FOLLOWER_CHANNEL_ID].count,
-  });
+  };
+  dashboard.updateWidget('sub-counter', data);
+  overlay.updateSection('sub-counter', data);
 }
+
+// ── OBS overlay ───────────────────────────────────────────────────────────────
+// Minimalist standalone browser-source page — separate from the dashboard
+// widget above so it can be sized/positioned independently in OBS.
+
+overlay.registerSection('sub-counter', {
+  title: 'Sub Counter',
+  order: 50,
+  render: (function render() {}).toString(), // unused — standalone page has its own renderer
+});
+
+overlay.addRoute('/sub-counter', (req, res) => {
+  try {
+    const html = fs.readFileSync(OVERLAY_HTML, 'utf8');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  } catch (e) {
+    log.error('[sub-counter] Could not read overlay.html:', e.message);
+    res.writeHead(500); res.end('Sub counter overlay not found');
+  }
+});
 
 
 
