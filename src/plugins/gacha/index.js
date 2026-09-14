@@ -55,6 +55,16 @@ const LOOT_TABLE = [
 
 const DUD_COUNT = 2; // dud1.mp4, dud2.mp4
 
+// Maximum number of cells in a single grid reveal. If a trigger asks for
+// more than this (e.g. 500 bits = 5 pulls, fine — but 5000 bits = 50 pulls,
+// too many for one grid), we split into multiple batches of MAX_GRID_SIZE
+// each (last batch may be smaller) and queue them one after another via
+// _pullQueue. Each batch plays out as its own ~14s grid reveal animation.
+//
+// 25 → 5×5 grid, fills the 1920×1080 stage nicely without cells getting
+// too small to read.
+const MAX_GRID_SIZE = 25;
+
 // ─── Pull logic ──────────────────────────────────────────────────────────────
 
 function roll(isPremium) {
@@ -103,10 +113,56 @@ registerSection('gacha', {
 // ─── State helpers ────────────────────────────────────────────────────────────
 
 let _pullActive = false;
-const _pullQueue = []; // { user, isPremium }
+const _pullQueue = []; // { user, isPremium, count?, users? }
 
 function pushState(state, extra = {}) {
   updateSection('gacha', { state, ...extra });
+}
+
+// ─── Result listener registry ──────────────────────────────────────────────────
+// Plugins can register a callback via gacha.onResult(cb) to be notified
+// every time a pull completes (single OR grid). Each callback is called
+// with one result object: { id, user, label, rarity, isDud, timestamp }.
+// Used by the gacha-results dashboard widget to populate its list.
+const _resultListeners = [];
+function onResult(cb) {
+  if (typeof cb === 'function') _resultListeners.push(cb);
+}
+function _emitResult(result) {
+  for (const cb of _resultListeners) {
+    try { cb(result); } catch (e) { log.error('[gacha] onResult listener threw:', e.message); }
+  }
+}
+
+// Monotonic id for results so the dashboard widget has stable keys.
+let _resultId = 0;
+function _nextResultId() { return ++_resultId; }
+
+// ─── Gifted-sub batcher ────────────────────────────────────────────────────────
+// Twitch sends each gifted-sub recipient as a separate `channel.subscribe`
+// event with `is_gift: true`. Without batching, a 25-sub gift would
+// queue 25 sequential 14s pulls = ~6 minutes. Instead, we collect all
+// gifted subs that arrive within GIFT_BATCH_MS of the first one into a
+// single batch, then triggerGridPull with the collected usernames so the
+// overlay shows one grid reveal (auto-split into MAX_GRID_SIZE chunks
+// if the batch is bigger than 25) instead of N sequential single pulls.
+const GIFT_BATCH_MS = 2000;
+let _giftBatch = { timer: null, users: [] };
+
+function _flushGiftBatch() {
+  _giftBatch.timer = null;
+  const users = _giftBatch.users;
+  _giftBatch.users = [];
+  if (users.length === 0) return;
+  log.info(`[gacha] Flushing gifted-sub batch of ${users.length} recipient(s): ${users.join(', ')}`);
+  triggerGridPull({ users, isPremium: true });
+}
+
+function _queueGiftedSub(user) {
+  _giftBatch.users.push(user);
+  if (!_giftBatch.timer) {
+    _giftBatch.timer = setTimeout(_flushGiftBatch, GIFT_BATCH_MS);
+  }
 }
 
 // ─── Internal: play one pull immediately ─────────────────────────────────────
@@ -143,6 +199,16 @@ function _executePull({ user, isPremium }) {
   setTimeout(() => {
     pushState('result', {
       result: { rarity: item.rarity, label: item.label, user },
+    });
+
+    // Emit the result so plugins like gacha-results can record it.
+    _emitResult({
+      id:        _nextResultId(),
+      user:      user,
+      label:     isDud ? '(Dud)' : item.label,
+      rarity:    item.rarity,
+      isDud:     isDud,
+      timestamp: new Date(),
     });
 
     // Fire the item's associated redeem as soon as the icon is revealed,
@@ -196,8 +262,13 @@ function _startNextQueued() {
 // through _executePull, this rolls everything up front and reveals all
 // items simultaneously in a grid on the overlay.
 
-function _executeGridPull({ user, count, isPremium }) {
+function _executeGridPull({ user, count, isPremium, users }) {
   _pullActive = true;
+
+  // `users` is an optional array of usernames, one per pull, so each grid
+  // cell can be attributed to a different recipient (used by the gifted-sub
+  // batcher). If absent, all cells are attributed to the single `user`.
+  const hasPerItemUsers = Array.isArray(users) && users.length >= count;
 
   const items = [];
   for (let i = 0; i < count; i++) {
@@ -211,25 +282,47 @@ function _executeGridPull({ user, count, isPremium }) {
       videoFile = `/gachavids/${item.rarity}.mp4`;
     }
     const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
+    const itemUser = hasPerItemUsers ? users[i] : user;
     items.push({
       videoFile, iconPath,
       rarity: item.rarity, label: item.label, isDud,
       redeem: item.redeem,
+      user:   itemUser,
     });
   }
 
-  log.info(`[gacha] ${user} grid pull (${isPremium ? 'premium' : 'standard'}) x${count}: ${items.map(i => i.label).join(', ')}`);
+  // For the header line: if all items share the same user, show that
+  // user; otherwise show "N viewers".
+  const headerUser = hasPerItemUsers
+    ? (items.every(it => it.user === items[0].user) ? items[0].user : `${count} viewers`)
+    : user;
 
-  pushState('grid', { user, items });
+  log.info(`[gacha] ${headerUser} grid pull (${isPremium ? 'premium' : 'standard'}) x${count}: ${items.map(i => i.label).join(', ')}`);
+
+  pushState('grid', { user: headerUser, items });
 
   setTimeout(() => {
+    // Emit each item as a separate result (after the icon reveal).
+    for (const item of items) {
+      _emitResult({
+        id:        _nextResultId(),
+        user:      item.user,
+        label:     item.isDud ? '(Dud)' : item.label,
+        rarity:    item.rarity,
+        isDud:     item.isDud,
+        timestamp: new Date(),
+      });
+    }
+
     // Fire each item's associated redeem as the icons are revealed, same
-    // as a normal single pull, so plugins like sfx pick them up.
+    // as a normal single pull, so plugins like sfx pick them up. Each
+    // redeem is attributed to that item's user (per-recipient for
+    // gifted-sub batches).
     for (const item of items) {
       if (item.isDud || !item.redeem) continue;
       if (_queue) {
         _queue.pushRedeem({
-          username:  user,
+          username:  item.user,
           title:     item.redeem,
           cost:      0,
           input:     null,
@@ -251,16 +344,63 @@ function _executeGridPull({ user, count, isPremium }) {
  * Trigger `count` pulls that reveal all at once in a grid, instead of one
  * after another. Falls back to a normal single pull when count <= 1.
  * Queues behind any pull/grid already in progress, same as triggerPull.
+ *
+ * If `count` exceeds MAX_GRID_SIZE, this AUTOMATICALLY splits into
+ * multiple batches of MAX_GRID_SIZE each (last batch may be smaller).
+ * Each batch plays as its own ~14s grid reveal, queued back-to-back via
+ * _pullQueue. So /pull count:50 = two 25-cell grids, one after another.
  */
-function triggerGridPull({ user, count = 1, isPremium = false }) {
-  if (count <= 1) return triggerPull({ user, isPremium });
-
-  if (_pullActive) {
-    _pullQueue.push({ user, count, isPremium });
-    log.info(`[gacha] Grid pull queued for ${user} x${count} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
-    return;
+function triggerGridPull({ user, count = 1, isPremium = false, users }) {
+  // If `users` array is provided, it overrides `count` — one pull per
+  // user, each attributed to a different recipient (gifted-sub batcher).
+  if (Array.isArray(users) && users.length > 0) {
+    count = users.length;
   }
-  _executeGridPull({ user, count, isPremium });
+  if (count <= 1) {
+    // Single pull — but if a specific user was provided via `users[0]`,
+    // use that instead of the bare `user`.
+    const singleUser = Array.isArray(users) && users.length === 1 ? users[0] : user;
+    return triggerPull({ user: singleUser, isPremium });
+  }
+
+  // Split into batches of MAX_GRID_SIZE. For count <= MAX_GRID_SIZE this
+  // is a single batch and behaves exactly like the old code.
+  const batches = [];
+  let remaining = count;
+  while (remaining > 0) {
+    const size = Math.min(MAX_GRID_SIZE, remaining);
+    batches.push(size);
+    remaining -= size;
+  }
+
+  if (batches.length > 1) {
+    log.info(
+      `[gacha] ${user || '(multi-user)'} grid pull x${count} split into ${batches.length} batches ` +
+      `(${batches.join('+')}) — queued back-to-back.`
+    );
+  }
+
+  // Fire the first batch immediately (or queue it if a pull is active),
+  // and queue the rest. _pullQueue dispatches them in order via
+  // _startNextQueued(), which knows to route {count>1} items back through
+  // _executeGridPull.
+  let offset = 0;
+  for (let i = 0; i < batches.length; i++) {
+    const batchCount = batches[i];
+    // Slice the per-item users array for this batch (if present).
+    const batchUsers = Array.isArray(users) ? users.slice(offset, offset + batchCount) : undefined;
+    offset += batchCount;
+
+    if (i === 0 && !_pullActive) {
+      _executeGridPull({ user, count: batchCount, isPremium, users: batchUsers });
+    } else {
+      _pullQueue.push({ user, count: batchCount, isPremium, users: batchUsers });
+      log.info(
+        `[gacha] Grid pull batch ${i + 1}/${batches.length} (${batchCount} pulls) queued for ${user || '(multi-user)'} ` +
+        `| queue depth: ${_pullQueue.length}`
+      );
+    }
+  }
 }
 
 // ─── Main pull trigger ────────────────────────────────────────────────────────
@@ -341,8 +481,14 @@ function init(context) {
   // queue.js routes bits, subs, resubs, and subgifts through onDonation.
   // type: 'bits'                → premium pull(s): 100 bits = 1 premium pull,
   //                              ≥ 200 bits = grid reveal of (bits/100) pulls
+  //                              (auto-batched into ≤MAX_GRID_SIZE chunks)
   // type: 'sub' | 'resub'      → 1 premium pull for the subscriber
-  // type: 'subgift'            → 1 premium pull per sub gifted (credit gifter)
+  // type: 'subgift'            → 1 premium pull for the GIFTER (regardless
+  //                              of how many subs they gifted). Each
+  //                              recipient gets their own pull via the
+  //                              subsequent `channel.subscribe` event above
+  //                              — so an N-sub gift = 1 gifter pull + N
+  //                              recipient pulls = N+1 total.
   if (typeof q?.onDonation === 'function') {
     q.onDonation(event => {
       const type = event.type;
@@ -367,14 +513,36 @@ function init(context) {
 
       } else if (type === 'sub' || type === 'resub') {
         const user = event.username ?? 'someone';
-        log.info(`[gacha] ${type} from ${user} → 1 premium pull`);
-        triggerPull({ user, isPremium: true });
+        // Gifted subs go through the batcher so a multi-sub gift reveals
+        // all recipient pulls in one (or a few) grid(s) instead of N
+        // sequential ~14s single pulls. Non-gifted subs and resubs
+        // trigger immediately — there's only ever one of them per event.
+        if (type === 'sub' && event.gifted === true) {
+          log.info(`[gacha] Gifted sub from ${user} → queued for batched grid reveal`);
+          _queueGiftedSub(user);
+        } else {
+          log.info(`[gacha] ${type} from ${user} → 1 premium pull`);
+          triggerPull({ user, isPremium: true });
+        }
 
       } else if (type === 'subgift') {
+        // One pull for the gifter, regardless of how many subs they gifted.
+        // Each recipient will get their OWN pull when their `channel.subscribe`
+        // event fires (Twitch sends those separately, with `is_gift: true`),
+        // and the `sub` branch above already triggers 1 pull per subscriber.
+        //
+        // So for a 1-sub gift: 1 pull (gifter, here) + 1 pull (recipient,
+        // via the subsequent sub event) = 2 pulls total, correctly
+        // attributed to each user.
+        // For an N-sub gift: 1 pull (gifter, here) + N pulls (recipients,
+        // via N subsequent sub events) = N+1 pulls total.
         const user  = event.username ?? 'someone'; // gifter
         const count = event.quantity ?? 1;
-        log.info(`[gacha] ${user} gifted ${count} sub(s) → ${count} premium pull(s)`);
-        for (let i = 0; i < count; i++) triggerPull({ user, isPremium: true });
+        log.info(
+          `[gacha] ${user} gifted ${count} sub(s) → 1 premium pull for gifter ` +
+          `(recipients get their own pulls via subsequent sub events)`
+        );
+        triggerPull({ user, isPremium: true });
       }
     });
   } else {
@@ -417,4 +585,6 @@ module.exports = {
   processMessage,
   triggerPull,
   triggerGridPull,
+  MAX_GRID_SIZE, // exported so premium-roll can compute batch counts
+  onResult,     // exported so gacha-results widget can subscribe to pulls
 };

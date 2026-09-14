@@ -220,6 +220,21 @@
     text-shadow: 0 0 10px var(--rarity-glow, rgba(255,255,255,0.8));
   }
 
+  /* Per-cell recipient name (used by the gifted-sub batcher — each cell
+     can be attributed to a different recipient). Hidden by default;
+     shown when the grid item carries its own `user` field. */
+  .grid-cell .grid-recipient {
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.75);
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 4px;
+  }
+
   #grid-user {
     position: absolute;
     bottom: 16px; left: 0; right: 0;
@@ -350,6 +365,19 @@ function handleGridPull(data) {
       labelEl.className = 'grid-label';
       labelEl.textContent = item.label || '';
       iconWrapEl.appendChild(labelEl);
+
+      // Per-cell recipient name. Only shown when the item carries its
+      // own `user` field (i.e. the grid came from the gifted-sub batcher,
+      // where each cell is a different recipient). When the grid is for
+      // a single user (bits cheer, /pull command), the header line below
+      // the grid already shows the name and we skip the per-cell line to
+      // avoid redundancy.
+      if (item.user) {
+        const recipientEl = document.createElement('div');
+        recipientEl.className = 'grid-recipient';
+        recipientEl.textContent = '↳ ' + item.user;
+        iconWrapEl.appendChild(recipientEl);
+      }
 
       cell.appendChild(iconWrapEl);
 

@@ -134,14 +134,17 @@ function init(context) {
       `Matched via ${matchedByTitle ? `title "${title}"` : ''}${(matchedByTitle && matchedByType) ? ' + ' : ''}${matchedByType ? `rewardType "${rewardType}"` : ''}`
     );
 
-    // Immediate toast so the viewer sees their power-up was received.
-    _send('twitch',  `@${user} ✨ Power-up activated! Routing to premium-roll…`);
-    _send('youtube', `@${user} ✨ Power-up activated! Routing to premium-roll…`);
-
+    // NOTE: We intentionally do NOT send a chat announcement here.
+    // The overlay animation IS the announcement — sending chat text on
+    // every power-up redemption (and again from premium-roll, and again
+    // from the bits handler) spammed chat with three near-identical
+    // "✨ Triggering…" messages per pull. Just log it + hand off to
+    // premium-roll silently.
+    //
     // Hand off to the premium-roll plugin. Same code path as the /pull
     // Discord slash command, and identical in effect to a 100-bit cheer:
-    // one premium pull (with chat announcement) after a short delay.
-    // delayMs=1500 keeps the historical pacing.
+    // one premium pull after a short delay. delayMs=1500 keeps the
+    // historical pacing.
     premiumRoll.triggerPremiumPull(user, { delayMs: 1500 });
   });
 

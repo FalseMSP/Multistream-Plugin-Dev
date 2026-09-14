@@ -23,9 +23,13 @@ const log    = require('../../logger');
 const gacha  = require('../gacha');
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
-// Hard cap so a misclicked /pull count 9999 doesn't lock the overlay for
-// 20 minutes. 25 cells is already a 5×5 grid — plenty.
-const MAX_PULL_COUNT = 25;
+// Hard cap on the /pull slash command's `count` option. This is just to
+// prevent a misclicked `/pull count:99999` from locking the overlay for
+// hours — gacha.triggerGridPull now AUTO-SPLITS into batches of
+// gacha.MAX_GRID_SIZE (25) and queues them back-to-back, so values >25
+// are fine and produce multiple sequential grid reveals. 100 = 4 batches
+// of 25 = ~1 minute of grid reveals, which is plenty for any manual use.
+const MAX_PULL_COUNT = 100;
 
 // ─── Chat reply ───────────────────────────────────────────────────────────────
 
@@ -57,9 +61,20 @@ function onChatReady(chatReply) {
 //   • gacha-powerup-pull (Twitch "Gacha Pull" Power-up → 100-bit equivalent)
 //
 // opts.count   — number of pulls (default 1). ≥ 2 → grid reveal.
-// opts.delayMs — ms to wait before triggering the gacha animation, so the
-//                chat announcement lands first. Default 2000 (matches the
-//                historical behaviour). gacha-powerup-pull passes 1500.
+// opts.delayMs — ms to wait before triggering the gacha animation, so any
+//                upstream toast lands first. Default 2000.
+//                gacha-powerup-pull passes 1500.
+//
+// NOTE: We intentionally do NOT send a chat announcement from here.
+// Previously this fired one of:
+//   "@<user> ✨ Triggering a premium gacha pull…"
+//   "@<user> ✨ Triggering N PREMIUM gacha pulls — grid reveal incoming!"
+// and gacha-powerup-pull fired a separate
+//   "@<user> ✨ Power-up activated! Routing to premium-roll…"
+// which combined with the bits/sub handlers meant chat got spammed with
+// 3 near-identical "✨ Triggering…" messages per pull. The overlay
+// animation IS the announcement now — log lines still record what
+// happened for debugging.
 //
 function triggerPremiumPull(user, opts = {}) {
   const count = Math.max(1, Math.min(MAX_PULL_COUNT, Math.trunc(opts.count ?? 1) || 1));
@@ -70,12 +85,6 @@ function triggerPremiumPull(user, opts = {}) {
   log.info(
     `[premium-roll] Triggering ${isGrid ? `grid of ${count} premium pulls` : 'a premium pull'} for ${user}.`
   );
-
-  const announcement = isGrid
-    ? `@${user} ✨ Triggering ${count} PREMIUM gacha pulls — grid reveal incoming!`
-    : `@${user} ✨ Triggering a premium gacha pull…`;
-  _send('twitch',  announcement);
-  _send('youtube', announcement);
 
   setTimeout(() => {
     if (isGrid) {
@@ -121,6 +130,17 @@ async function handleInteraction(interaction) {
 
   const { isGrid } = triggerPremiumPull(user, { count });
 
+  // Compute batch info for the ephemeral reply so the mod knows what to
+  // expect on the overlay. count > gacha.MAX_GRID_SIZE triggers multiple
+  // sequential grid reveals.
+  const maxGrid = gacha.MAX_GRID_SIZE ?? 25;
+  if (isGrid && count > maxGrid) {
+    const batches = Math.ceil(count / maxGrid);
+    return interaction.editReply(
+      `✨ Triggered **${count}** premium gacha pulls for **${user}** — ` +
+      `split into ${batches} grid batches of up to ${maxGrid} each, queued back-to-back.`
+    );
+  }
   return interaction.editReply(
     isGrid
       ? `✨ Triggered **${count}** premium gacha pulls for **${user}** — grid reveal.`

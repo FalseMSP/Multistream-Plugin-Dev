@@ -544,18 +544,27 @@ function handleEventSubNotification(type, event, queue) {
       break;
 
     case 'channel.subscription.gift':
-      for (let i = 0; i < event.total; i++) {
-        queue.pushDonation({
-          platform:   'twitch',
-          type:       'subgift',
-          username:   event.user_name ?? 'anonymous',
-          recipient:  null,
-          tier:       event.tier,
-          quantity:   1,
-          cumulative: event.cumulative_total ?? null,
-          timestamp:  new Date(),
-        });
-      }
+      // EventSub fires ONE event per gift transaction, with `event.total`
+      // being the number of subs in this gift (NOT cumulative). Send a
+      // single donation event with `quantity: event.total` so downstream
+      // consumers can render it as one "X gifted 5 subs!" embed / one
+      // gacha grid reveal / one TNT award of (5 × TNT_PER_EVENT), etc.
+      // (Previously this looped `event.total` times pushing quantity:1
+      // each iteration, which spammed Discord with N embeds per gift and
+      // prevented the gacha grid reveal from firing.)
+      //
+      // Recipients aren't known at this point — Twitch sends them later
+      // as individual `channel.subscribe` events with `is_gift: true`.
+      queue.pushDonation({
+        platform:   'twitch',
+        type:       'subgift',
+        username:   event.user_name ?? 'anonymous',
+        recipient:  null,
+        tier:       event.tier,
+        quantity:   Math.max(1, Number(event.total) || 1),
+        cumulative: event.cumulative_total ?? null,
+        timestamp:  new Date(),
+      });
       log.info(`[Twitch] Sub gift: ${event.user_name} gifted ${event.total} subs`);
       break;
 
