@@ -3,75 +3,108 @@
 /**
  * gacha-powerup-pull plugin
  * ─────────────────────────
- * Hooks into Twitch Power-ups. Specifically, when a viewer triggers a
- * "Gacha Pull" Power-up (a bits-funded automatic reward redemption — see
- * src/twitch.js's `channel.channel_points_automatic_reward_redemption.add`
- * and `channel.bits.use` subscriptions), this fires a PREMIUM gacha pull by
- * activating the `premium-roll` plugin — exactly the same code path used by
- * the manual `/pull` Discord slash command, and the same effect as cheering
- * 100 bits (one premium pull, plus the chat announcement).
+ * Hooks into Twitch custom Power-ups. When a viewer triggers a "Gacha Pull"
+ * Power-up (a bits-funded custom Power-up redemption — see src/twitch.js's
+ * `channel.custom_power_up_redemption.add` subscription), this fires a
+ * PREMIUM gacha pull by activating the `premium-roll` plugin — exactly the
+ * same code path used by the manual `/pull` Discord slash command.
  *
- * Routing through `premium-roll.triggerPremiumPull(user)` means:
+ * COUNT SUPPORT: titles can carry a count suffix to trigger multiple pulls
+ * at once (revealed as a grid). Examples:
+ *   "Gacha Pull"         → 1 premium pull
+ *   "Gacha Pull (x16)"   → 16 premium pulls (one 4×4 grid reveal)
+ *   "Gacha Pull x8"      → 8 premium pulls
+ *   "gachapull x25"      → 25 premium pulls (one 5×5 grid reveal)
+ * After normalisation, "Gacha Pull (x16)" becomes "gacha pull x16", which
+ * the regex below matches with count=16. Counts >25 auto-split into
+ * batches of 25 (handled by gacha.triggerGridPull).
+ *
+ * Routing through `premium-roll.triggerPremiumPull(user, { count })` means:
  *   • The power-up "activates the gacha pull premium plugin" (premium-roll),
  *     not the bare gacha engine.
- *   • The chat announcement is sent from one place, with the same wording
- *     whether the trigger was a Discord slash command or a Twitch power-up.
  *   • If `/pull` ever grows new behaviour (logging, sound effect, etc.),
  *     the power-up automatically gets the same behaviour for free.
  *
  * This is deliberately separate from the plain channel-points "Gacha Pull"
  * reward already handled by the `gacha` plugin (which gives a STANDARD pull
  * for channel points). Power-ups cost real bits, so redeeming one should
- * feel like the premium tier — matching the 100-bits-cheer behaviour.
+ * feel like the premium tier.
  *
  * Requires: src/twitch.js subscribes to
- * `channel.channel_points_automatic_reward_redemption.add`,
- * `channel.bits.use`, AND `channel.custom_power_up_redemption.add`
- * (the dedicated custom-Power-up event), then pushes those events through
- * `queue.pushRedeem(...)` with `source: 'power_up'` (and, for custom
- * power-ups, `rewardType: 'custom_power_up'`).
+ * `channel.custom_power_up_redemption.add` and pushes those events through
+ * `queue.pushRedeem(...)` with `source: 'power_up'` and
+ * `rewardType: 'custom_power_up'`. (channel.bits.use is NO LONGER
+ * subscribed — see twitch.js for the double-counting audit.)
  */
 
 const log          = require('../../logger');
 const premiumRoll  = require('../premium-roll');
 
-// Title(s) that should count as the "Gacha Pull" power-up. Twitch's payload
-// naming isn't fully predictable here — a custom Power-up may report a
-// friendly title ("Gacha Pull"), while built-in ones only report a type
-// enum. Matching is done after aggressively normalising (lowercase,
-// collapse all non-alphanumeric runs to a single space), so "Gacha_Pull",
-// "gacha-pull", "GachaPull", etc. all resolve to the same string.
+// ─── Title matching ──────────────────────────────────────────────────────────
 //
-// 'custom power up' is included as a TEMPORARY catch-all: when a custom
-// Power-up redemption arrives via the dedicated
-// `channel.custom_power_up_redemption.add` EventSub (added in twitch.js),
-// Twitch doesn't always populate `event.reward.title`, so twitch.js falls
-// back to the literal string "Custom Power-Up" as the redeem title. That
-// normalises to "custom power up" — so any custom Power-up that doesn't
-// carry an explicit title gets treated as a gacha pull for now.
+// Matching is done after aggressively normalising (lowercase, collapse all
+// non-alphanumeric runs to a single space), so "Gacha_Pull", "gacha-pull",
+// "GachaPull", "Gacha Pull (x16)", etc. all resolve cleanly:
+//   "Gacha Pull"         → "gacha pull"
+//   "Gacha Pull (x16)"   → "gacha pull x16"   (parens → spaces, collapsed)
+//   "gachapull"          → "gachapull"
+//   "Gacha Pull x8"      → "gacha pull x8"
 //
-// TODO: once Twitch's payload reliably gives each custom Power-up a
-// distinct title, drop 'custom power up' from this list and match on the
-// real per-Power-up titles instead.
+// The regex below matches the "Gacha Pull" family with an OPTIONAL count
+// suffix:
+//   • \s* between "gacha" and "pull" allows "gachapull" (no separator).
+//   • (?:\s+x(\d+))? captures the count when present (e.g. "x16" → 16).
+//
+// Examples:
+//   "gacha pull"         → match, count=1
+//   "gacha pull x16"     → match, count=16
+//   "gachapull"          → match, count=1
+//   "gachapull x25"      → match, count=25
+//   "gacha pull powerup" → NO match (falls through to static list below)
+//   "custom power up"    → NO match (the fallback title is NOT accepted —
+//                          we require the real power-up title now that
+//                          twitch.js reads event.custom_power_up.title)
+const GACHA_PULL_RE = /^gacha\s*pull(?:\s+x(\d+))?$/;
+
+// Static fallback aliases for titles that don't fit the regex above.
+// count=1 for all of these (no count suffix supported on the short forms).
 const GACHA_POWERUP_TITLES = [
-  'gacha pull',           // friendly title (e.g. "Gacha Pull")
-  'gachapull',            // no-separator variant
-  'gacha pull powerup',   // explicit suffix
   'gacha',                // short form
-  'custom power up',      // ← TEMPORARY: fallback title for any custom Power-up
+  'gacha pull powerup',   // explicit suffix
 ];
 
-// Twitch-side `rewardType` values that should also trigger a premium pull,
-// independent of the (often missing) title. `custom_power_up` is set by
-// twitch.js's `channel.custom_power_up_redemption.add` handler. This is a
-// second matching path so we still trigger even if the title field is empty
-// or unparseable.
-const GACHA_POWERUP_REWARD_TYPES = ['custom_power_up'];
+// Hard cap on the count extracted from titles like "Gacha Pull (x200)".
+// Matches premium-roll's MAX_PULL_COUNT. Larger values get clamped.
+const MAX_PULL_COUNT = 100;
 
-// Keep a chat-reply reference so we can still send a power-up-specific
-// acknowledgement just before handing off to premium-roll. (premium-roll
-// also sends its own announcement — that's fine; one is the immediate
-// "Power-up detected" toast, the other is the "rolling now" message.)
+/**
+ * Test a redeem title against the gacha-pull patterns.
+ * @param {string} rawTitle
+ * @returns {{ matched: boolean, count: number, matchedAs: string|null }}
+ *   matchedAs is a short human-readable hint for logging, e.g.
+ *   'regex count=16', 'regex single', 'static'.
+ */
+function _matchPullTitle(rawTitle) {
+  const t = _normaliseTitle(rawTitle);
+
+  // Try the regex first: "gacha pull", "gachapull", "gacha pull x16", etc.
+  const m = t.match(GACHA_PULL_RE);
+  if (m) {
+    const raw = m[1] ? parseInt(m[1], 10) : 1;
+    const count = Math.max(1, Math.min(MAX_PULL_COUNT, raw));
+    return { matched: true, count, matchedAs: m[1] ? `regex count=${count}` : 'regex single' };
+  }
+
+  // Fall back to the static title list.
+  if (GACHA_POWERUP_TITLES.includes(t)) {
+    return { matched: true, count: 1, matchedAs: 'static' };
+  }
+
+  return { matched: false, count: 0, matchedAs: null };
+}
+
+// ─── Chat reply (kept for future use, currently unused) ──────────────────────
+
 let _chatReply = { twitch: null, youtube: null };
 
 function _send(platform, text) {
@@ -100,6 +133,8 @@ function _normaliseTitle(raw) {
     .trim();
 }
 
+// ─── Init ────────────────────────────────────────────────────────────────────
+
 function init(context) {
   const q = context.queue;
   if (typeof q?.onRedeem !== 'function') {
@@ -116,43 +151,40 @@ function init(context) {
     const raw = redeem.title ?? redeem.rewardType;
     if (!raw) return;
 
-    const title = _normaliseTitle(raw);
-    const rewardType = redeem.rewardType ?? null;
-    const matchedByTitle = GACHA_POWERUP_TITLES.includes(title);
-    const matchedByType  = rewardType && GACHA_POWERUP_REWARD_TYPES.includes(rewardType);
+    const { matched, count, matchedAs } = _matchPullTitle(raw);
 
-    if (!matchedByTitle && !matchedByType) {
+    if (!matched) {
       log.debug(
-        `[gacha-powerup-pull] Ignoring power-up redeem with unmatched title: "${raw}" (normalised: "${title}", rewardType: "${rewardType}")`
+        `[gacha-powerup-pull] Ignoring power-up redeem with unmatched title: "${raw}" (rewardType: "${redeem.rewardType ?? null}")`
       );
       return;
     }
 
     const user = redeem.user ?? redeem.username ?? 'someone';
     log.info(
-      `[gacha-powerup-pull] Gacha Pull power-up used by ${user} → premium-roll (same as 100 bits). ` +
-      `Matched via ${matchedByTitle ? `title "${title}"` : ''}${(matchedByTitle && matchedByType) ? ' + ' : ''}${matchedByType ? `rewardType "${rewardType}"` : ''}`
+      `[gacha-powerup-pull] Gacha Pull power-up used by ${user} → premium-roll ` +
+      `(count=${count}, matched via ${matchedAs}).`
     );
 
     // NOTE: We intentionally do NOT send a chat announcement here.
     // The overlay animation IS the announcement — sending chat text on
-    // every power-up redemption (and again from premium-roll, and again
-    // from the bits handler) spammed chat with three near-identical
-    // "✨ Triggering…" messages per pull. Just log it + hand off to
+    // every power-up redemption spammed chat. Just log + hand off to
     // premium-roll silently.
     //
     // Hand off to the premium-roll plugin. Same code path as the /pull
-    // Discord slash command, and identical in effect to a 100-bit cheer:
-    // one premium pull after a short delay. delayMs=1500 keeps the
-    // historical pacing.
-    premiumRoll.triggerPremiumPull(user, { delayMs: 1500 });
+    // Discord slash command. count=1 → single pull; count>1 → grid
+    // reveal (auto-split into batches of 25 by gacha.triggerGridPull).
+    // delayMs=1500 keeps the historical pacing.
+    premiumRoll.triggerPremiumPull(user, { count, delayMs: 1500 });
   });
 
-  log.info('[gacha-powerup-pull] Loaded — listening for the "Gacha Pull" Power-up → routes through premium-roll.');
+  log.info('[gacha-powerup-pull] Loaded — listening for "Gacha Pull" Power-ups (incl. counted variants like "Gacha Pull (x16)") → routes through premium-roll.');
 }
 
 module.exports = {
   id: 'gacha-powerup-pull',
   init,
   onChatReady,
+  // Exported for testing / external use:
+  _matchPullTitle,
 };
