@@ -424,10 +424,8 @@ const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha'];
 // Channel Point reward title(s) that trigger a premium pull.
 const PREMIUM_REDEEM_TITLES  = ['gacha premium pull', 'gacha premium'];
 
-// Bits threshold for one pull (100 bits = 1 premium pull, ≥ 200 = grid).
-// Matches the manual /pull Discord command and the Twitch "Gacha Pull"
-// Power-up (which routes through premium-roll).
-const BITS_PER_PULL = 100;
+// (BITS_PER_PULL removed — plain bits cheers no longer trigger gacha pulls.
+//  Use custom Power-ups like "Gacha Pull" or "Gacha Pull (x16)" instead.)
 
 // ─── Chat / redeem integration ────────────────────────────────────────────────
 
@@ -477,11 +475,19 @@ function init(context) {
     log.warn('[gacha] context.queue.onRedeem not available — redeem triggers disabled');
   }
 
-  // ── Bits & Subs via onDonation ───────────────────────────────────────────
-  // queue.js routes bits, subs, resubs, and subgifts through onDonation.
-  // type: 'bits'                → premium pull(s): 100 bits = 1 premium pull,
-  //                              ≥ 200 bits = grid reveal of (bits/100) pulls
-  //                              (auto-batched into ≤MAX_GRID_SIZE chunks)
+  // ── Subs via onDonation ──────────────────────────────────────────────────────────────
+  // queue.js routes subs, resubs, and subgifts through onDonation.
+  //
+  // NOTE: Plain bits cheers NO LONGER trigger gacha pulls. Previously
+  // 100 bits = 1 pull, 200+ bits = grid reveal. That's been removed —
+  // bits are just bits now. Pulls come from:
+  //   • Custom Power-ups ("Gacha Pull", "Gacha Pull (x16)", etc.)
+  //     → gacha-powerup-pull plugin → premium-roll
+  //   • Sub / resub           → 1 premium pull for the subscriber
+  //   • Subgift               → 1 premium pull for the GIFTER (each
+  //                           recipient gets their own pull via the
+  //                           subsequent `channel.subscribe` event)
+  //
   // type: 'sub' | 'resub'      → 1 premium pull for the subscriber
   // type: 'subgift'            → 1 premium pull for the GIFTER (regardless
   //                              of how many subs they gifted). Each
@@ -493,25 +499,7 @@ function init(context) {
     q.onDonation(event => {
       const type = event.type;
 
-      if (type === 'bits') {
-        const bits  = event.amount ?? 0;
-        const user  = event.username ?? 'someone';
-        const pulls = Math.floor(bits / BITS_PER_PULL);
-        if (pulls < 1) return;
-        if (pulls > 1) {
-          // Big cheer (≥ 200 bits) — reveal all pulls at once in a grid
-          // instead of queuing them one after another.
-          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} premium pull(s) as a grid reveal`);
-          triggerGridPull({ user, count: pulls, isPremium: true });
-        } else {
-          // Exactly 100 bits (or sub-200 cheer that rounds to 1 pull):
-          // single premium pull — same effect as the gacha-powerup-pull
-          // path which routes through premium-roll.
-          log.info(`[gacha] ${user} cheered ${bits} bits → 1 premium pull`);
-          triggerPull({ user, isPremium: true });
-        }
-
-      } else if (type === 'sub' || type === 'resub') {
+      if (type === 'sub' || type === 'resub') {
         const user = event.username ?? 'someone';
         // Gifted subs go through the batcher so a multi-sub gift reveals
         // all recipient pulls in one (or a few) grid(s) instead of N
@@ -563,7 +551,7 @@ function init(context) {
 
   log.info('[gacha] Plugin loaded. Standard redeems:', STANDARD_REDEEM_TITLES.join(', '));
   log.info('[gacha] Premium redeems:', PREMIUM_REDEEM_TITLES.join(', '));
-  log.info(`[gacha] Bits per pull: ${BITS_PER_PULL} | Subs → premium pull`);
+  log.info('[gacha] Subs/resubs → 1 premium pull | Subgifts → 1 gifter pull + N recipient pulls');
 }
 
 async function processMessage(msg) {
