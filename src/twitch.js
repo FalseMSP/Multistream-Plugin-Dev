@@ -379,6 +379,14 @@ async function setupEventSub(callbackUrl, secret) {
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.channel_points_custom_reward_redemption.add', '1');
 
+    // Automatic Reward Redemptions cover both Twitch's built-in default
+    // rewards (e.g. "Highlight My Message") AND bits-funded Power-ups
+    // (Celebration, Gigantify an Emote, and custom Power-ups such as a
+    // "Gacha Pull" power-up). These never go through the custom_reward
+    // redemption event above, so they need their own subscription.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.channel_points_automatic_reward_redemption.add', '1');
+
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.cheer', '1');
 
@@ -426,6 +434,27 @@ function handleEventSubNotification(type, event, queue) {
       });
       log.info(`[Twitch] Redeem: ${event.user_name} → "${event.reward.title}" (${event.reward.cost} pts)`);
       break;
+
+    case 'channel.channel_points_automatic_reward_redemption.add': {
+      // Covers Twitch default rewards AND bits-funded Power-ups (including
+      // custom Power-ups like a streamer-defined "Gacha Pull"). The reward
+      // doesn't always carry a human title the way custom rewards do, so we
+      // fall back to `reward.type` (Twitch's enum, e.g. "gigantify_an_emote")
+      // with underscores turned into spaces.
+      const rewardTitle = event.reward?.title
+        || (event.reward?.type ? String(event.reward.type).replace(/_/g, ' ') : 'Power-Up');
+      queue.pushRedeem({
+        username:   event.user_name,
+        title:      rewardTitle,
+        cost:       event.reward?.cost ?? 0,
+        input:      event.message?.text || event.user_input || null,
+        timestamp:  new Date(event.redeemed_at),
+        source:     'power_up',
+        rewardType: event.reward?.type ?? null,
+      });
+      log.info(`[Twitch] Power-up/automatic redeem: ${event.user_name} → "${rewardTitle}"`);
+      break;
+    }
 
     case 'channel.cheer':
       queue.pushDonation({
