@@ -161,6 +161,11 @@
     overflow: hidden;
     border-radius: 12px;
     background: rgba(0,0,0,0.35);
+    /* Without these, flex/grid children with intrinsic content (icons, text)
+       can blow out the 1fr track sizing and cause the grid to overflow the
+       1920×1080 stage. Forcing them to shrink-to-fit keeps cells square. */
+    min-width: 0;
+    min-height: 0;
   }
 
   .grid-cell video {

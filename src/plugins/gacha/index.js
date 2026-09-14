@@ -167,13 +167,27 @@ function _executePull({ user, isPremium }) {
   setTimeout(() => {
     pushState('idle');
     _pullActive = false;
-    // Start the next queued pull after a short breath between animations
-    if (_pullQueue.length > 0) {
-      const next = _pullQueue.shift();
-      log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
-      setTimeout(() => _executePull(next), 1500);
-    }
+    _startNextQueued();
   }, 14000);
+}
+
+// ─── Shared queue consumer ───────────────────────────────────────────────────
+// Both _executePull and _executeGridPull end by releasing _pullActive and
+// pulling the next queued item. The next item may itself be a grid pull
+// ({ user, count, isPremium }) or a single pull ({ user, isPremium }).
+// Dispatch to the right executor — otherwise a grid pull queued behind a
+// single pull would be silently demoted to a single pull (the old bug).
+function _startNextQueued() {
+  if (_pullQueue.length === 0) return;
+  const next = _pullQueue.shift();
+  log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
+  setTimeout(() => {
+    if (next.count && next.count > 1) {
+      _executeGridPull(next);
+    } else {
+      _executePull(next);
+    }
+  }, 1500);
 }
 
 // ─── Grid pull (many pulls revealed simultaneously) ──────────────────────────
@@ -229,15 +243,7 @@ function _executeGridPull({ user, count, isPremium }) {
   setTimeout(() => {
     pushState('idle');
     _pullActive = false;
-    if (_pullQueue.length > 0) {
-      const next = _pullQueue.shift();
-      log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
-      if (next.count && next.count > 1) {
-        setTimeout(() => _executeGridPull(next), 1500);
-      } else {
-        setTimeout(() => _executePull(next), 1500);
-      }
-    }
+    _startNextQueued();
   }, 14000);
 }
 
@@ -273,16 +279,14 @@ function triggerPull({ user, isPremium = false }) {
 
 // Channel Point reward title(s) that trigger a standard pull.
 // Case-insensitive. Add alternates if you name it differently on YT.
-// "Gacha Pull" here is the 5000-point CHANNEL POINTS reward — standard tier.
 const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha'];
 
-// Channel Point reward title(s) that trigger a premium pull via channel points.
-// The actual premium tier is the BITS-based "Gacha Pull" Power-up, which is
-// handled separately by the gacha-powerup-pull plugin (via channel.bits.use),
-// not through this title list at all.
+// Channel Point reward title(s) that trigger a premium pull.
 const PREMIUM_REDEEM_TITLES  = ['gacha premium pull', 'gacha premium'];
 
-// Bits threshold for one pull (100 bits = 1 standard pull, NOT premium)
+// Bits threshold for one pull (100 bits = 1 premium pull, ≥ 200 = grid).
+// Matches the manual /pull Discord command and the Twitch "Gacha Pull"
+// Power-up (which routes through premium-roll).
 const BITS_PER_PULL = 100;
 
 // ─── Chat / redeem integration ────────────────────────────────────────────────
@@ -335,7 +339,8 @@ function init(context) {
 
   // ── Bits & Subs via onDonation ───────────────────────────────────────────
   // queue.js routes bits, subs, resubs, and subgifts through onDonation.
-  // type: 'bits'                → standard pull (100 bits = 1 pull)
+  // type: 'bits'                → premium pull(s): 100 bits = 1 premium pull,
+  //                              ≥ 200 bits = grid reveal of (bits/100) pulls
   // type: 'sub' | 'resub'      → 1 premium pull for the subscriber
   // type: 'subgift'            → 1 premium pull per sub gifted (credit gifter)
   if (typeof q?.onDonation === 'function') {
@@ -347,14 +352,17 @@ function init(context) {
         const user  = event.username ?? 'someone';
         const pulls = Math.floor(bits / BITS_PER_PULL);
         if (pulls < 1) return;
-        if (bits > BITS_PER_PULL && pulls > 1) {
-          // Big cheer — reveal all pulls at once in a grid instead of
-          // queuing them one after another.
-          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} pull(s) as a grid reveal`);
+        if (pulls > 1) {
+          // Big cheer (≥ 200 bits) — reveal all pulls at once in a grid
+          // instead of queuing them one after another.
+          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} premium pull(s) as a grid reveal`);
           triggerGridPull({ user, count: pulls, isPremium: true });
         } else {
-          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
-          for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
+          // Exactly 100 bits (or sub-200 cheer that rounds to 1 pull):
+          // single premium pull — same effect as the gacha-powerup-pull
+          // path which routes through premium-roll.
+          log.info(`[gacha] ${user} cheered ${bits} bits → 1 premium pull`);
+          triggerPull({ user, isPremium: true });
         }
 
       } else if (type === 'sub' || type === 'resub') {
