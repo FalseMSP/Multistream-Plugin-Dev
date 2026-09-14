@@ -178,10 +178,67 @@ async function clearDiscount() {
 
 // ── Plugin lifecycle ─────────────────────────────────────────────────────
 
+let _queue = null;
+let _applying = false; // simple lock — prevents concurrent applyDiscount runs
+
 function init(context) {
   _twitch = context.twitch;
+  _queue  = context.queue ?? null;
   _load();
   log.info(`[redeem-discount] Loaded. Current discount: ${_state.discountAmount} pts`);
+
+  // Listen for gacha-sourced "50 Point Discount" redeems. When a viewer
+  // pulls the "50 Point Discount" item from the gacha, the gacha plugin
+  // fires a synthetic redeem with title "50 Point Discount" and
+  // _fromGacha=true. We auto-apply a 50-point discount to every channel-
+  // point reward — same as if a mod had run /discount set amount:50.
+  if (typeof _queue?.onRedeem === 'function') {
+    _queue.onRedeem(function(redeem) {
+      // Only react to gacha-sourced redeems (synthetic, dispatched by the
+      // gacha plugin when a "50 Point Discount" item is revealed).
+      if (!redeem._fromGacha) return;
+
+      const title = String(redeem.title ?? '').replace(/\s*\[YT\]\s*$/i, '').trim();
+      if (title.toLowerCase() !== '50 point discount') return;
+
+      const user = redeem.user ?? redeem.username ?? 'someone';
+      log.info(`[redeem-discount] Gacha "50 Point Discount" pulled by ${user} → auto-applying 50pt discount.`);
+
+      // Run applyDiscount(50) in the background. A simple lock prevents
+      // concurrent runs if multiple "50 Point Discount" items are pulled
+      // in the same grid — the second one is skipped (the first run already
+      // applied the discount, so there's nothing to do).
+      if (_applying) {
+        log.info('[redeem-discount] Already applying a discount — skipping duplicate trigger.');
+        return;
+      }
+      if (!_twitch) {
+        log.warn('[redeem-discount] Twitch module not available — cannot auto-apply discount.');
+        return;
+      }
+
+      _applying = true;
+      applyDiscount(50)
+        .then(function(result) {
+          const applied = result.applied.length;
+          const unchanged = result.unchanged.length;
+          const failed = result.failed.length;
+          log.info(
+            `[redeem-discount] Auto-apply complete: ${applied} updated, ` +
+            `${unchanged} unchanged, ${failed} failed.`
+          );
+        })
+        .catch(function(e) {
+          log.error('[redeem-discount] Auto-apply failed:', e.message);
+        })
+        .finally(function() {
+          _applying = false;
+        });
+    });
+    log.info('[redeem-discount] Listening for gacha "50 Point Discount" redeems → auto-apply.');
+  } else {
+    log.warn('[redeem-discount] context.queue.onRedeem not available — gacha auto-apply disabled.');
+  }
 }
 
 // ── Discord slash command ────────────────────────────────────────────────

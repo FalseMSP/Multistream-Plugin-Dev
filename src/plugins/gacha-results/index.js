@@ -32,18 +32,28 @@ const gacha      = require('../gacha');
 const DATA_FILE = path.resolve(__dirname, 'results.json');
 const MAX_RESULTS = 500; // cap to keep the file + widget payload bounded
 
-// ─── SFX auto-remove ──────────────────────────────────────────────────────────
+// ─── Auto-remove items ────────────────────────────────────────────────────────
 //
 // Gacha items whose result should NOT appear in the dashboard list.
-// These are sound-effect items that play instantly via the sfx plugin —
-// there's nothing for the streamer to "fulfill" manually.
+// These are items that are auto-fulfilled by other plugins — there's
+// nothing for the streamer to manually deliver.
 //
 // Matched against the result's `redeem` field (the Twitch reward title
 // that the gacha plugin dispatches). If `redeem` is null (duds, items
 // with no associated redeem), the item is kept.
 //
-// Update this list if you add new SFX items to the gacha loot table.
-// The redeem titles must match the SFX_MAP keys in src/plugins/sfx/index.js.
+// Two categories:
+//   • SFX items — play instantly via the sfx plugin (Vine Boom, Metal
+//     Pipe, etc.). Auto-removed because the sound IS the fulfillment.
+//   • "50 Point Discount" — auto-applied by the redeem-discount plugin
+//     (knocks 50 points off every channel-point reward). Auto-removed
+//     because the discount is applied automatically, no manual action
+//     needed.
+//
+// Update these sets if you add new auto-fulfilled items to the gacha
+// loot table. The redeem titles must match the SFX_MAP keys in
+// src/plugins/sfx/index.js and the `redeem` field in the gacha loot
+// table (src/plugins/gacha/index.js).
 const SFX_REDEEM_TITLES = new Set([
   'Vine Boom',
   'Metal Pipe',
@@ -62,9 +72,15 @@ const SFX_REDEEM_TITLES = new Set([
   'yaoi',
 ]);
 
-function _isSfxResult(result) {
+// Items that are auto-fulfilled by other plugins (not SFX, but still
+// don't need manual action from the streamer).
+const AUTO_FULFILL_REDEEM_TITLES = new Set([
+  '50 Point Discount',  // → redeem-discount plugin auto-applies a 50pt discount
+]);
+
+function _isAutoRemoveResult(result) {
   if (!result.redeem) return false;
-  return SFX_REDEEM_TITLES.has(result.redeem);
+  return SFX_REDEEM_TITLES.has(result.redeem) || AUTO_FULFILL_REDEEM_TITLES.has(result.redeem);
 }
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
@@ -114,10 +130,12 @@ function _pushState() {
 // ─── Result listener (called by gacha plugin) ─────────────────────────────────
 
 function _onResult(result) {
-  // Auto-filter SFX items — they're instantaneous sound effects with
-  // nothing to fulfill, so they shouldn't clutter the dashboard list.
-  if (_isSfxResult(result)) {
-    log.debug(`[gacha-results] Auto-removing SFX result: "${result.label}" (redeem: "${result.redeem}") for ${result.user}`);
+  // Auto-filter items that are auto-fulfilled by other plugins —
+  // SFX items (play instantly via sfx plugin) and "50 Point Discount"
+  // (auto-applied by redeem-discount plugin). These shouldn't clutter
+  // the dashboard list since there's nothing for the streamer to do.
+  if (_isAutoRemoveResult(result)) {
+    log.debug(`[gacha-results] Auto-removing result: "${result.label}" (redeem: "${result.redeem}") for ${result.user}`);
     return;
   }
 
@@ -486,7 +504,7 @@ function init() {
   }
   dashboard.registerAction('gacha-fulfill-result', _handleFulfillAction);
   _pushState();
-  log.info('[gacha-results] Plugin loaded. SFX auto-remove titles: ' + [...SFX_REDEEM_TITLES].join(', '));
+  log.info('[gacha-results] Plugin loaded. Auto-remove: SFX=[' + [...SFX_REDEEM_TITLES].join(', ') + '] auto-fulfill=[' + [...AUTO_FULFILL_REDEEM_TITLES].join(', ') + ']');
 }
 
 module.exports = {
