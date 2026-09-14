@@ -202,12 +202,16 @@ function _executePull({ user, isPremium }) {
     });
 
     // Emit the result so plugins like gacha-results can record it.
+    // `redeem` is included so downstream plugins can identify SFX items
+    // (Vine Boom, Metal Pipe, etc.) and auto-remove them from the results
+    // list if desired.
     _emitResult({
       id:        _nextResultId(),
       user:      user,
       label:     isDud ? '(Dud)' : item.label,
       rarity:    item.rarity,
       isDud:     isDud,
+      redeem:    isDud ? null : (item.redeem || null),
       timestamp: new Date(),
     });
 
@@ -310,6 +314,7 @@ function _executeGridPull({ user, count, isPremium, users }) {
         label:     item.isDud ? '(Dud)' : item.label,
         rarity:    item.rarity,
         isDud:     item.isDud,
+        redeem:    item.isDud ? null : (item.redeem || null),
         timestamp: new Date(),
       });
     }
