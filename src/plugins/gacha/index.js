@@ -273,9 +273,13 @@ function triggerPull({ user, isPremium = false }) {
 
 // Channel Point reward title(s) that trigger a standard pull.
 // Case-insensitive. Add alternates if you name it differently on YT.
+// "Gacha Pull" here is the 5000-point CHANNEL POINTS reward — standard tier.
 const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha'];
 
-// Channel Point reward title(s) that trigger a premium pull.
+// Channel Point reward title(s) that trigger a premium pull via channel points.
+// The actual premium tier is the BITS-based "Gacha Pull" Power-up, which is
+// handled separately by the gacha-powerup-pull plugin (via channel.bits.use),
+// not through this title list at all.
 const PREMIUM_REDEEM_TITLES  = ['gacha premium pull', 'gacha premium'];
 
 // Bits threshold for one pull (100 bits = 1 standard pull, NOT premium)

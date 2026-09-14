@@ -4,19 +4,18 @@
  * gacha-powerup-pull plugin
  * ─────────────────────────
  * Hooks into Twitch Power-ups. Specifically, when a viewer triggers a
- * "Gacha Pull" Power-up (a bits-funded automatic reward redemption — see
- * src/twitch.js's `channel.channel_points_automatic_reward_redemption.add`
- * subscription), this fires a PREMIUM gacha pull, same as the manual
- * `/pull` command in premium-roll.
+ * "Gacha Pull" custom Power-up (bits, not channel points), this fires a
+ * PREMIUM gacha pull, same as the manual `/pull` command in premium-roll.
  *
  * This is deliberately separate from the plain channel-points "Gacha Pull"
  * reward already handled by the `gacha` plugin (which gives a STANDARD
- * pull for channel points). Power-ups cost real bits, so redeeming one
+ * pull for channel points). The Power-up costs real bits, so redeeming it
  * should feel like the premium tier.
  *
  * Requires: src/twitch.js subscribes to
- * `channel.channel_points_automatic_reward_redemption.add` and pushes those
- * events through `queue.pushRedeem(...)` with `source: 'power_up'`.
+ * `channel.custom_power_up_redemption.add` (the dedicated custom-Power-up
+ * event) and `channel.bits.use` (covers Twitch's built-in Power-ups), and
+ * pushes those through `queue.pushRedeem(...)` with `source: 'power_up'`.
  */
 
 const log   = require('../../logger');

@@ -386,14 +386,21 @@ async function setupEventSub(callbackUrl, secret) {
       'channel.channel_points_automatic_reward_redemption.add', '1');
 
     // channel.bits.use is Twitch's general "Bits were used" event, and it's
-    // the ACTUAL source for both built-in Power-ups (Celebration, Gigantify
-    // an Emote, Message Effect) and streamer-defined custom Power-ups (like
-    // a "Gacha Pull" power-up) — see event.type: 'power_up' | 'custom_power_up'.
-    // It also fires for plain cheers (event.type === 'cheer'), which we
-    // ignore here since channel.cheer already covers those via pushDonation.
+    // one source for both built-in Power-ups (Celebration, Gigantify an
+    // Emote, Message Effect) and custom Power-ups — see event.type: 'power_up'
+    // | 'custom_power_up'. It also fires for plain cheers (event.type ===
+    // 'cheer'), which we ignore since channel.cheer already covers those.
     // Requires bits:read scope — already granted since channel.cheer needs it.
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.bits.use', '1');
+
+    // channel.custom_power_up_redemption.add is the DEDICATED event for
+    // custom Power-up redemptions specifically (e.g. a "Gacha Pull" Power-up
+    // you define yourself) — a more direct, purpose-built signal than
+    // parsing it out of the general bits-use firehose above. Also requires
+    // bits:read scope.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.custom_power_up_redemption.add', '1');
 
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.cheer', '1');
@@ -466,8 +473,12 @@ function handleEventSubNotification(type, event, queue) {
 
     case 'channel.bits.use': {
       // Plain cheers are already handled by channel.cheer → pushDonation.
-      // Only Power-ups (built-in or custom) get routed here as redeems.
-      if (event.type === 'cheer') break;
+      // Custom Power-ups are handled by the dedicated
+      // channel.custom_power_up_redemption.add event below instead, to
+      // avoid firing twice for the same redemption — only built-in Power-ups
+      // (Celebration, Gigantify an Emote, Message Effect) are handled here.
+      if (event.type === 'cheer' || event.type === 'custom_power_up') break;
+      if (event.type !== 'power_up') break;
 
       const powerUp = event.power_up || event.custom_power_up || null;
       const rawTitle =
@@ -487,6 +498,24 @@ function handleEventSubNotification(type, event, queue) {
         rewardType: event.type,
       });
       log.info(`[Twitch] Bits Power-up: ${event.user_name} → "${rewardTitle}" (${event.bits ?? 0} bits)`);
+      break;
+    }
+
+    case 'channel.custom_power_up_redemption.add': {
+      // The dedicated custom-Power-up event. Mirrors the shape of a normal
+      // custom reward redemption: reward.title, reward.cost (in bits here),
+      // user_input, redeemed_at.
+      const rewardTitle = event.reward?.title || 'Custom Power-Up';
+      queue.pushRedeem({
+        username:   event.user_name,
+        title:      rewardTitle,
+        cost:       event.reward?.cost ?? 0,
+        input:      event.user_input || null,
+        timestamp:  new Date(event.redeemed_at ?? Date.now()),
+        source:     'power_up',
+        rewardType: 'custom_power_up',
+      });
+      log.info(`[Twitch] Custom Power-up redeemed: ${event.user_name} → "${rewardTitle}"`);
       break;
     }
 
