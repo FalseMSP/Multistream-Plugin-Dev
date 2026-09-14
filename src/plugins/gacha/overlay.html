@@ -140,6 +140,90 @@
   }
   .ring:nth-child(2) { animation-delay: 0.6s; }
   .ring:nth-child(3) { animation-delay: 1.2s; }
+
+  /* ── Grid reveal (multiple simultaneous pulls) ────────── */
+  #grid-root {
+    position: absolute;
+    inset: 0;
+    display: none;
+    grid-auto-rows: 1fr;
+    gap: 12px;
+    padding: 40px;
+    pointer-events: none;
+  }
+  #grid-root.visible { display: grid; }
+
+  .grid-cell {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 12px;
+    background: rgba(0,0,0,0.35);
+  }
+
+  .grid-cell video {
+    position: absolute;
+    inset: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+  }
+
+  .grid-cell .grid-icon-wrap {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    opacity: 0;
+    transform: scale(0.7);
+    transition: opacity 0.5s cubic-bezier(.22,1,.36,1),
+                transform 0.5s cubic-bezier(.22,1,.36,1);
+    z-index: 2;
+  }
+  .grid-cell .grid-icon-wrap.visible {
+    opacity: 1;
+    transform: scale(1);
+  }
+
+  .grid-cell .grid-icon {
+    width: 40%;
+    max-width: 160px;
+    object-fit: contain;
+    filter: drop-shadow(0 0 24px var(--rarity-glow, rgba(255,255,255,0.6)));
+    image-rendering: pixelated;
+  }
+
+  .grid-cell .grid-label {
+    font-size: 16px;
+    font-weight: 800;
+    color: #fff;
+    text-align: center;
+    text-shadow: 0 0 16px rgba(255,255,255,0.5), 0 2px 6px rgba(0,0,0,0.9);
+    padding: 0 8px;
+  }
+
+  .grid-cell .grid-rarity {
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--rarity-color, #fff);
+    text-shadow: 0 0 10px var(--rarity-glow, rgba(255,255,255,0.8));
+  }
+
+  #grid-user {
+    position: absolute;
+    bottom: 16px; left: 0; right: 0;
+    text-align: center;
+    font-size: 22px;
+    color: rgba(255,255,255,0.8);
+    text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    z-index: 3;
+  }
 </style>
 </head>
 <body>
@@ -160,6 +244,10 @@
     <div id="item-label">Item Name</div>
     <div id="pull-user">for username</div>
   </div>
+
+  <div id="grid-root">
+    <div id="grid-user"></div>
+  </div>
 </div>
 
 <script>
@@ -177,9 +265,12 @@ const itemLabel  = document.getElementById('item-label');
 const pullUser   = document.getElementById('pull-user');
 const rings      = document.getElementById('rings');
 const root       = document.getElementById('gacha-root');
+const gridRoot   = document.getElementById('grid-root');
+const gridUser   = document.getElementById('grid-user');
 
 let iconTimer = null;
 let hideTimer = null;
+let gridTimers = [];
 
 const SHIMMER_RARITIES  = new Set(['legendary', 'mythic', 'oneofone']);
 const RINGS_RARITIES    = new Set(['mythic', 'oneofone']);
@@ -187,6 +278,8 @@ const RINGS_RARITIES    = new Set(['mythic', 'oneofone']);
 function resetTimers() {
   clearTimeout(iconTimer);
   clearTimeout(hideTimer);
+  gridTimers.forEach(clearTimeout);
+  gridTimers = [];
 }
 
 function hideAll() {
@@ -198,7 +291,77 @@ function hideAll() {
   rings.style.display = 'none';
   root.className = '';
   iconWrap.className = '';
+  gridRoot.classList.remove('visible');
+  gridRoot.innerHTML = '';
+  gridRoot.insertAdjacentElement('afterbegin', gridUser);
+  gridUser.textContent = '';
   resetTimers();
+}
+
+// Pick a grid layout (cols x rows) that's roughly square for `count` cells.
+function _gridDims(count) {
+  const cols = Math.ceil(Math.sqrt(count));
+  const rows = Math.ceil(count / cols);
+  return { cols, rows };
+}
+
+function handleGridPull(data) {
+  resetTimers();
+  hideAll(); // clear any leftover single-pull state first
+  resetTimers();
+
+  const items = data.items || [];
+  const { cols, rows } = _gridDims(items.length);
+  gridRoot.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+  gridRoot.style.gridTemplateRows    = `repeat(${rows}, 1fr)`;
+
+  items.forEach((item, i) => {
+    const cell = document.createElement('div');
+    cell.className = 'grid-cell rarity-' + item.rarity;
+
+    const vid = document.createElement('video');
+    vid.autoplay = true;
+    vid.playsInline = true;
+    vid.volume = 1;
+    vid.src = item.videoFile;
+    cell.appendChild(vid);
+
+    if (!item.isDud && item.iconPath) {
+      const iconWrapEl = document.createElement('div');
+      iconWrapEl.className = 'grid-icon-wrap';
+
+      const icon = document.createElement('img');
+      icon.className = 'grid-icon';
+      icon.src = item.iconPath;
+      iconWrapEl.appendChild(icon);
+
+      const rarityEl = document.createElement('div');
+      rarityEl.className = 'grid-rarity';
+      rarityEl.textContent = item.rarity === 'oneofone' ? 'One of One' :
+        item.rarity.charAt(0).toUpperCase() + item.rarity.slice(1);
+      iconWrapEl.appendChild(rarityEl);
+
+      const labelEl = document.createElement('div');
+      labelEl.className = 'grid-label';
+      labelEl.textContent = item.label || '';
+      iconWrapEl.appendChild(labelEl);
+
+      cell.appendChild(iconWrapEl);
+
+      const t = setTimeout(() => iconWrapEl.classList.add('visible'), ICON_REVEAL_MS);
+      gridTimers.push(t);
+    }
+
+    gridRoot.appendChild(cell);
+    vid.play().catch(() => {});
+  });
+
+  gridUser.textContent = 'for ' + (data.user || 'someone');
+  backdrop.classList.add('visible');
+  gridRoot.classList.add('visible');
+
+  const t = setTimeout(hideAll, 13500);
+  gridTimers.push(t);
 }
 
 function handlePull(data) {
@@ -251,6 +414,8 @@ function connect() {
       if (!data) return;
       if (data.state === 'pulling') {
         handlePull(data);
+      } else if (data.state === 'grid') {
+        handleGridPull(data);
       } else if (data.state === 'idle') {
         hideAll();
       }

@@ -379,13 +379,21 @@ async function setupEventSub(callbackUrl, secret) {
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.channel_points_custom_reward_redemption.add', '1');
 
-    // Automatic Reward Redemptions cover both Twitch's built-in default
-    // rewards (e.g. "Highlight My Message") AND bits-funded Power-ups
-    // (Celebration, Gigantify an Emote, and custom Power-ups such as a
-    // "Gacha Pull" power-up). These never go through the custom_reward
-    // redemption event above, so they need their own subscription.
+    // Automatic Reward Redemptions cover Twitch's built-in default rewards
+    // (e.g. "Highlight My Message"). Kept for completeness — most Power-ups
+    // actually arrive via channel.bits.use below, not this one.
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.channel_points_automatic_reward_redemption.add', '1');
+
+    // channel.bits.use is Twitch's general "Bits were used" event, and it's
+    // the ACTUAL source for both built-in Power-ups (Celebration, Gigantify
+    // an Emote, Message Effect) and streamer-defined custom Power-ups (like
+    // a "Gacha Pull" power-up) — see event.type: 'power_up' | 'custom_power_up'.
+    // It also fires for plain cheers (event.type === 'cheer'), which we
+    // ignore here since channel.cheer already covers those via pushDonation.
+    // Requires bits:read scope — already granted since channel.cheer needs it.
+    await subscribeEventSub(broadcasterId, callbackUrl, secret,
+      'channel.bits.use', '1');
 
     await subscribeEventSub(broadcasterId, callbackUrl, secret,
       'channel.cheer', '1');
@@ -453,6 +461,32 @@ function handleEventSubNotification(type, event, queue) {
         rewardType: event.reward?.type ?? null,
       });
       log.info(`[Twitch] Power-up/automatic redeem: ${event.user_name} → "${rewardTitle}"`);
+      break;
+    }
+
+    case 'channel.bits.use': {
+      // Plain cheers are already handled by channel.cheer → pushDonation.
+      // Only Power-ups (built-in or custom) get routed here as redeems.
+      if (event.type === 'cheer') break;
+
+      const powerUp = event.power_up || event.custom_power_up || null;
+      const rawTitle =
+        event.custom_power_up?.title
+        || event.custom_power_up?.name
+        || powerUp?.type
+        || event.type;
+      const rewardTitle = rawTitle ? String(rawTitle).replace(/_/g, ' ') : 'Power-Up';
+
+      queue.pushRedeem({
+        username:   event.user_name,
+        title:      rewardTitle,
+        cost:       event.bits ?? 0,
+        input:      event.message?.text || null,
+        timestamp:  new Date(),
+        source:     'power_up',
+        rewardType: event.type,
+      });
+      log.info(`[Twitch] Bits Power-up: ${event.user_name} → "${rewardTitle}" (${event.bits ?? 0} bits)`);
       break;
     }
 

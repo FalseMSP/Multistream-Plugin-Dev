@@ -86,6 +86,8 @@ registerSection('gacha', {
     }
     if (data.state === 'pulling') {
       el.innerHTML = '<div style="color:var(--accent,#fff)">🎰 Pull in progress…</div>';
+    } else if (data.state === 'grid') {
+      el.innerHTML = '<div style="color:var(--accent,#fff)">🎰 Grid reveal: ' + esc(String((data.items || []).length)) + ' pulls for ' + esc(data.user || '') + '</div>';
     } else if (data.state === 'result') {
       const r = data.result;
       el.innerHTML =
@@ -174,6 +176,87 @@ function _executePull({ user, isPremium }) {
   }, 14000);
 }
 
+// ─── Grid pull (many pulls revealed simultaneously) ──────────────────────────
+// Used when a single donation is large enough to award multiple pulls at
+// once (e.g. a big bit cheer). Instead of queuing them one after another
+// through _executePull, this rolls everything up front and reveals all
+// items simultaneously in a grid on the overlay.
+
+function _executeGridPull({ user, count, isPremium }) {
+  _pullActive = true;
+
+  const items = [];
+  for (let i = 0; i < count; i++) {
+    const item = roll(isPremium);
+    const isDud = item.rarity === 'dud';
+    let videoFile;
+    if (isDud) {
+      const dudNum = Math.floor(Math.random() * DUD_COUNT) + 1;
+      videoFile = `/gachavids/dud${dudNum}.mp4`;
+    } else {
+      videoFile = `/gachavids/${item.rarity}.mp4`;
+    }
+    const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
+    items.push({
+      videoFile, iconPath,
+      rarity: item.rarity, label: item.label, isDud,
+      redeem: item.redeem,
+    });
+  }
+
+  log.info(`[gacha] ${user} grid pull (${isPremium ? 'premium' : 'standard'}) x${count}: ${items.map(i => i.label).join(', ')}`);
+
+  pushState('grid', { user, items });
+
+  setTimeout(() => {
+    // Fire each item's associated redeem as the icons are revealed, same
+    // as a normal single pull, so plugins like sfx pick them up.
+    for (const item of items) {
+      if (item.isDud || !item.redeem) continue;
+      if (_queue) {
+        _queue.pushRedeem({
+          username:  user,
+          title:     item.redeem,
+          cost:      0,
+          input:     null,
+          timestamp: new Date(),
+          _fromGacha: true,
+        });
+      }
+    }
+  }, 8000);
+
+  setTimeout(() => {
+    pushState('idle');
+    _pullActive = false;
+    if (_pullQueue.length > 0) {
+      const next = _pullQueue.shift();
+      log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
+      if (next.count && next.count > 1) {
+        setTimeout(() => _executeGridPull(next), 1500);
+      } else {
+        setTimeout(() => _executePull(next), 1500);
+      }
+    }
+  }, 14000);
+}
+
+/**
+ * Trigger `count` pulls that reveal all at once in a grid, instead of one
+ * after another. Falls back to a normal single pull when count <= 1.
+ * Queues behind any pull/grid already in progress, same as triggerPull.
+ */
+function triggerGridPull({ user, count = 1, isPremium = false }) {
+  if (count <= 1) return triggerPull({ user, isPremium });
+
+  if (_pullActive) {
+    _pullQueue.push({ user, count, isPremium });
+    log.info(`[gacha] Grid pull queued for ${user} x${count} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+    return;
+  }
+  _executeGridPull({ user, count, isPremium });
+}
+
 // ─── Main pull trigger ────────────────────────────────────────────────────────
 // Queues the pull if one is already in progress; plays immediately otherwise.
 
@@ -220,6 +303,12 @@ function init(context) {
   // ── Channel Point redeems ────────────────────────────────────────────────
   if (typeof q?.onRedeem === 'function') {
     q.onRedeem(redeem => {
+      // Power-up-sourced redeems (bits Power-ups, incl. custom ones like a
+      // "Gacha Pull" power-up) are handled exclusively by the
+      // gacha-powerup-pull plugin so they always give a premium pull —
+      // don't also match them here as a channel-points standard pull.
+      if (redeem.source === 'power_up') return;
+
       const raw = redeem.title ?? redeem.reward?.title;
       if (!raw) {
         log.warn('[gacha] Redeem missing title — skipping. Keys:', Object.keys(redeem).join(', '));
@@ -254,8 +343,15 @@ function init(context) {
         const user  = event.username ?? 'someone';
         const pulls = Math.floor(bits / BITS_PER_PULL);
         if (pulls < 1) return;
-        log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
-        for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
+        if (bits > BITS_PER_PULL && pulls > 1) {
+          // Big cheer — reveal all pulls at once in a grid instead of
+          // queuing them one after another.
+          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} pull(s) as a grid reveal`);
+          triggerGridPull({ user, count: pulls, isPremium: true });
+        } else {
+          log.info(`[gacha] ${user} cheered ${bits} bits → ${pulls} standard pull(s)`);
+          for (let i = 0; i < pulls; i++) triggerPull({ user, isPremium: true });
+        }
 
       } else if (type === 'sub' || type === 'resub') {
         const user = event.username ?? 'someone';
@@ -308,4 +404,5 @@ module.exports = {
   onChatReady,
   processMessage,
   triggerPull,
+  triggerGridPull,
 };

@@ -22,11 +22,13 @@
 const log   = require('../../logger');
 const gacha = require('../gacha');
 
-// Title(s) that should count as the "Gacha Pull" power-up. Twitch's reward
-// payload for automatic redemptions doesn't always carry a friendly title —
-// it may only carry a `type` enum, which src/twitch.js falls back to with
-// underscores turned into spaces (e.g. "gacha_pull" → "gacha pull").
-const GACHA_POWERUP_TITLES = ['gacha pull', 'gacha pull powerup', 'gacha'];
+// Title(s) that should count as the "Gacha Pull" power-up. Twitch's payload
+// naming isn't fully predictable here — a custom Power-up may report a
+// friendly title ("Gacha Pull"), while built-in ones only report a type
+// enum. Matching is done after aggressively normalising (lowercase,
+// collapse all non-alphanumeric runs to a single space), so "Gacha_Pull",
+// "gacha-pull", "GachaPull", etc. all resolve to the same string.
+const GACHA_POWERUP_TITLES = ['gacha pull', 'gachapull', 'gacha pull powerup', 'gacha'];
 
 let _chatReply = { twitch: null, youtube: null };
 
@@ -49,7 +51,11 @@ function onChatReady(chatReply) {
 }
 
 function _normaliseTitle(raw) {
-  return String(raw).replace(/_/g, ' ').replace(/\s*\[YT\]\s*$/i, '').trim().toLowerCase();
+  return String(raw)
+    .replace(/\s*\[YT\]\s*$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }
 
 function init(context) {
@@ -69,7 +75,10 @@ function init(context) {
     if (!raw) return;
 
     const title = _normaliseTitle(raw);
-    if (!GACHA_POWERUP_TITLES.includes(title)) return;
+    if (!GACHA_POWERUP_TITLES.includes(title)) {
+      log.debug(`[gacha-powerup-pull] Ignoring power-up redeem with unmatched title: "${raw}" (normalised: "${title}")`);
+      return;
+    }
 
     const user = redeem.user ?? redeem.username ?? 'someone';
     log.info(`[gacha-powerup-pull] Gacha Pull power-up used by ${user} → premium pull.`);
