@@ -48,7 +48,7 @@ const LOOT_TABLE = [
   { id: 'custom-mc-mod',    label: 'Custom Minecraft Mod',          rarity: 'mythic',    icon: 'custom-mc-mod',    odds:  0.10, premiumOdds: 1.00, redeem: 'Custom Minecraft Mod'  },
   { id: 'shower-stream',    label: 'Shower Stream',                 rarity: 'mythic',    icon: 'shower-stream',    odds:  0.00001, premiumOdds: 0.0001, redeem: 'Shower Stream'         },
   // One of One
-  { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.01, premiumOdds: 0.01, redeem: 'Literally Nothing (Rare)'},
+  { id: 'one-of-one',       label: 'Literally Nothing (Rare)',      rarity: 'oneofone',  icon: 'one-of-one',       odds:  0.1, premiumOdds: 0.1, redeem: 'Literally Nothing (Rare)'},
   // Dud (virtual — handled separately)
   { id: 'dud',              label: 'Dud',                           rarity: 'dud',       icon: null,               odds: 15.88, premiumOdds: 1.99, redeem: 'Dud'                   },
 ];
