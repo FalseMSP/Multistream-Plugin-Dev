@@ -10,6 +10,7 @@
  */
 const tmi = require('tmi.js');
 const log = require('./logger');
+const followGuard = require('./follow-guard');
 // ── Config ────────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TWITCH_TOKEN              ?? '';
 const CLIENT_ID   = process.env.TWITCH_CLIENT_ID          ?? '';
@@ -574,7 +575,15 @@ function handleEventSubNotification(type, event, queue) {
       log.info(`[Twitch] Resub: ${event.user_name} (${event.cumulative_months} months)`);
       break;
 
-    case 'channel.follow':
+    case 'channel.follow': {
+      // Guard against unfollow → refollow farming: Twitch fires
+      // channel.follow again for a refollow, which would otherwise
+      // re-trigger the entire follow reward pipeline (TNT points,
+      // gacha-at-home pulls, event feed, Discord announcement, sub-counter
+      // bump, etc.) for free every time someone unfollows and refollows.
+      if (!followGuard.shouldTriggerFollowPipeline(event.user_id, event.user_name)) {
+        break;
+      }
       queue.pushDonation({
         platform:  'twitch',
         type:      'follow',
@@ -583,6 +592,7 @@ function handleEventSubNotification(type, event, queue) {
       });
       log.info(`[Twitch] Follow: ${event.user_name}`);
       break;
+    }
 
     case 'channel.raid':
       // EventSub fires for raids in both directions; we subscribed with
