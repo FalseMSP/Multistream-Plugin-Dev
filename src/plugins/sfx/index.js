@@ -135,6 +135,30 @@ registerSection('sfx', {
   }).toString(),
 });
 
+// ─── Public helpers (for other plugins) ──────────────────────────────────────
+
+/**
+ * True if the given reward title maps to a sound effect.
+ * Normalises the same way handleRedeem does (strips the "[YT]" suffix that
+ * yt-points appends, case-insensitive) so any plugin can ask "is this
+ * reward an SFX?" without duplicating the map.
+ *
+ * @param {string} rewardTitle
+ * @returns {boolean}
+ */
+function isSfxTitle(rewardTitle) {
+  if (!rewardTitle || typeof rewardTitle !== 'string') return false;
+  var normalised = rewardTitle.replace(/\s*\[YT\]\s*$/i, '').trim();
+  return Object.keys(SFX_MAP).some(
+    function(k) { return k.toLowerCase() === normalised.toLowerCase(); }
+  );
+}
+
+/** Titles of every mapped SFX reward, in map order. */
+function getSfxTitles() {
+  return Object.keys(SFX_MAP);
+}
+
 // ─── Redeem handler ───────────────────────────────────────────────────────────
 
 /**
@@ -193,6 +217,11 @@ function handleRedeem(rewardTitle, opts) {
 
 module.exports = {
   id: 'sfx',
+
+  // Shared with other plugins (e.g. yt-points groups SFX redeems in chat)
+  SFX_MAP,
+  isSfxTitle,
+  getSfxTitles,
 
   init(context) {
     var q = context.queue;

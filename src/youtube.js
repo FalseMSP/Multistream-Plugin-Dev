@@ -660,11 +660,37 @@ async function ytUnvip(_, username) {
 
 const SAY_CHUNK_SIZE = 200;
 
+/**
+ * Split text into ≤size-char chunks, preferring natural boundaries
+ * (newline → " · " → "|" → "," → space) so bot messages never break
+ * mid-word like before. Falls back to a hard split only when a single
+ * "word" exceeds the whole budget.
+ */
 function _chunkText(text, size) {
   const chunks = [];
-  for (let i = 0; i < text.length; i += size) {
-    chunks.push(text.slice(i, i + size));
+  let rest = String(text ?? '');
+
+  const BOUNDARIES = ['\n', ' · ', ' | ', ', ', ' '];
+
+  while (rest.length > size) {
+    let cut = -1;
+
+    // Find the best boundary inside the first `size` chars (search from the
+    // most-preferred separator to the least, keep the latest occurrence so
+    // chunks stay as full as possible). lastIndexOf starts back from
+    // size - sep.length so the WHOLE separator fits inside the chunk.
+    for (const sep of BOUNDARIES) {
+      const idx = rest.lastIndexOf(sep, size - sep.length);
+      if (idx > 0) { cut = idx + sep.length; break; }
+    }
+
+    // No usable boundary → hard split (oversized single token).
+    if (cut <= 0) cut = size;
+
+    chunks.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
   }
+  if (rest) chunks.push(rest);
   return chunks;
 }
 

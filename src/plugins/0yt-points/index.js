@@ -13,8 +13,11 @@
  * ── Chat commands (YouTube only) ─────────────────────────────────────────────
  *   !points              — Check your current balance
  *   !points top          — Show the top 5 viewers by points
+ *   !redeem              — Show how to redeem (usage hint)
  *   !redeem <reward>     — Spend points on a registered reward
- *   !rewards             — List all available rewards and costs
+ *   !rewards             — Compact grouped shop overview (SFX collapsed)
+ *   !rewards sfx [page]  — Browse one group (paginated to fit one chat line)
+ *   !rewards <name>      — Full detail card for one reward (typos get hints)
  *
  * ── Twitch reward sync ────────────────────────────────────────────────────────
  *   Rewards are scraped from the Twitch Helix API on demand via:
@@ -24,9 +27,25 @@
  *   twitch-auth.js) must carry channel:read:redemptions scope.
  *
  *   When a YouTube viewer redeems a Twitch-sourced reward:
- *     1. Confirmed in YouTube chat: "✅ {user} redeemed {reward}!"
+ *     1. Confirmed in YouTube chat (see "Redeem announcements" below)
  *     2. Injected into the redeem pipeline via queue.pushRedeem() — appears in
  *        #redeem-feed exactly like a real Twitch redemption (tagged [YT]).
+ *
+ * ── Redeem announcements (YouTube chat UX) ───────────────────────────────────
+ *   YouTube chat is the "redeem screen" viewers watch, so announcements are
+ *   engineered to stay readable even when redeems are spammy:
+ *
+ *   • Every reward carries a group: 'sfx' (auto-detected via the sfx plugin's
+ *     sound map — the majority of redeems on most streams) or 'general'.
+ *   • SFX redeems are BATCHED: everything within YT_SFX_BATCH_MS (default 6 s,
+ *     0 = off) collapses into ONE line, e.g.
+ *         🔊 3 SFX: Vine Boom (alice) · Quack (bob) +1 more
+ *   • Non-SFX redeems announce immediately (rare → worth the spotlight):
+ *         ✅ alice redeemed Gacha Pull (5,000 pts) · 1,230 left
+ *   • Every line is single-line and hard-capped at YouTube's 200-char limit —
+ *     the blind mid-word chunking of old never happens by construction.
+ *   • !rewards is grouped + paginated instead of one giant pipe-separated
+ *     dump, and unknown reward names get "did you mean" suggestions.
  *
  * ── Public API (for other plugins) ───────────────────────────────────────────
  *   const pts = require('../yt-points');
@@ -68,6 +87,9 @@ const fs   = require('fs');
 const path = require('path');
 const log  = require('../../logger');
 const commandsList = require('../commands-list');
+// Source of truth for which rewards are sounds. yt-points uses it to auto-tag
+// SFX rewards so their chat announcements can be batched (see header).
+const sfxPlugin = require('../sfx');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -76,11 +98,23 @@ const CHECKIN_WINDOW_MS    = 5   * 60 * 1000; // each 5-min block since last msg
 const CHECKIN_PTS_PER_TICK = 20;              // points per completed 5-min window
 const CHECKIN_MAX_PTS      = 120;              // cap: max bonus per message
 
-const CMD_POINTS  = /^!points(?:\s+(top))?\s*$/i;
-const CMD_REDEEM  = /^!redeem\s+(.+)$/i;
-const CMD_REWARDS = /^!(rewards|shop)\s*$/i;
+const CMD_POINTS      = /^!points(?:\s+(top))?\s*$/i;
+const CMD_REDEEM      = /^!redeem\s+(.+)$/i;
+const CMD_REDEEM_BARE = /^!redeem\s*$/i;
+const CMD_REWARDS     = /^!(rewards|shop)(?:\s+(.+))?$/i;
 
 const POINTS_FILE = path.resolve('.yt-points.json');
+
+/**
+ * Window (ms) during which SFX redeem announcements are collected into a
+ * single chat message. SFX are the bulk of redeems — without batching every
+ * vine-boom would be its own chat line. 0 disables batching (not recommended).
+ * Env: YT_SFX_BATCH_MS (clamped to 0–30000, default 6000).
+ */
+const _rawBatchMs = parseInt(process.env.YT_SFX_BATCH_MS ?? '6000', 10);
+const SFX_BATCH_MS = Number.isFinite(_rawBatchMs) && _rawBatchMs >= 0
+  ? Math.min(_rawBatchMs, 30000)
+  : 6000;
 
 // ─── Plugin context (set in init) ────────────────────────────────────────────
 //
@@ -106,12 +140,14 @@ const _lastMessageTime = new Map();
 /**
  * @typedef  {Object} Reward
  * @property {string}   name
+ * @property {string}   [displayTitle]  Pretty title shown in chat (defaults to name)
  * @property {number}   cost
  * @property {string}   description
+ * @property {string}   [group]         Logical group — 'sfx' | 'general' | custom
  * @property {boolean}  fromTwitch    true if scraped from Twitch
  * @property {string}   [twitchId]      Twitch reward ID
  * @property {boolean}  [oncePerStream] true = can only be redeemed once per stream session
- * @property {(username: string, chatReply: Function) => Promise<boolean>} handler
+ * @property {(username: string, chatReply: Function, ctx?: {videoId?: string}) => Promise<boolean>} handler
  */
 /** @type {Map<string, Reward>} */
 const _rewards = new Map();
@@ -158,7 +194,367 @@ function _leaderboardText(limit = 5) {
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit);
   if (!sorted.length) return 'No points awarded yet!';
-  return sorted.map(([name, pts], i) => `#${i + 1} ${name} (${pts})`).join(' | ');
+  return sorted.map(([name, pts], i) => `#${i + 1} ${name} (${_fmtNum(pts)})`).join(' | ');
+}
+
+// ─── Chat formatting helpers ─────────────────────────────────────────────────
+//
+// YouTube live chat is the "redeem screen" viewers watch. Everything shown to
+// chatters goes through these helpers so it stays single-line, under the
+// 200-char API cap, and visually consistent.
+
+const YT_MSG_MAX = 200;   // hard YouTube liveChatMessages.insert cap
+const SEP        = ' · '; // visual separator used across shop/announcement lines
+
+/** Emoji prefix per reward group in chat lines. */
+const GROUP_ICONS = { sfx: '\u{1F50A}', general: '\u2705' };
+function _groupIcon(group) { return GROUP_ICONS[group] ?? '\u{1F4E6}'; }
+
+/** 1234 → "1,234" — thousands separators keep balances scannable in chat. */
+function _fmtNum(n) {
+  return Number(n ?? 0).toLocaleString('en-US');
+}
+
+/** 90 → "1m 30s" — cooldown remaining in chat-friendly form. */
+function _fmtCooldown(seconds) {
+  const m = Math.floor(seconds / 60), s = seconds % 60;
+  return m > 0 ? (s ? `${m}m ${s}s` : `${m}m`) : `${s}s`;
+}
+
+/** Slice without splitting surrogate pairs (emoji) at the boundary. */
+function _safeSlice(str, max) {
+  return String(str).slice(0, max).replace(/[\uD800-\uDFFF]$/, '');
+}
+
+/**
+ * The single choke point for every chat reply: collapses whitespace (YouTube
+ * strips newlines anyway), trims, and hard-caps at 200 chars. Errors are
+ * logged here so call sites never need .catch() noise.
+ */
+function _sendLine(send, text) {
+  if (typeof send !== 'function') return;
+  const line = _safeSlice(String(text).replace(/\s+/g, ' ').trim(), YT_MSG_MAX);
+  if (!line) return;
+  Promise.resolve()
+    .then(() => send(line))
+    .catch(e => log.error('[yt-points] send error:', e.message));
+}
+
+/** Send several pre-composed lines (each already sized to fit). */
+function _sendPacked(send, lines) {
+  for (const line of lines) _sendLine(send, line);
+}
+
+/** Classic DP edit distance — inputs are short reward names only. */
+function _levenshtein(a, b) {
+  if (a === b) return 0;
+  const m = a.length, n = b.length;
+  if (!m || !n) return m || n;
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(
+        prev[j] + 1,                                    // deletion
+        cur[j - 1] + 1,                                 // insertion
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),  // substitution
+      );
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+/**
+ * Typo rescue: closest registered reward to a user-typed name. Compares
+ * against both the hyphenated key ("vine-boom") and the display title
+ * ("Vine Boom") so "!redeem vine boom" and "!redeem vineboom" both hit.
+ * @param {string} typed  raw user input
+ * @returns {Reward|null}
+ */
+function _suggestReward(typed) {
+  const norm = String(typed ?? '').toLowerCase().trim().replace(/\s+/g, '-');
+  if (!norm || _rewards.has(norm)) return _rewards.get(norm) ?? null;
+
+  let best = null, bestDist = Infinity;
+  for (const r of _rewards.values()) {
+    const titleKey = r.displayTitle.toLowerCase().replace(/\s+/g, '-');
+    for (const candidate of new Set([r.name, titleKey])) {
+      const d = _levenshtein(norm, candidate);
+      if (d < bestDist) { bestDist = d; best = r; }
+    }
+  }
+  // Tolerate ~1 typo per 4 characters (min 2) — beyond that it's a guess.
+  const threshold = Math.max(2, Math.floor(norm.length / 4));
+  return bestDist <= threshold ? best : null;
+}
+
+// ─── Redeem announcements (SFX batching) ─────────────────────────────────────
+//
+// SFX redeems dominate most streams — announcing each one separately turns
+// YouTube chat into a wall of "✅ user redeemed X!". Instead, SFX announcements
+// are collected per-stream for SFX_BATCH_MS and flushed as ONE compact line:
+//   🔊 3 SFX: Vine Boom (alice), Quack (bob) +2 more
+//   🔊 3 SFX by alice: Vine Boom, Quack, Metal Pipe
+// Non-SFX redeems stay individual — they're rare and worth the spotlight:
+//   ✅ alice redeemed Gacha Pull (5,000 pts) · 1,230 left
+
+/** Per-video batch state: videoId → { items, send, timer } */
+const _sfxBatches = new Map();
+
+/**
+ * Queue one redeem announcement. SFX goes through the per-video batch,
+ * everything else sends immediately.
+ * @param {object} p
+ * @param {Function|null} p.send       per-session chat sender (may be null)
+ * @param {string|undefined} p.videoId
+ * @param {string} p.username
+ * @param {{group: string, displayTitle: string, cost: number}} p.reward
+ */
+function _announceRedeem({ send, videoId, username, reward }) {
+  if (typeof send !== 'function') return;
+  const group = reward?.group ?? 'general';
+
+  if (group !== 'sfx' || SFX_BATCH_MS <= 0) {
+    _sendLine(send, _singleRedeemLine(username, reward));
+    return;
+  }
+
+  const batchKey = videoId ?? '_default';
+  let batch = _sfxBatches.get(batchKey);
+  if (!batch) {
+    batch = { items: [], send, timer: null };
+    _sfxBatches.set(batchKey, batch);
+  }
+  batch.items.push({ username, reward });
+
+  // Safety valve: absurd bursts flush early instead of growing unbounded.
+  if (batch.items.length >= 20) { _flushSfxBatch(batchKey); return; }
+
+  if (!batch.timer) {
+    const t = setTimeout(() => _flushSfxBatch(batchKey), SFX_BATCH_MS);
+    if (typeof t.unref === 'function') t.unref(); // never hold the process open
+    batch.timer = t;
+  }
+}
+
+/**
+ * Single-redeem line. Balance is read at send time (the !redeem message
+ * itself may have just earned passive points, so this stays accurate).
+ */
+function _singleRedeemLine(username, reward) {
+  const balance = _fmtNum(getPoints(username));
+  if ((reward?.group ?? 'general') === 'sfx') {
+    return `🔊 ${username} played ${reward.displayTitle} · ${balance} pts left`;
+  }
+  return `✅ ${username} redeemed ${reward.displayTitle} (${_fmtNum(reward.cost)} pts) · ${balance} left`;
+}
+
+/**
+ * Collapse every buffered SFX redeem for one stream into a single chat line,
+ * greedily packed to stay inside YouTube's 200-char cap (overflow → "+N more").
+ */
+function _flushSfxBatch(batchKey) {
+  const batch = _sfxBatches.get(batchKey);
+  if (!batch) return;
+  _sfxBatches.delete(batchKey);
+  if (batch.timer) { clearTimeout(batch.timer); batch.timer = null; }
+  if (!batch.items.length) return;
+
+  const count    = batch.items.length;
+  const sameUser = batch.items.every(i => i.username === batch.items[0].username);
+
+  let line;
+  if (count === 1) {
+    line = _singleRedeemLine(batch.items[0].username, batch.items[0].reward);
+  } else {
+    const prefix = sameUser
+      ? `🔊 ${count} SFX by ${batch.items[0].username}: `
+      : `🔊 ${count} SFX: `;
+    const parts = batch.items.map(i => sameUser
+      ? i.reward.displayTitle
+      : `${i.reward.displayTitle} (${i.username})`);
+
+    const RESERVE = 12; // room for " +99 more"
+    let body = '';
+    let shown = 0;
+    for (const part of parts) {
+      const candidate = body ? `${body}, ${part}` : part;
+      if ((prefix + candidate).length > YT_MSG_MAX - RESERVE) break;
+      body = candidate;
+      shown++;
+    }
+    line = prefix + body + (shown < count ? ` +${count - shown} more` : '');
+  }
+
+  _sendLine(batch.send, line);
+}
+
+// ─── !rewards rendering (grouped + paginated shop) ────────────────────────────
+//
+// The old one-line pipe-separated dump (name + cost + FULL description per
+// reward) blew way past YouTube's 200-char cap and got blind-split into a
+// wall-of-text. The shop is now grouped:
+//   !rewards            → compact overview, SFX collapsed to one entry
+//   !rewards sfx [page] → one group, paginated to exactly fit one chat line
+//   !rewards <name>     → detail card for a single reward
+
+const REWARDS_HINT = 'browse: !rewards sfx · details: !rewards <name>';
+
+/** All rewards grouped by their group field, cost-sorted within each group. */
+function _groupedRewards() {
+  const groups = new Map();
+  for (const r of getRewards()) { // getRewards() sorts by cost
+    if (!groups.has(r.group)) groups.set(r.group, []);
+    groups.get(r.group).push(r);
+  }
+  return groups;
+}
+
+/**
+ * Greedily pack list entries into the fewest ≤200-char single-line messages.
+ * Continuation messages repeat the prefix so each line keeps its context.
+ */
+function _packEntries(entries, prefix = '') {
+  const lines = [];
+  let line = prefix;
+  for (const entry of entries) {
+    const candidate = (line === prefix) ? prefix + entry : line + SEP + entry;
+    if (candidate.length > YT_MSG_MAX && line !== prefix) {
+      lines.push(line);
+      line = prefix + entry;
+    } else {
+      line = candidate;
+    }
+    if (line.length > YT_MSG_MAX) line = _safeSlice(line, YT_MSG_MAX);
+  }
+  lines.push(line);
+  return lines;
+}
+
+/**
+ * Split name entries across pages whose rendered line (prefix + body + page
+ * hint) always fits one chat message. Slightly conservative on the last page
+ * — that's fine, correctness beats squeezing 3 extra characters into chat.
+ * @returns {string[]} page bodies
+ */
+function _paginate(entries, prefix, sep, reserve = 0) {
+  const pages = [];
+  let body = '';
+  for (const entry of entries) {
+    const candidate = body ? body + sep + entry : entry;
+    if (prefix.length + candidate.length + reserve > YT_MSG_MAX && body) {
+      pages.push(body);
+      body = entry;
+    } else {
+      body = candidate;
+    }
+  }
+  if (body) pages.push(body);
+  return pages;
+}
+
+/**
+ * Compact shop overview. Non-general groups collapse to one entry each:
+ *   🎁 Rewards: gacha-pull 5,000 · 🔊 sfx ×15 (50 ea) → !rewards sfx
+ */
+function _overviewLines() {
+  const groups  = _groupedRewards();
+  const entries = [];
+
+  for (const [group, items] of groups) {
+    if (group === 'general') {
+      for (const r of items) entries.push(`${r.name} ${_fmtNum(r.cost)}`);
+      continue;
+    }
+    const uniform = items.every(r => r.cost === items[0].cost);
+    const label = `${_groupIcon(group)} ${group} ×${items.length}` +
+      (uniform ? ` (${_fmtNum(items[0].cost)} ea)` : ' (costs vary)');
+    entries.push(`${label} → !rewards ${group}`);
+  }
+
+  if (!entries.length) return [];
+  return _packEntries(entries, '🎁 Rewards: ');
+}
+
+/**
+ * One group listing, e.g. "!rewards sfx 2" — paginated to fit a single line.
+ * When every reward in the group costs the same, the header carries the price
+ * and items are listed name-only (the common case for SFX — much cleaner).
+ */
+function _groupLines(group, items, page) {
+  const uniform = items.every(r => r.cost === items[0].cost);
+  const header = `${_groupIcon(group)} ${group}` +
+    (uniform ? ` · ${_fmtNum(items[0].cost)} pts each` : ' · costs vary');
+  const names = items.map(r => uniform ? r.name : `${r.name} ${_fmtNum(r.cost)}`);
+
+  const RESERVE = 34; // room for " (2/5) — … (!rewards sfx 3 for more)"
+  const bodies  = _paginate(names, header + ' — ', ', ', RESERVE);
+  const total   = bodies.length;
+
+  if (total === 1) return [`${header} — ${bodies[0]}`];
+
+  const idx = Math.min(Math.max(page ?? 1, 1), total);
+  let line = `${header} (${idx}/${total}) — ${bodies[idx - 1]}`;
+  if (idx < total) line += ` (!rewards ${group} ${idx + 1} for more)`;
+  return [_safeSlice(line, YT_MSG_MAX)];
+}
+
+/**
+ * One-reward detail card (single line), e.g.
+ *   🎁 gacha-pull · 5,000 pts · once/stream — "Spawn a gacha pull on stream!"
+ * Description is trimmed to whatever room the metadata leaves.
+ */
+function _detailLine(reward) {
+  const bits = [`🎁 ${reward.name}`, `${_fmtNum(reward.cost)} pts`];
+  if (reward.group && reward.group !== 'general') {
+    bits.push(`${_groupIcon(reward.group)} ${reward.group}`);
+  }
+  if (reward.oncePerStream)       bits.push('once/stream');
+  if (reward.cooldownSeconds > 0) bits.push(`${_fmtCooldown(reward.cooldownSeconds)} cooldown`);
+
+  const prefix = bits.join(SEP);
+  if (!reward.description) return _safeSlice(prefix, YT_MSG_MAX);
+
+  const room = YT_MSG_MAX - prefix.length - ' — '.length;
+  const desc = room <= 0 ? '' : _safeSlice(reward.description, room - 1) + (reward.description.length > room - 1 ? '…' : '');
+  return desc ? `${prefix} — ${desc}` : prefix;
+}
+
+/**
+ * Entry point for "!rewards [query]".
+ * @param {Function|null} send
+ * @param {string} arg  everything after "!rewards" (may be '')
+ */
+function _handleRewardsCommand(send, arg) {
+  if (!send) return;
+  if (!getRewards().length) {
+    _sendLine(send, '🎁 No rewards yet — check back soon!');
+    return;
+  }
+
+  const raw    = String(arg ?? '').trim().toLowerCase();
+  if (!raw) { _sendPacked(send, _overviewLines()); return; }
+
+  // "!rewards sfx 2" → group 'sfx', page 2 (group names are hyphenated keys)
+  const tokens = raw.split(/\s+/);
+  let page = null;
+  if (tokens.length > 1 && /^\d+$/.test(tokens[tokens.length - 1])) {
+    page = parseInt(tokens.pop(), 10);
+  }
+  const query = tokens.join('-');
+
+  const groups = _groupedRewards();
+  if (groups.has(query)) {
+    _sendPacked(send, _groupLines(query, groups.get(query), page));
+    return;
+  }
+
+  // Exact reward, then typo rescue — showing the detail card IS the suggestion.
+  const reward = _rewards.get(query) ?? _suggestReward(raw);
+  if (reward) { _sendLine(send, _detailLine(reward)); return; }
+
+  _sendLine(send, `❌ No reward or group called "${_safeSlice(raw, 40)}". ${REWARDS_HINT}`);
 }
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
@@ -242,6 +638,8 @@ async function syncTwitchRewards() {
     const description     = r.prompt?.trim() || r.title;
     const twitchId        = r.id;
     const rewardTitle     = r.title; // captured for the closure below
+    const isSfx           = sfxPlugin.isSfxTitle(rewardTitle); // auto-group SFX
+    const rewardGroup     = isSfx ? 'sfx' : 'general';
     const cooldownSeconds = r.global_cooldown_setting?.is_enabled
       ? (r.global_cooldown_setting.global_cooldown_seconds ?? 0)
       : 0;
@@ -256,12 +654,20 @@ async function syncTwitchRewards() {
       twitchId,
       cooldownSeconds,
       oncePerStream,
-      handler: async (username, chatReply) => {
-        // 1. Announce in YouTube chat
-        if (chatReply) {
-          await chatReply(`✅ ${username} redeemed "${rewardTitle}"!`)
-            .catch(e => log.error('[yt-points] YT chat reply error:', e.message));
-        }
+      group:       rewardGroup,
+      displayTitle: rewardTitle,
+      handler: async (username, chatReply, ctx = {}) => {
+        // 1. Announce in YouTube chat. SFX redeems are batched into one line
+        //    per YT_SFX_BATCH_MS window (see "Redeem announcements" header);
+        //    everything else announces immediately. The reward shape passed
+        //    here mirrors what registerReward stored — it is read by the
+        //    announcement formatter.
+        _announceRedeem({
+          send:    chatReply,
+          videoId: ctx.videoId,
+          username,
+          reward:  { group: rewardGroup, displayTitle: rewardTitle, cost },
+        });
 
         // 2. Inject into the redeem pipeline → shows in #redeem-feed
         if (_queue?.pushRedeem) {
@@ -326,14 +732,21 @@ function setPoints(username, amount) {
  * Register a redeemable reward.
  * @param {Reward} reward
  */
-function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null, cooldownSeconds = 0, oncePerStream = false }) {
+function registerReward({ name, cost, description, handler, fromTwitch = false, twitchId = null, cooldownSeconds = 0, oncePerStream = false, group = null, displayTitle = null }) {
   if (!name || !cost || !description || typeof handler !== 'function') {
     log.warn('[yt-points] registerReward: missing required field(s)');
     return;
   }
   const key = name.toLowerCase().trim();
-  _rewards.set(key, { name: key, cost, description, handler, fromTwitch, twitchId, cooldownSeconds, oncePerStream });
-  log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}${oncePerStream ? ' [once-per-stream]' : ''}`);
+  const resolvedGroup = String(group ?? 'general').toLowerCase().trim() || 'general';
+  _rewards.set(key, {
+    name: key,
+    displayTitle: _safeSlice(String(displayTitle ?? name).trim(), 60),
+    cost, description, handler,
+    fromTwitch, twitchId, cooldownSeconds, oncePerStream,
+    group: resolvedGroup,
+  });
+  log.info(`[yt-points] Reward registered: ${key} (${cost} pts)${fromTwitch ? ' [Twitch]' : ''}${oncePerStream ? ' [once-per-stream]' : ''}${resolvedGroup !== 'general' ? ` [${resolvedGroup}]` : ''}`);
 }
 
 /** Remove a reward by name. */
@@ -415,8 +828,8 @@ function onChatReady(chatReply) {
   _chatReply = chatReply;
 
   commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)', 'youtube');
-  commandsList.registerCommand('!redeem',  'Spend points on a reward — !redeem <reward name>', 'youtube');
-  commandsList.registerCommand('!rewards', 'List available point rewards and their costs', 'youtube');
+  commandsList.registerCommand('!redeem',  'Redeem a reward — !redeem <name> · !rewards to browse', 'youtube');
+  commandsList.registerCommand('!rewards', 'Browse rewards — !rewards overview · !rewards sfx · !rewards <name> for details', 'youtube');
 
   log.info('[yt-points] Ready. Chat commands registered.');
 }
@@ -468,27 +881,29 @@ async function processMessage(msg) {
   const pointsMatch = CMD_POINTS.exec(text);
   if (pointsMatch) {
     if (pointsMatch[1]?.toLowerCase() === 'top') {
-      if (send) send('🏆 Top viewers: ' + _leaderboardText(5))
-        .catch(e => log.error('[yt-points] send error:', e.message));
+      if (send) _sendLine(send, '🏆 Top viewers: ' + _leaderboardText(5));
     } else {
       const total = getPoints(username);
-      if (send) send(`⭐ ${username}: ${total} pts`)
-        .catch(e => log.error('[yt-points] send error:', e.message));
+      if (send) _sendLine(send, `⭐ ${username}: ${_fmtNum(total)} pts`);
     }
     return { message: null };
   }
 
-  // ── !rewards ──────────────────────────────────────────────────────────────
-  if (CMD_REWARDS.test(text)) {
-    const rewards = getRewards();
-    const reply   = rewards.length
-      ? '🎁 Rewards: ' + rewards.map(r => `${r.name} (${r.cost} pts — ${r.description})`).join(' | ')
-      : 'No rewards yet — check back soon!';
-    if (send) send(reply).catch(e => log.error('[yt-points] send error:', e.message));
+  // ── !rewards [group | page | name] ──────────────────────────────────
+  const rewardsMatch = CMD_REWARDS.exec(text);
+  if (rewardsMatch) {
+    _handleRewardsCommand(send, rewardsMatch[2] ?? '');
     return { message: null };
   }
 
-  // ── !redeem <reward> ──────────────────────────────────────────────────────
+  // ── !redeem (no arguments) → usage hint ─────────────────────────────
+  // Previously bare "!redeem" matched nothing, fell through, and never got a
+  // reply — confusing for first-time users. Teach the command instead.
+  if (CMD_REDEEM_BARE.test(text)) {
+    if (send) _sendLine(send, `🎁 Usage: !redeem <name> — ${REWARDS_HINT}`);
+    return { message: null };
+  }
+
   const redeemMatch = CMD_REDEEM.exec(text);
   if (redeemMatch) {
     // Normalise the typed name the same way registerReward does
@@ -496,16 +911,20 @@ async function processMessage(msg) {
     const reward    = _rewards.get(rewardKey);
 
     if (!reward) {
-      if (send) send(`❌ Unknown reward "${redeemMatch[1].trim()}". Type !rewards to see options.`)
-        .catch(e => log.error('[yt-points] send error:', e.message));
+      // Typo rescue: point at the closest real reward instead of a dead end.
+      const suggestion = _suggestReward(redeemMatch[1]);
+      const tip = suggestion ? ` Did you mean "${suggestion.name}"?` : '';
+      if (send) _sendLine(send,
+        `❌ Unknown reward "${_safeSlice(redeemMatch[1].trim(), 40)}".${tip} !rewards to browse`);
       return { message: null };
     }
 
     const balance = getPoints(username);
     if (balance < reward.cost) {
       const short = reward.cost - balance;
-      if (send) send(`❌ ${username}: need ${reward.cost} pts, have ${balance} (${short} more needed).`)
-        .catch(e => log.error('[yt-points] send error:', e.message));
+      if (send) _sendLine(send,
+        `❌ ${username}: ${reward.displayTitle} costs ${_fmtNum(reward.cost)} pts · ` +
+        `you have ${_fmtNum(balance)} (${_fmtNum(short)} short)`);
       return { message: null };
     }
 
@@ -516,11 +935,8 @@ async function processMessage(msg) {
       const cooldownMs    = reward.cooldownSeconds * 1000;
       if (elapsedMs < cooldownMs) {
         const remainingSecs = Math.ceil((cooldownMs - elapsedMs) / 1000);
-        const mm = Math.floor(remainingSecs / 60);
-        const ss = remainingSecs % 60;
-        const timeStr = mm > 0 ? `${mm}m ${ss}s` : `${ss}s`;
-        if (send) send(`⏳ "${reward.name}" is on cooldown — available again in ${timeStr}.`)
-          .catch(e => log.error('[yt-points] send error:', e.message));
+        if (send) _sendLine(send,
+          `⏳ "${reward.displayTitle}" is on cooldown — ${_fmtCooldown(remainingSecs)} left.`);
         return { message: null };
       }
     }
@@ -536,8 +952,8 @@ async function processMessage(msg) {
         onStreamStart();
       }
       if (_redeemedThisStream.has(rewardKey)) {
-        if (send) send(`❌ "${reward.name}" has already been redeemed this stream — it's a once-per-stream reward!`)
-          .catch(e => log.error('[yt-points] send error:', e.message));
+        if (send) _sendLine(send,
+          `❌ "${reward.displayTitle}" was already redeemed this stream (once-per-stream reward).`);
         return { message: null };
       }
     }
@@ -547,15 +963,17 @@ async function processMessage(msg) {
 
     let success = false;
     try {
-      success = await reward.handler(username, send);
+      // 3rd arg gives handlers stream context (per-video announcement batching:
+      // videoId → which chat the SFX batch flushes to).
+      success = await reward.handler(username, send, { videoId });
     } catch (e) {
       log.error(`[yt-points] reward handler error (${rewardKey}):`, e.message);
     }
 
     if (!success) {
       addPoints(username, reward.cost, 'redeem-refund');
-      if (send) send(`⚠️ ${username}: "${reward.name}" couldn't be fulfilled right now. Points refunded.`)
-        .catch(e => log.error('[yt-points] send error:', e.message));
+      if (send) _sendLine(send,
+        `⚠️ ${username}: "${reward.displayTitle}" couldn't be fulfilled right now. Points refunded.`);
     } else {
       if (reward.cooldownSeconds > 0) _redeemCooldowns.set(rewardKey, now);
       if (reward.oncePerStream)       _redeemedThisStream.add(rewardKey);
@@ -725,8 +1143,17 @@ async function handleInteraction(interaction) {
 
       registerReward({
         name: rawName, cost, description: desc,
-        handler: async (username) => {
-          if (send) await send(`🎉 ${username} redeemed: ${rawName}! (${desc})`);
+        group: 'general',
+        handler: async (username, chatReply, ctx = {}) => {
+          // Same announcement path as Twitch-synced rewards (immediate — this
+          // is a general reward). Errors inside the announcement are caught
+          // by _sendLine and must NOT fail the redeem (no bogus refunds).
+          _announceRedeem({
+            send:    chatReply,
+            videoId: ctx.videoId,
+            username,
+            reward:  { group: 'general', displayTitle: rawName, cost },
+          });
           return true;
         },
       });
