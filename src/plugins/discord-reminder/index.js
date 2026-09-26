@@ -9,6 +9,21 @@ const ACTIVITY_WINDOW_MS = 5 * 60 * 1000; // a chat is "active" if messaged with
 
 const DISCORD_URL = 'https://discord.gg/jBSNayWUrX';
 
+// Messages sent to both platforms
+const COMMON_MESSAGES = [
+  `Join the Discord: ${DISCORD_URL}`,
+];
+
+// Messages exclusive to YouTube (doesn't make sense to plug Twitch on Twitch)
+const YOUTUBE_ONLY_MESSAGES = [
+  `if you're enjoying, like the stream please :)`,
+  `im also on twitch! twitch.tv/redlifemc`,
+];
+
+function _randomFrom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
 let _youtube    = null;
 let _chatReply  = { twitch: null, youtube: null };
 let _intervalId = null;
@@ -35,7 +50,8 @@ function _startReminder() {
     // ── Twitch ───────────────────────────────────────────────────────────────
     const twitchSend = _chatReply.twitch;
     if (twitchSend && _twitchLastSeen && now - _twitchLastSeen < ACTIVITY_WINDOW_MS) {
-      twitchSend(`👾 Join the Discord: ${DISCORD_URL}`)
+      const twitchMessage = _randomFrom(COMMON_MESSAGES);
+      twitchSend(twitchMessage)
         .catch(e => log.error('[discord-reminder] Twitch send error:', e.message));
       log.info('[discord-reminder] Sent reminder to Twitch chat.');
     }
@@ -43,9 +59,10 @@ function _startReminder() {
     // ── YouTube (per active video ID) ─────────────────────────────────────
     const yt = _getYoutube();
     if (yt?.sayTo) {
+      const youtubeMessage = _randomFrom([...COMMON_MESSAGES, ...YOUTUBE_ONLY_MESSAGES]);
       for (const [videoId, lastSeen] of _ytLastSeen.entries()) {
         if (now - lastSeen < ACTIVITY_WINDOW_MS) {
-          yt.sayTo(videoId, `👾 Join the Discord: ${DISCORD_URL}`)
+          yt.sayTo(videoId, youtubeMessage)
             .catch(e => log.error(`[discord-reminder] YT send error (${videoId}):`, e.message));
           log.info(`[discord-reminder] Sent reminder to YouTube chat (videoId=${videoId}).`);
         } else {
@@ -60,7 +77,6 @@ function _startReminder() {
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  commandsList.registerCommand('!discord', 'Get the Discord invite link');
   _startReminder();
   log.info('[discord-reminder] Started 5-minute reminder interval.');
 }
