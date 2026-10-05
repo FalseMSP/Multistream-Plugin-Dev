@@ -32,6 +32,19 @@
  *                       Has "Copy & Play" (copies ID + dequeues) and
  *                       "Skip" (dequeues without copying) buttons.
  *
+ * Overlay sections (OBS browser sources):
+ *   gd-queue          — the level queue list
+ *   gd-now-playing    — "currently playing" card: the entry that was just
+ *                       popped off the queue via /next or "Copy & Play".
+ *                       Shows the level NAME (fetched from gdbrowser, cached),
+ *                       the level ID, who requested it and any notes.
+ *                       "Skip" deliberately does NOT update it — a skipped
+ *                       level was discarded, not played.
+ *
+ * Standalone OBS pages (dedicated browser sources):
+ *   /gd-queue         — queue card only
+ *   /gd-now-playing   — currently-playing card only
+ *
  * All chat commands are suppressed from #stream-chat (they're bot triggers,
  * not conversation).
  */
@@ -261,8 +274,75 @@ async function _updatePreview() {
 // Push current state to the overlay and dashboard
 function _notify() {
   updateSection('gd-queue', { queue: _queue, enabled: _enabled });
+  _pushNowPlaying();
   dashboard.updateWidget('gd-queue', { queue: _queue, enabled: _enabled });
   _updatePreview(); // async, fire-and-forget — updates gd-level-preview widget
+}
+
+// ── Currently Playing (gd-now-playing overlay) ──────────────────────────────
+// Set whenever an entry is popped as "played" — via /next (Discord) or the
+// dashboard's "Copy & Play" button (both go through _next()). "Skip" pops
+// with played=false and deliberately does NOT touch this state: a skipped
+// level was discarded, not played, so the on-stream card keeps showing what
+// is actually running.
+
+let _nowPlaying = null;   // { levelId, username, platform, notes, nameState, info, startedAt }
+let _npFetchSeq = 0;      // bumps on every pop — stale name fetches are discarded
+
+function _pushNowPlaying() {
+  updateSection('gd-now-playing', { nowPlaying: _nowPlaying });
+}
+
+function _setNowPlaying(entry) {
+  _npFetchSeq += 1;
+  const seq = _npFetchSeq;
+
+  _nowPlaying = {
+    levelId:   entry.levelId,
+    username:  entry.username,
+    platform:  entry.platform,
+    notes:     entry.notes ?? null,
+    nameState: 'loading',
+    info:      null,           // { name, author } once gdbrowser resolves
+    startedAt: new Date().toISOString(),
+  };
+  _pushNowPlaying();           // card appears instantly with ID + requester
+
+  // Non-numeric IDs can't be looked up on the GD API — show the ID only.
+  if (!/^\d+$/.test(String(entry.levelId))) {
+    _nowPlaying.nameState = 'unavailable';
+    _pushNowPlaying();
+    return;
+  }
+
+  const tryFetch = (attempt) => {
+    if (seq !== _npFetchSeq || !_nowPlaying) return;   // superseded by a newer pop
+    _fetchLevelInfo(entry.levelId).then((info) => {
+      if (seq !== _npFetchSeq || !_nowPlaying) return;
+      // null = an identical fetch is already in flight (dedupe guard in
+      // _fetchLevelInfo) — the cache will be populated when it lands; retry.
+      if (info === null) {
+        if (attempt < 4) {
+          const t = setTimeout(() => tryFetch(attempt + 1), 2000);
+          t.unref?.();
+        }
+        return;
+      }
+      if (info && !info.error) {
+        _nowPlaying.nameState = 'loaded';
+        _nowPlaying.info      = { name: info.name, author: info.author };
+      } else {
+        _nowPlaying.nameState = 'unavailable';
+        _nowPlaying.info      = null;
+      }
+      _pushNowPlaying();
+    }).catch(() => {
+      if (seq !== _npFetchSeq || !_nowPlaying) return;
+      _nowPlaying.nameState = 'unavailable';
+      _pushNowPlaying();
+    });
+  };
+  tryFetch(0);
 }
 
 // ── Overlay section registration ──────────────────────────────────────────
@@ -308,6 +388,79 @@ registerSection('gd-queue', {
       }).join('');
     }).toString(),
 });
+
+// ── Overlay section: gd-now-playing ─────────────────────────────────────────
+// "Currently playing" card — the queue head that was just popped via /next
+// or the dashboard's "Copy & Play" button. Shows the level NAME (fetched
+// from gdbrowser with a 5-min cache), the level ID, who requested it and
+// any notes. Renders identically on the /overlay mosaic and the standalone
+// /gd-now-playing OBS source (both share _SECTION_CSS in overlay-server.js).
+
+registerSection('gd-now-playing', {
+  title: 'Now Playing',
+  order: 9, // sits above the Level Queue card
+  icon: `<svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="1.5" y="1.5" width="19" height="19" rx="4" stroke="#00e5ff" stroke-width="1.4"/>
+    <polygon points="9,7 15.5,11 9,15" fill="#00e5ff"/>
+  </svg>`,
+
+  render: /* serialised — no outer-scope references */
+    (function render(data, el, esc, { badge }) {
+      if (!data) { el.innerHTML = ''; return; }
+      var np = data.nowPlaying;
+
+      if (!np) {
+        if (badge) badge.textContent = '';
+        el.innerHTML = '<div class="msg msg-empty">NOTHING PLAYING</div>';
+        return;
+      }
+
+      if (badge) badge.textContent = 'ID ' + np.levelId;
+
+      var info = np.info;
+      var name = info && info.name ? info.name : null;
+
+      // Inline colour override: the shared .entry:first-child rule turns
+      // .entry-id white — correct for the queue list, but here the name is
+      // the white hero and the ID should stay GD-red.
+      var idHtml = '<span class="entry-id" style="color:var(--red)">' + esc(np.levelId) + '</span>';
+
+      var html = '<div class="entry">'
+        + '<span class="entry-pos">▶</span>'
+        + '<div class="entry-main">';
+
+      if (name) {
+        html += '<span class="entry-name">' + esc(name) + '</span>'
+          + idHtml;
+        if (info && info.author) {
+          html += '<span class="entry-user">level by ' + esc(info.author) + '</span>';
+        }
+      } else {
+        html += idHtml;
+        if (np.nameState === 'loading') {
+          html += '<span class="entry-user">fetching level name…</span>';
+        }
+      }
+
+      html += '<span class="entry-user">'
+        + '<span class="platform-dot ' + esc(np.platform) + '"></span>'
+        + 'requested by ' + esc(np.username)
+        + '</span>';
+
+      if (np.notes && np.notes.trim()) {
+        html += '<span class="entry-notes">' + esc(np.notes) + '</span>';
+      }
+
+      html += '</div></div>';
+      el.innerHTML = html;
+    }).toString(),
+});
+
+// Initial paint at module load (mirrors tnt-tracker's load-time push) so
+// /state, the /sse bootstrap and standalone pages see the real empty-state
+// shape immediately — not a bare null until the first _notify().
+updateSection('gd-queue', { queue: _queue, enabled: _enabled });
+_pushNowPlaying();
 
 // ── Dashboard widget: gd-queue (queue list) ──────────────────────────────────
 
@@ -689,7 +842,7 @@ addRoute('/api/gd-queue/skip', (req, res) => {
     res.writeHead(405, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Method not allowed' }));
   }
-  const entry = _next();
+  const entry = _next(false); // skipped, not played — now-playing overlay stays as-is
   if (entry) {
     log.info(`[gd-queue] Skipped level ${entry.levelId} (requested by ${entry.username}) — not copied to clipboard`);
   }
@@ -712,6 +865,14 @@ addRoute('/gd-queue', (req, res) => {
   res.end(html);
 });
 
+// Serves a self-contained overlay page showing only the "currently playing"
+// card. Add http://<host>:2999/gd-now-playing as a Browser Source in OBS.
+addRoute('/gd-now-playing', (req, res) => {
+  const html = buildStandaloneSectionPage('gd-now-playing', { title: 'Now Playing' });
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(html);
+});
+
 // ── Queue helpers ─────────────────────────────────────────────────────────
 
 function _findByUser(username) {
@@ -730,8 +891,16 @@ function _add(username, platform, levelId, notes) {
   return existing !== -1; // true = was a replacement
 }
 
-function _next() {
-  return _queue.shift() ?? null;
+/**
+ * Pop the queue head.
+ * @param {boolean} [played=true] — true when the level is actually being
+ *   played (/next, "Copy & Play") → updates the gd-now-playing overlay.
+ *   Pass false for "skip" (discard without playing) → now-playing untouched.
+ */
+function _next(played = true) {
+  const entry = _queue.shift() ?? null;
+  if (entry && played) _setNowPlaying(entry);
+  return entry;
 }
 
 // ── processMessage ────────────────────────────────────────────────────────
