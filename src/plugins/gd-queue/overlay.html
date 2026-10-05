@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Now Playing</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800&display=swap">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    background: transparent;
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  #text {
+    font-size: 26px;
+    font-weight: 800;
+    color: #ffffff;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 4px rgba(0,0,0,0.85);
+    white-space: nowrap;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+  }
+
+  #text.visible { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="text"></div>
+
+<script>
+  const el = document.getElementById('text');
+  let last = null;
+
+  // Pure formatter — one line: "LevelName - 12381024".
+  // Falls back to the bare ID while the name is still being fetched and for
+  // non-numeric IDs (which can never resolve). Returns null when nothing is
+  // playing so the page stays empty. Never trusted as HTML — the caller
+  // assigns it via textContent.
+  function formatText(np) {
+    if (!np || np.levelId == null) return null;
+    const name = np.info && np.info.name ? np.info.name : null;
+    return name ? name + ' - ' + np.levelId : String(np.levelId);
+  }
+
+  function apply(data) {
+    const text = formatText(data && data.nowPlaying);
+    if (text === null) {
+      el.classList.remove('visible');
+      last = null;
+      return;
+    }
+    el.classList.add('visible');
+    if (last !== text) {
+      el.textContent = text;
+      last = text;
+    }
+  }
+
+  function connect() {
+    const es = new EventSource('/sse');
+    es.onmessage = (e) => {
+      try {
+        const payload = JSON.parse(e.data);
+        if (payload.type === 'section' && payload.id === 'gd-now-playing') apply(payload.data);
+      } catch (err) {
+        console.error('[gd-queue] now-playing SSE parse error', err);
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+
+  connect();
+</script>
+</body>
+</html>

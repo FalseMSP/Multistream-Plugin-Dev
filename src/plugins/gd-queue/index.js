@@ -43,16 +43,25 @@
  *
  * Standalone OBS pages (dedicated browser sources):
  *   /gd-queue         — queue card only
- *   /gd-now-playing   — currently-playing card only
+ *   /gd-now-playing   — plain-text "currently playing" line, sub-counter
+ *                       style (transparent bg, Inter, text-shadow):
+ *                           LevelName - 12381024
+ *                       Shows the bare ID until the name resolves (and for
+ *                       non-numeric IDs); renders nothing when no level is
+ *                       playing. Full card still available on /overlay.
  *
  * All chat commands are suppressed from #stream-chat (they're bot triggers,
  * not conversation).
  */
 
+const fs   = require('fs');
+const path = require('path');
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
 const { registerSection, updateSection, addRoute, buildStandaloneSectionPage } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
+
+const OVERLAY_HTML = path.resolve(__dirname, 'overlay.html');
 
 // ── State ─────────────────────────────────────────────────────────────────
 // Queue entries: Array<{ username, platform, levelId, notes, addedAt }>
@@ -393,8 +402,8 @@ registerSection('gd-queue', {
 // "Currently playing" card — the queue head that was just popped via /next
 // or the dashboard's "Copy & Play" button. Shows the level NAME (fetched
 // from gdbrowser with a 5-min cache), the level ID, who requested it and
-// any notes. Renders identically on the /overlay mosaic and the standalone
-// /gd-now-playing OBS source (both share _SECTION_CSS in overlay-server.js).
+// any notes. Renders on the /overlay mosaic; the dedicated /gd-now-playing
+// OBS source is the plain-text overlay.html page instead (sub-counter style).
 
 registerSection('gd-now-playing', {
   title: 'Now Playing',
@@ -865,12 +874,24 @@ addRoute('/gd-queue', (req, res) => {
   res.end(html);
 });
 
-// Serves a self-contained overlay page showing only the "currently playing"
-// card. Add http://<host>:2999/gd-now-playing as a Browser Source in OBS.
+// Serves the "currently playing" overlay as PLAIN TEXT — a single line:
+//   LevelName - 12381024
+// styled like sub-counter's overlay (transparent bg, Inter, text-shadow).
+// It listens on the same /sse stream and consumes the same now-playing
+// state that feeds the mosaic card: the bare ID shows immediately on pop,
+// then the name slides in once gdbrowser resolves it; non-numeric IDs and
+// lookup failures stay as the bare ID; nothing playing renders nothing at
+// all (fully transparent).
+// Add http://<host>:2999/gd-now-playing as a Browser Source in OBS.
 addRoute('/gd-now-playing', (req, res) => {
-  const html = buildStandaloneSectionPage('gd-now-playing', { title: 'Now Playing' });
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(html);
+  try {
+    const html = fs.readFileSync(OVERLAY_HTML, 'utf8');
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(html);
+  } catch (e) {
+    log.error('[gd-queue] Could not read overlay.html:', e.message);
+    res.writeHead(500); res.end('GD now-playing overlay not found');
+  }
 });
 
 // ── Queue helpers ─────────────────────────────────────────────────────────
