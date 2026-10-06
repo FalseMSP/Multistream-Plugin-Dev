@@ -846,6 +846,17 @@ function startOverlayServer(port = 2999) {
       return;
     }
 
+    // Overlay pages (e.g. the OBS browser source, where there is no
+    // devtools) POST media/playback diagnostics here so they show up in the
+    // bot's log.
+    if (req.method === 'POST' && url === '/__client-log') {
+      let body = '';
+      req.on('data', (c) => { if (body.length < 4096) body += c; });
+      req.on('end', () => { log.warn('[client] ' + body.slice(0, 4096)); });
+      res.writeHead(204); res.end();
+      return;
+    }
+
     if (req.method === 'GET' && url === '/sse') {
       res.writeHead(200, {
         'Content-Type':  'text/event-stream',

@@ -123,11 +123,21 @@ registerSection('sfx', {
           _playNext();
         }
 
+        // Report to the bot log: OBS browser sources have no devtools.
+        function _report(msg) {
+          try { fetch('/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(function(){}); } catch (e) {}
+        }
+
         audio.addEventListener('ended', _onDone);
-        audio.addEventListener('error', _onDone);
+        audio.addEventListener('error', function() {
+          var e = audio.error;
+          _report('sfx MEDIA ERROR code=' + (e && e.code) + ' msg=' + (e && e.message) + ' src=' + audio.currentSrc);
+          _onDone();
+        });
 
         audio.play().catch(function(err) {
           console.warn('[sfx] audio play failed:', err.message);
+          _report('sfx play() rejected: ' + err.name + ': ' + err.message + ' src=' + audio.currentSrc);
           _onDone(); // skip to next even on error
         });
       })();

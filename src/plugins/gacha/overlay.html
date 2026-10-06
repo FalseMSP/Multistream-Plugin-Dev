@@ -386,7 +386,8 @@ function handleGridPull(data) {
     }
 
     gridRoot.appendChild(cell);
-    vid.play().catch(() => {});
+    watchMedia(vid, 'grid');
+    playLogged(vid, 'grid');
   });
 
   gridUser.textContent = 'for ' + (data.user || 'someone');
@@ -416,9 +417,10 @@ function handlePull(data) {
 
   // Show backdrop + video
   backdrop.classList.add('visible');
+  clientLog('gacha pull event rarity=' + data.rarity + ' video=' + data.videoFile);
   video.src = data.videoFile;
   video.load();
-  video.play().catch(() => {});
+  playLogged(video, 'pull');
   video.classList.add('visible');
 
   // Schedule icon reveal
@@ -432,6 +434,27 @@ function handlePull(data) {
   // Hide everything after 13.5 s (plugin resets at 14 s)
   hideTimer = setTimeout(hideAll, 13500);
 }
+
+// ── Client diagnostics → bot log (OBS browser sources have no devtools) ─────
+function clientLog(msg) {
+  try {
+    fetch('/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(() => {});
+  } catch (_) {}
+}
+function watchMedia(el, label) {
+  el.addEventListener('error', () => {
+    const e = el.error;
+    clientLog('gacha ' + label + ' MEDIA ERROR code=' + (e && e.code) +
+      ' msg=' + (e && e.message) + ' src=' + el.currentSrc);
+  });
+  el.addEventListener('stalled', () => clientLog('gacha ' + label + ' stalled src=' + el.currentSrc));
+}
+function playLogged(el, label) {
+  const p = el.play();
+  if (p && p.catch) p.catch((err) => clientLog('gacha ' + label + ' play() rejected: ' +
+    (err && err.name) + ': ' + (err && err.message) + ' src=' + el.currentSrc));
+}
+clientLog('gacha overlay loaded UA=' + navigator.userAgent);
 
 // ── SSE connection to overlay-server ─────────────────────────────────────────
 // The overlay-server broadcasts: { type: 'section', id: 'gacha', data: { state, ... } }
@@ -463,6 +486,7 @@ function connect() {
   };
 }
 
+watchMedia(video, 'pull');
 connect();
 </script>
 </body>
