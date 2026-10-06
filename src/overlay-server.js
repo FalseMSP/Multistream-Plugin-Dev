@@ -832,6 +832,17 @@ function startOverlayServer(port = 2999) {
   const server = http.createServer((req, res) => {
     const url = req.url.split('?')[0];
 
+    // Connection diagnostics: shows in the bot log who (OBS vs a browser)
+    // is actually loading overlay pages / SSE, independent of client JS.
+    if (req.method === 'GET' && (url === '/gacha' || url === '/overlay' || url === '/sse')) {
+      const who = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?');
+      const ua  = (req.headers['user-agent'] || '?').slice(0, 160);
+      log.info(`[overlay] GET ${url} from ${who} UA=${ua}`);
+      if (url === '/sse') {
+        res.on('close', () => log.info(`[overlay] SSE closed (${who}) UA=${ua.slice(0, 60)}`));
+      }
+    }
+
     if (req.method === 'GET' && url === '/polls') {
       const html = _buildPollHtml();
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -860,10 +871,21 @@ function startOverlayServer(port = 2999) {
     if (req.method === 'GET' && url === '/sse') {
       res.writeHead(200, {
         'Content-Type':  'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-transform',
         'Connection':    'keep-alive',
+        'X-Accel-Buffering': 'no',
         'Access-Control-Allow-Origin': '*',
       });
+      // Flush headers now and keep the socket alive. Without a heartbeat,
+      // NAT/routers/proxies silently drop an idle SSE connection and the
+      // overlay then never receives live events (replay-on-connect still works).
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      try { req.socket.setKeepAlive(true, 15000); req.socket.setNoDelay(true); } catch {}
+      res.write(': connected\n\n');
+      const _hb = setInterval(() => {
+        try { res.write(': ping\n\n'); } catch { clearInterval(_hb); }
+      }, Number(process.env.OVERLAY_SSE_HEARTBEAT_MS) || 15000);
+      res.on('close', () => clearInterval(_hb));
       for (const [id, section] of _sections) {
         res.write(`data: ${JSON.stringify({ type: 'section', id, data: section.data })}\n\n`);
       }

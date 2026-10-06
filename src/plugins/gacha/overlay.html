@@ -1,496 +1,1147 @@
-<!DOCTYPE html>
+'use strict';
+
+/**
+ * overlay-server.js
+ * ─────────────────
+ * Plugin-driven stream overlay server. Any plugin can register a "section"
+ * that renders into the OBS browser source overlay.
+ *
+ * ── Plugin API ────────────────────────────────────────────────────────────
+ *
+ *   const overlay = require('./overlay-server');
+ *
+ *   overlay.registerSection('my-plugin', {
+ *     title:  'My Widget',         // header text
+ *     icon:   '<svg>…</svg>',      // raw SVG string shown left of title (22×22)
+ *     order:  10,                  // sort order among sections (default: 50)
+ *     render: renderFn.toString(), // client-side render fn, serialised to string
+ *                                  // signature: function render(data, el, esc) {}
+ *                                  //   data = whatever you passed to updateSection()
+ *                                  //   el   = the section's <div class="section-body">
+ *                                  //   esc  = HTML-escape helper
+ *   });
+ *
+ *   overlay.updateSection('my-plugin', { ...anyData });  // triggers SSE push
+ *
+ * ── HTTP endpoints ────────────────────────────────────────────────────────
+ *
+ *   GET /overlay          — OBS Browser Source page (add this URL in OBS)
+ *   GET /sse              — SSE stream (all sections share one connection)
+ *   GET /state            — full JSON snapshot of all section data (debug)
+ *   GET /state/:sectionId — single-section JSON snapshot
+ *   GET /sfx/*            — static audio files from src/overlay/public/sfx/
+ */
+
+const http = require('http');
+const fs   = require('fs');
+const path = require('path');
+const log  = require('./logger');
+
+// ── Static file root ──────────────────────────────────────────────────────
+// Files in src/overlay/public/ are served at their relative path.
+// e.g. src/overlay/public/sfx/vine-boom.mp3 → GET /sfx/vine-boom.mp3
+
+const PUBLIC_DIR = path.resolve(__dirname, 'overlay', 'public');
+
+const MIME_TYPES = {
+  '.mp3':  'audio/mpeg',
+  '.ogg':  'audio/ogg',
+  '.wav':  'audio/wav',
+  '.webm': 'audio/webm',
+  '.mp4':  'video/mp4',
+  '.png':  'image/png',
+  '.jpg':  'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif':  'image/gif',
+  '.svg':  'image/svg+xml',
+  '.css':  'text/css',
+  '.js':   'application/javascript',
+  '.json': 'application/json',
+  '.html': 'text/html; charset=utf-8',
+};
+
+function serveStatic(url, res, req) {
+  // Prevent path traversal
+  const rel     = path.normalize(url).replace(/^(\.\.[/\\])+/, '');
+  const absPath = path.join(PUBLIC_DIR, rel);
+  if (!absPath.startsWith(PUBLIC_DIR)) {
+    res.writeHead(403); res.end('Forbidden'); return true;
+  }
+
+  let stat;
+  try { stat = fs.statSync(absPath); } catch { return false; }
+  if (!stat.isFile()) return false;
+
+  const ext      = path.extname(absPath).toLowerCase();
+  const mimeType = MIME_TYPES[ext] ?? 'application/octet-stream';
+  const headers  = {
+    'Content-Type':  mimeType,
+    'Cache-Control': 'public, max-age=3600',
+    'Accept-Ranges': 'bytes',
+    'Access-Control-Allow-Origin': '*',
+  };
+
+  // Range support — OBS's browser source (Chromium/CEF) needs this to play
+  // mp4s whose moov atom is at the end of the file (not "faststart").
+  const range = req && req.headers && req.headers.range;
+  const m = range && /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (m && (m[1] || m[2])) {
+    let start, end;
+    if (m[1] === '') { start = Math.max(0, stat.size - parseInt(m[2], 10)); end = stat.size - 1; }
+    else { start = parseInt(m[1], 10); end = m[2] ? Math.min(parseInt(m[2], 10), stat.size - 1) : stat.size - 1; }
+    if (start >= stat.size || start > end) {
+      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` }); res.end(); return true;
+    }
+    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 });
+    fs.createReadStream(absPath, { start, end }).pipe(res);
+    return true;
+  }
+
+  res.writeHead(200, { ...headers, 'Content-Length': stat.size });
+  fs.createReadStream(absPath).pipe(res);
+  return true;
+}
+
+
+// ── Section registry ──────────────────────────────────────────────────────
+
+/** @type {Map<string, { title: string, icon: string, order: number, render: string, data: * }>} */
+const _sections = new Map();
+
+function registerSection(id, { title, icon = '', order = 50, render }) {
+  if (typeof render !== 'string') {
+    throw new TypeError(
+      `[overlay] registerSection('${id}'): opts.render must be a function serialised ` +
+      `to a string via myFn.toString() — the browser will eval it.`
+    );
+  }
+  _sections.set(id, { title, icon, order, render, data: null });
+  log.info(`[overlay] Section registered: ${id}`);
+}
+
+function updateSection(id, data) {
+  const section = _sections.get(id);
+  if (!section) {
+    log.warn(`[overlay] updateSection('${id}'): section not registered — did you call registerSection() first?`);
+    return;
+  }
+  section.data = data;
+  _broadcast({ type: 'section', id, data });
+}
+
+// ── SSE broadcast ─────────────────────────────────────────────────────────
+
+const _clients = new Set();
+
+function _broadcast(payload) {
+  if (_clients.size === 0) return;
+  const msg = `data: ${JSON.stringify(payload)}\n\n`;
+  for (const res of _clients) {
+    try { res.write(msg); } catch { _clients.delete(res); }
+  }
+}
+
+// ── Poll overlay state ────────────────────────────────────────────────────
+
+let _pollState = null;
+
+function updatePollOverlay(data) {
+  _pollState = data;
+  _broadcast({ type: 'poll', data });
+}
+
+// ── External chat/redeem API ──────────────────────────────────────────────
+//
+// External integrations (e.g. the ViewersHateMe Minecraft mod) need a
+// pull-based way to consume chat messages + redeems that have already
+// passed through the plugin pipeline. SSE works for browsers but is
+// awkward from a Java HTTP client, so we expose simple JSON polling
+// endpoints with a monotonic id cursor.
+//
+//   GET /api/chat?since=<id>&limit=<n>     → newest chat messages
+//   GET /api/redeems?since=<id>&limit=<n>  → newest redeems
+//   GET /api/state                         → server uptime + buffer sizes
+//
+// Messages are buffered in a small ring (default 1000 entries) so brief
+// poll gaps don't lose data. Producers call pushExternalChatMessage() /
+// pushExternalRedeem() — wired up from queue.onMessage / queue.onRedeem
+// in index.js.
+
+const EXTERNAL_BUFFER_MAX = 1000;
+
+/** @type {Array<{ id: number, platform: string, username: string, message: string, timestamp: number }>} */
+const _externalChatBuffer = [];
+/** @type {Array<{ id: number, platform: string, username: string, title: string, cost: number, input: string|null, timestamp: number }>} */
+const _externalRedeemBuffer = [];
+
+let _externalSeq = 0;
+const _externalStartedAt = Date.now();
+
+/**
+ * Append a chat message to the external API ring buffer.
+ * Producers (queue.onMessage) call this with the post-pipeline message.
+ *
+ * @param {{ platform: string, username: string, message: string }} msg
+ */
+function pushExternalChatMessage(msg) {
+  const entry = {
+    id:        ++_externalSeq,
+    platform:  String(msg.platform ?? ''),
+    username:  String(msg.username ?? ''),
+    message:   String(msg.message ?? ''),
+    timestamp: Date.now(),
+  };
+  _externalChatBuffer.push(entry);
+  if (_externalChatBuffer.length > EXTERNAL_BUFFER_MAX) {
+    _externalChatBuffer.splice(0, _externalChatBuffer.length - EXTERNAL_BUFFER_MAX);
+  }
+  return entry.id;
+}
+
+/**
+ * Append a redeem to the external API ring buffer.
+ * Producers (queue.onRedeem) call this. Redeems from the YouTube sync
+ * plugin arrive with a "[YT]" suffix on the title and no platform field,
+ * so we normalise: platform = 'youtube' if the title ends with [YT],
+ * otherwise 'twitch'.
+ *
+ * @param {{ username: string, title: string, cost?: number, input?: string|null, platform?: string }} redeem
+ */
+function pushExternalRedeem(redeem) {
+  let platform = redeem.platform;
+  let title    = String(redeem.title ?? '');
+  if (!platform) {
+    const m = title.match(/\s*\[YT\]\s*$/i);
+    if (m) {
+      platform = 'youtube';
+      title = title.slice(0, m.index);
+    } else {
+      platform = 'twitch';
+    }
+  }
+  const entry = {
+    id:        ++_externalSeq,
+    platform:  String(platform),
+    username:  String(redeem.username ?? ''),
+    title:     title.trim(),
+    cost:      Number(redeem.cost ?? 0),
+    input:     redeem.input ?? null,
+    timestamp: Date.now(),
+  };
+  _externalRedeemBuffer.push(entry);
+  if (_externalRedeemBuffer.length > EXTERNAL_BUFFER_MAX) {
+    _externalRedeemBuffer.splice(0, _externalRedeemBuffer.length - EXTERNAL_BUFFER_MAX);
+  }
+  return entry.id;
+}
+
+/**
+ * Drain entries from a buffer with id > since, capped at limit.
+ * Returns the entries in ascending id order (oldest first).
+ * @template T
+ * @param {T[]} buffer
+ * @param {number} since
+ * @param {number} limit
+ * @returns {T[]}
+ */
+function _drainSince(buffer, since, limit) {
+  const start = since > 0 ? since : 0;
+  // Linear scan is fine — buffer is capped at EXTERNAL_BUFFER_MAX.
+  const out = [];
+  for (const entry of buffer) {
+    if (entry.id <= start) continue;
+    out.push(entry);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/**
+ * Parse the `since` and `limit` query params from a request URL.
+ * Defaults: since = 0 (all buffered), limit = 100.
+ * @param {string} fullUrl
+ * @returns {{ since: number, limit: number }}
+ */
+function _parseCursor(fullUrl) {
+  try {
+    const q = fullUrl.split('?')[1] ?? '';
+    const params = new URLSearchParams(q);
+    const since  = Math.max(0, parseInt(params.get('since') ?? '0', 10) || 0);
+    const limit  = Math.min(500, Math.max(1, parseInt(params.get('limit') ?? '100', 10) || 100));
+    return { since, limit };
+  } catch {
+    return { since: 0, limit: 100 };
+  }
+}
+
+// ── Poll overlay HTML ─────────────────────────────────────────────────────
+
+function _buildPollHtml() {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Gacha Overlay</title>
+<meta charset="utf-8">
+<title>Poll Overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
 <style>
-  /* ── Reset & base ─────────────────────────────────────── */
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  html, body {
-    width: 1920px; height: 1080px;
-    overflow: hidden;
-    background: transparent;
-    font-family: 'Segoe UI', sans-serif;
+  :root {
+    --red:      #e53935;
+    --red-glow: rgba(229, 57, 53, 0.15);
+    --bg:       rgba(10, 8, 8, 0.92);
+    --border:   rgba(229, 57, 53, 0.3);
+    --text:     #f0e0e0;
+    --muted:    #6b4040;
+    --twitch:   #9147ff;
+    --youtube:  #ff0000;
   }
-
-  /* ── Root container ───────────────────────────────────── */
-  #gacha-root {
-    position: relative;
-    width: 100%; height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    pointer-events: none;
+  html, body { background: transparent; width: 420px; font-family: 'Inter', sans-serif; color: var(--text); -webkit-font-smoothing: antialiased; }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(30px); }
+    to   { opacity: 1; transform: translateX(0);    }
   }
-
-  /* ── Backdrop (dark vignette that fades in) ───────────── */
-  #backdrop {
-    position: absolute;
-    inset: 0;
-    background: radial-gradient(ellipse at center, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0.85) 100%);
-    opacity: 0;
-    transition: opacity 0.5s ease;
-    pointer-events: none;
+  @keyframes slideOut {
+    from { opacity: 1; transform: translateX(0);    }
+    to   { opacity: 0; transform: translateX(30px); }
   }
-  #backdrop.visible { opacity: 1; }
-
-  /* ── Video player ─────────────────────────────────────── */
-  #gacha-video {
-    position: absolute;
-    inset: 0;
-    width: 100%; height: 100%;
-    object-fit: contain;
-    opacity: 0;
-    transition: opacity 0.4s ease;
-    pointer-events: none;
-  }
-  #gacha-video.visible { opacity: 1; }
-
-  /* ── Icon reveal ──────────────────────────────────────── */
-  #icon-wrap {
-    position: absolute;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 24px;
-    opacity: 0;
-    transform: scale(0.6) translateY(30px);
-    transition: opacity 0.6s cubic-bezier(.22,1,.36,1),
-                transform 0.6s cubic-bezier(.22,1,.36,1);
-    pointer-events: none;
-    z-index: 10;
-  }
-  #icon-wrap.visible {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
-
-  #item-icon {
-    width: 260px;
-    height: 260px;
-    object-fit: contain;
-    filter: drop-shadow(0 0 40px var(--rarity-glow, rgba(255,255,255,0.6)));
-    image-rendering: pixelated; /* good for pixel art icons */
-  }
-
-  /* ── Rarity label ─────────────────────────────────────── */
-  #rarity-badge {
-    font-size: 22px;
-    font-weight: 900;
-    letter-spacing: 0.25em;
-    text-transform: uppercase;
-    color: var(--rarity-color, #fff);
-    text-shadow: 0 0 20px var(--rarity-glow, rgba(255,255,255,0.8)),
-                 0 2px 4px rgba(0,0,0,0.8);
-    padding: 6px 24px;
-    border: 2px solid var(--rarity-color, #fff);
-    border-radius: 4px;
-    background: rgba(0,0,0,0.4);
-    backdrop-filter: blur(4px);
-  }
-
-  #item-label {
-    font-size: 38px;
-    font-weight: 800;
-    color: #fff;
-    text-shadow: 0 0 30px rgba(255,255,255,0.5), 0 3px 8px rgba(0,0,0,0.9);
-    text-align: center;
-    max-width: 900px;
-    line-height: 1.2;
-  }
-
-  #pull-user {
-    font-size: 22px;
-    color: rgba(255,255,255,0.6);
-    text-shadow: 0 1px 4px rgba(0,0,0,0.8);
-  }
-
-  /* ── Rarity colour themes ─────────────────────────────── */
-  .rarity-common    { --rarity-color: #aaaaaa; --rarity-glow: rgba(170,170,170,0.7); }
-  .rarity-uncommon  { --rarity-color: #4cff82; --rarity-glow: rgba(76,255,130,0.7); }
-  .rarity-rare      { --rarity-color: #4ab4ff; --rarity-glow: rgba(74,180,255,0.8); }
-  .rarity-epic      { --rarity-color: #c47eff; --rarity-glow: rgba(196,126,255,0.9); }
-  .rarity-legendary { --rarity-color: #ffd54a; --rarity-glow: rgba(255,213,74,1.0); }
-  .rarity-mythic    { --rarity-color: #ff6060; --rarity-glow: rgba(255,96,96,1.0); }
-  .rarity-oneofone  { --rarity-color: #ff4ef7; --rarity-glow: rgba(255,78,247,1.0); }
-  .rarity-dud       { --rarity-color: #888888; --rarity-glow: rgba(136,136,136,0.5); }
-
-  /* ── Legendary+ shimmer effect ────────────────────────── */
-  @keyframes shimmer {
-    0%   { filter: drop-shadow(0 0 40px var(--rarity-glow)) brightness(1); }
-    50%  { filter: drop-shadow(0 0 80px var(--rarity-glow)) brightness(1.3); }
-    100% { filter: drop-shadow(0 0 40px var(--rarity-glow)) brightness(1); }
-  }
-  .shimmer #item-icon { animation: shimmer 1.4s ease-in-out infinite; }
-
-  /* ── Mythic particle burst (CSS-only rings) ───────────── */
-  @keyframes ring-expand {
-    0%   { transform: scale(0.2); opacity: 0.9; }
-    100% { transform: scale(3.5); opacity: 0; }
-  }
-  .ring {
-    position: absolute;
-    width: 260px; height: 260px;
-    border-radius: 50%;
-    border: 3px solid var(--rarity-glow, rgba(255,96,96,0.8));
-    animation: ring-expand 1.8s ease-out infinite;
-    pointer-events: none;
-  }
-  .ring:nth-child(2) { animation-delay: 0.6s; }
-  .ring:nth-child(3) { animation-delay: 1.2s; }
-
-  /* ── Grid reveal (multiple simultaneous pulls) ────────── */
-  #grid-root {
-    position: absolute;
-    inset: 0;
-    display: none;
-    grid-auto-rows: 1fr;
-    gap: 12px;
-    padding: 40px;
-    pointer-events: none;
-  }
-  #grid-root.visible { display: grid; }
-
-  .grid-cell {
-    position: relative;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: hidden;
-    border-radius: 12px;
-    background: rgba(0,0,0,0.35);
-    /* Without these, flex/grid children with intrinsic content (icons, text)
-       can blow out the 1fr track sizing and cause the grid to overflow the
-       1920×1080 stage. Forcing them to shrink-to-fit keeps cells square. */
-    min-width: 0;
-    min-height: 0;
-  }
-
-  .grid-cell video {
-    position: absolute;
-    inset: 0;
-    width: 100%; height: 100%;
-    object-fit: contain;
-  }
-
-  .grid-cell .grid-icon-wrap {
-    position: absolute;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    opacity: 0;
-    transform: scale(0.7);
-    transition: opacity 0.5s cubic-bezier(.22,1,.36,1),
-                transform 0.5s cubic-bezier(.22,1,.36,1);
-    z-index: 2;
-  }
-  .grid-cell .grid-icon-wrap.visible {
-    opacity: 1;
-    transform: scale(1);
-  }
-
-  .grid-cell .grid-icon {
-    width: 40%;
-    max-width: 160px;
-    object-fit: contain;
-    filter: drop-shadow(0 0 24px var(--rarity-glow, rgba(255,255,255,0.6)));
-    image-rendering: pixelated;
-  }
-
-  .grid-cell .grid-label {
-    font-size: 16px;
-    font-weight: 800;
-    color: #fff;
-    text-align: center;
-    text-shadow: 0 0 16px rgba(255,255,255,0.5), 0 2px 6px rgba(0,0,0,0.9);
-    padding: 0 8px;
-  }
-
-  .grid-cell .grid-rarity {
-    font-size: 11px;
-    font-weight: 900;
-    letter-spacing: 0.15em;
-    text-transform: uppercase;
-    color: var(--rarity-color, #fff);
-    text-shadow: 0 0 10px var(--rarity-glow, rgba(255,255,255,0.8));
-  }
-
-  /* Per-cell recipient name (used by the gifted-sub batcher — each cell
-     can be attributed to a different recipient). Hidden by default;
-     shown when the grid item carries its own `user` field. */
-  .grid-cell .grid-recipient {
-    font-size: 12px;
-    font-weight: 600;
-    color: rgba(255,255,255,0.75);
-    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
-    max-width: 100%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    padding: 0 4px;
-  }
-
-  #grid-user {
-    position: absolute;
-    bottom: 16px; left: 0; right: 0;
-    text-align: center;
-    font-size: 22px;
-    color: rgba(255,255,255,0.8);
-    text-shadow: 0 1px 4px rgba(0,0,0,0.8);
-    z-index: 3;
-  }
+  .overlay-card { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; width: 420px; opacity: 0; }
+  .overlay-card.is-visible  { animation: slideIn  0.35s cubic-bezier(0.22,1,0.36,1) forwards; }
+  .overlay-card.is-hiding   { animation: slideOut 0.3s  ease-in                     forwards; }
+  .section-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: rgba(229, 57, 53, 0.08); }
+  .section-icon { width: 22px; height: 22px; flex-shrink: 0; }
+  .section-title { font-size: 13px; font-weight: 900; letter-spacing: 0.14em; text-transform: uppercase; color: var(--red); }
+  .section-badge { margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
+  .poll-title { padding: 12px 14px 8px; font-size: 14px; font-weight: 700; color: var(--text); line-height: 1.3; border-bottom: 1px solid rgba(229, 57, 53, 0.12); }
+  .option { padding: 8px 14px; border-bottom: 1px solid rgba(229, 57, 53, 0.08); position: relative; overflow: hidden; }
+  .option:last-of-type { border-bottom: none; }
+  .option-bar { position: absolute; inset: 0; background: rgba(229, 57, 53, 0.12); transition: width 0.5s ease; }
+  .option.leading .option-bar { background: rgba(229, 57, 53, 0.22); border-left: 3px solid var(--red); }
+  .option-row { position: relative; display: flex; align-items: center; gap: 8px; }
+  .option-num { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); font-weight: 700; width: 16px; flex-shrink: 0; text-align: right; }
+  .option.leading .option-num { color: var(--red); }
+  .option-lbl { font-size: 13px; font-weight: 700; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text); }
+  .option.leading .option-lbl { color: #fff; }
+  .option-pct { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--muted); font-weight: 700; min-width: 36px; text-align: right; }
+  .option.leading .option-pct { color: var(--red); }
+  .option-votes { font-family: 'JetBrains Mono', monospace; font-size: 10px; color: rgba(107, 64, 64, 0.7); min-width: 28px; text-align: right; }
+  .poll-footer { display: flex; align-items: center; justify-content: space-between; padding: 7px 14px; border-top: 1px solid rgba(229, 57, 53, 0.12); background: rgba(229, 57, 53, 0.04); }
+  .footer-total { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
+  .footer-platforms { display: flex; gap: 6px; align-items: center; }
+  .platform-dot { width: 6px; height: 6px; border-radius: 50%; }
+  .platform-dot.twitch  { background: var(--twitch); }
+  .platform-dot.youtube { background: var(--youtube); }
+  .platform-label { font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .footer-timer { display: flex; align-items: center; gap: 5px; }
+  .timer-bar-track { width: 60px; height: 3px; background: rgba(229, 57, 53, 0.12); border-radius: 2px; overflow: hidden; }
+  .timer-bar-fill { height: 100%; background: var(--red); border-radius: 2px; transition: width 1s linear; }
+  .timer-text { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); min-width: 32px; }
+  .msg-reconnecting { padding: 6px 14px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--red); border-top: 1px solid rgba(229, 57, 53, 0.2); display: none; animation: blink 1s step-start infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
 </style>
 </head>
 <body>
-<div id="gacha-root">
-  <div id="backdrop"></div>
-  <video id="gacha-video" autoplay playsinline></video>
-
-  <div id="icon-wrap">
-    <!-- Particle rings (shown for mythic/oneofone) -->
-    <div id="rings" style="position:absolute; display:none;">
-      <div class="ring"></div>
-      <div class="ring"></div>
-      <div class="ring"></div>
-    </div>
-
-    <img id="item-icon" src="" alt=""/>
-    <div id="rarity-badge">Common</div>
-    <div id="item-label">Item Name</div>
-    <div id="pull-user">for username</div>
+<div class="overlay-card" id="card" class="${_pollState ? 'is-visible' : ''}">
+  <div class="section-header">
+    <span class="section-icon">
+      <svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="2" y="5" width="5" height="13" rx="1" fill="#e53935" opacity="0.5"/>
+        <rect x="9" y="9" width="5" height="9" rx="1" fill="#e53935" opacity="0.75"/>
+        <rect x="16" y="3" width="5" height="15" rx="1" fill="#e53935"/>
+      </svg>
+    </span>
+    <span class="section-title" id="header-label">Poll</span>
+    <span class="section-badge" id="header-badge"></span>
   </div>
-
-  <div id="grid-root">
-    <div id="grid-user"></div>
-  </div>
+  <div id="content"></div>
+  <div class="msg-reconnecting" id="reconnect-msg">⚠ RECONNECTING…</div>
 </div>
 
 <script>
-// ── Frame counter for the 150-frame icon reveal ───────────────────────────────
-const ICON_REVEAL_FRAMES = 150;
-const FPS = 24; // assumed video FPS
-const ICON_REVEAL_MS = (ICON_REVEAL_FRAMES / FPS) * 1000; // ≈ 6250 ms
+(function () {
+  const initialData = ${JSON.stringify(_pollState)};
+  const card        = document.getElementById('card');
+  const content     = document.getElementById('content');
+  const headerLabel = document.getElementById('header-label');
+  const headerBadge = document.getElementById('header-badge');
+  const reconnectMsg = document.getElementById('reconnect-msg');
+  let _timerInterval = null;
 
-const backdrop   = document.getElementById('backdrop');
-const video      = document.getElementById('gacha-video');
-const iconWrap   = document.getElementById('icon-wrap');
-const itemIcon   = document.getElementById('item-icon');
-const rarityBadge= document.getElementById('rarity-badge');
-const itemLabel  = document.getElementById('item-label');
-const pullUser   = document.getElementById('pull-user');
-const rings      = document.getElementById('rings');
-const root       = document.getElementById('gacha-root');
-const gridRoot   = document.getElementById('grid-root');
-const gridUser   = document.getElementById('grid-user');
-
-let iconTimer = null;
-let hideTimer = null;
-let gridTimers = [];
-
-const SHIMMER_RARITIES  = new Set(['legendary', 'mythic', 'oneofone']);
-const RINGS_RARITIES    = new Set(['mythic', 'oneofone']);
-
-function resetTimers() {
-  clearTimeout(iconTimer);
-  clearTimeout(hideTimer);
-  gridTimers.forEach(clearTimeout);
-  gridTimers = [];
-}
-
-function hideAll() {
-  backdrop.classList.remove('visible');
-  video.classList.remove('visible');
-  iconWrap.classList.remove('visible');
-  video.src = '';
-  itemIcon.src = '';
-  rings.style.display = 'none';
-  root.className = '';
-  iconWrap.className = '';
-  gridRoot.classList.remove('visible');
-  gridRoot.innerHTML = '';
-  gridRoot.insertAdjacentElement('afterbegin', gridUser);
-  gridUser.textContent = '';
-  resetTimers();
-}
-
-// Pick a grid layout (cols x rows) that's roughly square for `count` cells.
-function _gridDims(count) {
-  const cols = Math.ceil(Math.sqrt(count));
-  const rows = Math.ceil(count / cols);
-  return { cols, rows };
-}
-
-function handleGridPull(data) {
-  resetTimers();
-  hideAll(); // clear any leftover single-pull state first
-  resetTimers();
-
-  const items = data.items || [];
-  const { cols, rows } = _gridDims(items.length);
-  gridRoot.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
-  gridRoot.style.gridTemplateRows    = `repeat(${rows}, 1fr)`;
-
-  items.forEach((item, i) => {
-    const cell = document.createElement('div');
-    cell.className = 'grid-cell rarity-' + item.rarity;
-
-    const vid = document.createElement('video');
-    vid.autoplay = true;
-    vid.playsInline = true;
-    vid.volume = 1;
-    vid.src = item.videoFile;
-    cell.appendChild(vid);
-
-    if (!item.isDud && item.iconPath) {
-      const iconWrapEl = document.createElement('div');
-      iconWrapEl.className = 'grid-icon-wrap';
-
-      const icon = document.createElement('img');
-      icon.className = 'grid-icon';
-      icon.src = item.iconPath;
-      iconWrapEl.appendChild(icon);
-
-      const rarityEl = document.createElement('div');
-      rarityEl.className = 'grid-rarity';
-      rarityEl.textContent = item.rarity === 'oneofone' ? 'One of One' :
-        item.rarity.charAt(0).toUpperCase() + item.rarity.slice(1);
-      iconWrapEl.appendChild(rarityEl);
-
-      const labelEl = document.createElement('div');
-      labelEl.className = 'grid-label';
-      labelEl.textContent = item.label || '';
-      iconWrapEl.appendChild(labelEl);
-
-      // Per-cell recipient name. Only shown when the item carries its
-      // own `user` field (i.e. the grid came from the gifted-sub batcher,
-      // where each cell is a different recipient). When the grid is for
-      // a single user (bits cheer, /pull command), the header line below
-      // the grid already shows the name and we skip the per-cell line to
-      // avoid redundancy.
-      if (item.user) {
-        const recipientEl = document.createElement('div');
-        recipientEl.className = 'grid-recipient';
-        recipientEl.textContent = '↳ ' + item.user;
-        iconWrapEl.appendChild(recipientEl);
-      }
-
-      cell.appendChild(iconWrapEl);
-
-      const t = setTimeout(() => iconWrapEl.classList.add('visible'), ICON_REVEAL_MS);
-      gridTimers.push(t);
-    }
-
-    gridRoot.appendChild(cell);
-    watchMedia(vid, 'grid');
-    playLogged(vid, 'grid');
-  });
-
-  gridUser.textContent = 'for ' + (data.user || 'someone');
-  backdrop.classList.add('visible');
-  gridRoot.classList.add('visible');
-
-  const t = setTimeout(hideAll, 13500);
-  gridTimers.push(t);
-}
-
-function handlePull(data) {
-  resetTimers();
-
-  // Set rarity theme
-  const rarityClass = 'rarity-' + data.rarity;
-  root.className = rarityClass;
-  iconWrap.className = rarityClass;
-  if (SHIMMER_RARITIES.has(data.rarity)) iconWrap.classList.add('shimmer');
-  if (RINGS_RARITIES.has(data.rarity))   rings.style.display = 'block';
-  else                                    rings.style.display = 'none';
-
-  // Set text
-  rarityBadge.textContent = data.rarity === 'oneofone' ? 'One of One' :
-    data.rarity.charAt(0).toUpperCase() + data.rarity.slice(1);
-  itemLabel.textContent  = data.label  || '';
-  pullUser.textContent   = 'for ' + (data.user || 'someone');
-
-  // Show backdrop + video
-  backdrop.classList.add('visible');
-  clientLog('gacha pull event rarity=' + data.rarity + ' video=' + data.videoFile);
-  video.src = data.videoFile;
-  video.load();
-  playLogged(video, 'pull');
-  video.classList.add('visible');
-
-  // Schedule icon reveal
-  if (!data.isDud && data.iconPath) {
-    itemIcon.src = data.iconPath;
-    iconTimer = setTimeout(() => {
-      iconWrap.classList.add('visible');
-    }, ICON_REVEAL_MS);
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // Hide everything after 13.5 s (plugin resets at 14 s)
-  hideTimer = setTimeout(hideAll, 13500);
-}
+  function fmtTime(ms) {
+    if (ms <= 0) return '0s';
+    const s = Math.round(ms / 1000);
+    return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+  }
 
-// ── Client diagnostics → bot log (OBS browser sources have no devtools) ─────
-function clientLog(msg) {
-  try {
-    fetch('/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(() => {});
-  } catch (_) {}
-}
-function watchMedia(el, label) {
-  el.addEventListener('error', () => {
-    // hideAll() clears video.src = '' which makes browsers fire an
-    // "Invalid URI" error. That's expected, not a real load failure.
-    if (!el.getAttribute('src')) return;
-    const e = el.error;
-    clientLog('gacha ' + label + ' MEDIA ERROR code=' + (e && e.code) +
-      ' msg=' + (e && e.message) + ' src=' + el.currentSrc);
-  });
-  el.addEventListener('stalled', () => clientLog('gacha ' + label + ' stalled src=' + el.currentSrc));
-}
-function playLogged(el, label) {
-  const p = el.play();
-  if (p && p.catch) p.catch((err) => clientLog('gacha ' + label + ' play() rejected: ' +
-    (err && err.name) + ': ' + (err && err.message) + ' src=' + el.currentSrc));
-}
-clientLog('gacha overlay loaded UA=' + navigator.userAgent);
+  function render(data) {
+    if (_timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
 
-// ── SSE connection to overlay-server ─────────────────────────────────────────
-// The overlay-server broadcasts: { type: 'section', id: 'gacha', data: { state, ... } }
-// via the standard /sse endpoint — no named events, just onmessage.
-function connect() {
-  const es = new EventSource('/sse');
-
-  es.onmessage = function(e) {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type !== 'section' || msg.id !== 'gacha') return;
-      const data = msg.data;
-      if (!data) return;
-      if (data.state === 'pulling') {
-        handlePull(data);
-      } else if (data.state === 'grid') {
-        handleGridPull(data);
-      } else if (data.state === 'idle') {
-        hideAll();
-      }
-    } catch(err) {
-      console.error('[gacha overlay] parse error', err);
+    if (!data) {
+      card.classList.remove('is-visible');
+      card.classList.add('is-hiding');
+      setTimeout(() => {
+        card.classList.remove('is-hiding');
+        headerLabel.textContent = 'Poll';
+        headerBadge.textContent = '';
+        content.innerHTML = '';
+      }, 300);
+      return;
     }
-  };
 
-  es.onerror = function() {
-    es.close();
-    setTimeout(connect, 3000); // reconnect
-  };
-}
+    if (!card.classList.contains('is-visible')) {
+      card.classList.remove('is-hiding');
+      card.classList.add('is-visible');
+    }
+    headerLabel.textContent = data.type === 'prediction' ? 'Prediction' : 'Poll';
 
-watchMedia(video, 'pull');
-connect();
+    const total    = Object.values((data.combinedVotes ?? data.ytVotes)).reduce((a, b) => a + b, 0) || 0;
+    const hasVotes = total > 0;
+    const leadIdx  = data.options.reduce((best, _, i) =>
+      ((data.combinedVotes ?? data.ytVotes)[i] ?? 0) > ((data.combinedVotes ?? data.ytVotes)[best] ?? 0) ? i : best, 0);
+
+    const optionHtml = data.options.map((opt, i) => {
+      const v   = (data.combinedVotes ?? data.ytVotes)[i] ?? 0;
+      const pct = hasVotes ? Math.round((v / total) * 100) : 0;
+      const lead = hasVotes && i === leadIdx;
+      return \`<div class="option\${lead ? ' leading' : ''}" id="opt-\${i}">
+        <div class="option-bar" id="bar-\${i}" style="width:\${pct}%"></div>
+        <div class="option-row">
+          <span class="option-num">\${i + 1}</span>
+          <span class="option-lbl">\${esc(opt)}</span>
+          <span class="option-pct" id="pct-\${i}">\${pct}%</span>
+          <span class="option-votes" id="votes-\${i}">\${v}</span>
+        </div>
+      </div>\`;
+    }).join('');
+
+    const platformsHtml = data.platforms.map(p =>
+      \`<span class="platform-dot \${p}"></span><span class="platform-label">\${p}</span>\`
+    ).join('');
+
+    content.innerHTML =
+      \`<div class="poll-title">\${esc(data.title)}</div>\` +
+      optionHtml +
+      \`<div class="poll-footer">
+        <span class="footer-total" id="footer-total">\${total} vote\${total !== 1 ? 's' : ''}</span>
+        <div class="footer-platforms">\${platformsHtml}</div>
+        <div class="footer-timer">
+          <div class="timer-bar-track"><div class="timer-bar-fill" id="timer-fill"></div></div>
+          <span class="timer-text" id="timer-text"></span>
+        </div>
+      </div>\`;
+
+    headerBadge.textContent = total + ' votes';
+
+    function tick() {
+      const remaining = data.ended
+        ? 0
+        : Math.max(0, data.durationMs - (Date.now() - data.startedAt));
+      const pctLeft   = Math.round((remaining / data.durationMs) * 100);
+      const tf = document.getElementById('timer-fill');
+      const tt = document.getElementById('timer-text');
+      if (tf) tf.style.width = pctLeft + '%';
+      if (tt) tt.textContent = data.ended ? 'ended' : fmtTime(remaining);
+      if (remaining === 0 && _timerInterval) { clearInterval(_timerInterval); _timerInterval = null; }
+    }
+    tick();
+    _timerInterval = setInterval(tick, 1000);
+  }
+
+  function applyVoteUpdate(data) {
+    if (!data) { render(null); return; }
+    if (!document.getElementById('opt-0')) { render(data); return; }
+
+    const total    = Object.values((data.combinedVotes ?? data.ytVotes)).reduce((a, b) => a + b, 0) || 0;
+    const hasVotes = total > 0;
+    const leadIdx  = data.options.reduce((best, _, i) =>
+      ((data.combinedVotes ?? data.ytVotes)[i] ?? 0) > ((data.combinedVotes ?? data.ytVotes)[best] ?? 0) ? i : best, 0);
+
+    data.options.forEach((_, i) => {
+      const v   = (data.combinedVotes ?? data.ytVotes)[i] ?? 0;
+      const pct = hasVotes ? Math.round((v / total) * 100) : 0;
+      const lead = hasVotes && i === leadIdx;
+      const optEl   = document.getElementById('opt-' + i);
+      const barEl   = document.getElementById('bar-' + i);
+      const pctEl   = document.getElementById('pct-' + i);
+      const voteEl  = document.getElementById('votes-' + i);
+      if (!optEl) return;
+      optEl.classList.toggle('leading', lead);
+      if (barEl)  barEl.style.width    = pct + '%';
+      if (pctEl)  pctEl.textContent    = pct + '%';
+      if (voteEl) voteEl.textContent   = v;
+    });
+
+    const ft = document.getElementById('footer-total');
+    if (ft) ft.textContent = total + ' vote' + (total !== 1 ? 's' : '');
+    headerBadge.textContent = total + ' votes';
+  }
+
+  render(initialData);
+
+  let es;
+  function connect() {
+    es = new EventSource('/sse');
+    es.onopen    = () => { reconnectMsg.style.display = 'none'; };
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type !== 'poll') return;
+        if (!msg.data || !document.getElementById('opt-0')) render(msg.data);
+        else applyVoteUpdate(msg.data);
+      } catch {}
+    };
+    es.onerror = () => {
+      reconnectMsg.style.display = 'block';
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+  connect();
+})();
 </script>
 </body>
-</html>
+</html>`;
+}
+
+// ── Shared section stylesheet ─────────────────────────────────────────────
+// Single source of truth for the CSS that section render functions rely on
+// (.entry*, .platform-dot, .msg*, header/card chrome, CSS vars).
+// Used by BOTH the /overlay mosaic page and buildStandaloneSectionPage() so
+// a section renders identically everywhere.
+//
+// FIX: the standalone page previously shipped without the .entry*/.msg*/
+// .platform-dot rules — the /gd-queue OBS browser source rendered as
+// unstyled text. Any new shared rule (e.g. .entry-name) belongs HERE.
+
+const _SECTION_CSS = `
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --red:      #e53935;
+    --red-dim:  #7f1d1d;
+    --red-glow: rgba(229, 57, 53, 0.15);
+    --bg:       rgba(10, 8, 8, 0.92);
+    --bg-row:   rgba(229, 57, 53, 0.05);
+    --border:   rgba(229, 57, 53, 0.3);
+    --text:     #f0e0e0;
+    --muted:    #6b4040;
+    --danger:   #ff1744;
+    --twitch:   #9147ff;
+    --youtube:  #ff0000;
+  }
+
+  html, body {
+    background: transparent;
+    width: 420px;
+    font-family: 'Inter', sans-serif;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .overlay-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    width: 420px;
+    margin-bottom: 10px;
+  }
+
+  .overlay-card[data-state="closed"] {
+    border-color: var(--red-dim);
+    opacity: 0.55;
+  }
+  .overlay-card[data-state="closed"] .section-header {
+    background: rgba(127, 29, 29, 0.4);
+  }
+  .overlay-card[data-state="closed"] .section-title {
+    color: var(--muted);
+  }
+
+  .section-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(229, 57, 53, 0.08);
+  }
+  .section-icon  { width: 22px; height: 22px; flex-shrink: 0; }
+  .section-title {
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--red);
+  }
+  .section-badge {
+    margin-left: auto;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+  }
+  .section-body  { /* content is delegated to the plugin's render fn */ }
+
+  .entry {
+    display: grid;
+    grid-template-columns: 28px 1fr;
+    align-items: center;
+    gap: 4px 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid rgba(229, 57, 53, 0.08);
+    animation: fadeIn 0.2s ease;
+  }
+  .entry:last-child  { border-bottom: none; }
+  .entry:first-child {
+    background: var(--red-glow);
+    border-left: 3px solid var(--red);
+  }
+  .entry:first-child .entry-id  { color: #fff; }
+  .entry:first-child .entry-pos { color: var(--red); }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-4px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .entry-pos {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+    font-weight: 700;
+  }
+  .entry-main   { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .entry-id     { font-size: 18px; font-weight: 700; color: var(--red); letter-spacing: 0.02em; line-height: 1.1; }
+  .entry-name   {
+    font-size: 15px;
+    font-weight: 700;
+    color: #fff;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .entry-user   {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .entry-notes {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    color: rgba(229, 57, 53, 0.4);
+    font-style: italic;
+    padding-left: 38px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .platform-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .platform-dot.twitch  { background: var(--twitch); }
+  .platform-dot.youtube { background: var(--youtube); }
+
+  .msg {
+    padding: 16px 14px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-align: center;
+  }
+  .msg-empty  { color: var(--muted); }
+  .msg-closed { color: var(--red-dim); }
+  .msg-reconnecting {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--red);
+    border-top: 1px solid rgba(229, 57, 53, 0.2);
+    animation: blink 1s step-start infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+`;
+
+// ── Overlay HTML shell ────────────────────────────────────────────────────
+
+function _buildHtml() {
+  const ordered = [..._sections.entries()]
+    .sort(([, a], [, b]) => a.order - b.order);
+
+  const sectionMeta = ordered.map(([id, s]) => ({
+    id,
+    title:  s.title,
+    icon:   s.icon,
+    render: s.render,
+  }));
+
+  const initialData = Object.fromEntries(
+    [..._sections.entries()].map(([id, s]) => [id, s.data])
+  );
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Stream Overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+${_SECTION_CSS}
+</style>
+</head>
+<body>
+<div id="overlay-root"></div>
+
+<script>
+(function () {
+  const SECTIONS    = ${JSON.stringify(sectionMeta)};
+  const initialData = ${JSON.stringify(initialData)};
+
+  const renderers = {};
+  for (const s of SECTIONS) {
+    try {
+      renderers[s.id] = new Function('return (' + s.render + ')')();
+    } catch (e) {
+      console.error('[overlay] compile error in', s.id, e);
+      renderers[s.id] = () => {};
+    }
+  }
+
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  const root   = document.getElementById('overlay-root');
+  const cards  = {};
+  const bodies = {};
+
+  for (const s of SECTIONS) {
+    const card = document.createElement('div');
+    card.className = 'overlay-card';
+    card.id        = 'card-' + s.id;
+    card.innerHTML =
+      '<div class="section-header">' +
+        '<span class="section-icon">'  + s.icon          + '</span>' +
+        '<span class="section-title">' + esc(s.title)    + '</span>' +
+        '<span class="section-badge" id="badge-' + s.id + '"></span>' +
+      '</div>' +
+      '<div class="section-body" id="body-' + s.id + '"></div>';
+    root.appendChild(card);
+    cards[s.id]  = card;
+    bodies[s.id] = card.querySelector('.section-body');
+  }
+
+  function invoke(id, data) {
+    if (!renderers[id] || !bodies[id]) return;
+    try {
+      renderers[id](data, bodies[id], esc, {
+        card:  cards[id],
+        badge: document.getElementById('badge-' + id),
+      });
+    } catch (e) { console.error('[overlay] render error in', id, e); }
+  }
+
+  for (const s of SECTIONS) invoke(s.id, initialData[s.id]);
+
+  const reconnEl = document.createElement('div');
+  reconnEl.className     = 'msg msg-reconnecting';
+  reconnEl.style.display = 'none';
+  reconnEl.textContent   = '⚠ RECONNECTING…';
+  root.appendChild(reconnEl);
+
+  let es;
+  function connect() {
+    es = new EventSource('/sse');
+    es.onopen    = () => { reconnEl.style.display = 'none'; };
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'section') invoke(msg.id, msg.data);
+      } catch {}
+    };
+    es.onerror = () => {
+      reconnEl.style.display = 'block';
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>`;
+}
+
+
+// ── Extra route registry (plugins can add GET routes to this server) ──────
+
+/** @type {Map<string, (req: http.IncomingMessage, res: http.ServerResponse) => void>} */
+const _extraRoutes = new Map();
+
+/**
+ * Prefix-based route registry for paths like /clipcurator/*.
+ * Entries are checked via url.startsWith(prefix) before exact routes.
+ * @type {Array<{ prefix: string, handler: (req: http.IncomingMessage, res: http.ServerResponse) => void }>}
+ */
+const _prefixRoutes = [];
+
+/**
+ * Register a custom GET route on the overlay server.
+ * Safe to call before startOverlayServer() — routes are stored in a Map
+ * and consulted at request time.
+ *
+ * @param {string}   path     Exact path to match, e.g. '/tnt_placing'
+ * @param {Function} handler  (req, res) => void
+ */
+function addRoute(path, handler) {
+  _extraRoutes.set(path, handler);
+  log.info(`[overlay] Extra route registered: GET ${path}`);
+}
+
+/**
+ * Register a prefix-based route on the overlay server.
+ * Any request whose URL starts with `prefix` will be dispatched to `handler`.
+ * Prefix routes are checked BEFORE exact routes, so a /clipcurator prefix
+ * will match /clipcurator, /clipcurator/, /clipcurator/api/stats, etc.
+ *
+ * @param {string}   prefix   Path prefix to match, e.g. '/clipcurator'
+ * @param {Function} handler  (req, res) => void
+ */
+function addPrefixRoute(prefix, handler) {
+  _prefixRoutes.push({ prefix, handler });
+  log.info(`[overlay] Prefix route registered: ${prefix}/*`);
+}
+
+// ── HTTP server ───────────────────────────────────────────────────────────
+
+function startOverlayServer(port = 2999) {
+  const server = http.createServer((req, res) => {
+    const url = req.url.split('?')[0];
+
+    // Connection diagnostics: shows in the bot log who (OBS vs a browser)
+    // is actually loading overlay pages / SSE, independent of client JS.
+    if (req.method === 'GET' && (url === '/gacha' || url === '/overlay' || url === '/sse')) {
+      const who = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?');
+      const ua  = (req.headers['user-agent'] || '?').slice(0, 160);
+      log.info(`[overlay] GET ${url} from ${who} UA=${ua}`);
+      if (url === '/sse') {
+        res.on('close', () => log.info(`[overlay] SSE closed (${who}) UA=${ua.slice(0, 60)}`));
+      }
+    }
+
+    if (req.method === 'GET' && url === '/polls') {
+      const html = _buildPollHtml();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/overlay') {
+      const html = _buildHtml();
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+      return;
+    }
+
+    // Overlay pages (e.g. the OBS browser source, where there is no
+    // devtools) POST media/playback diagnostics here so they show up in the
+    // bot's log.
+    if (req.method === 'POST' && url === '/__client-log') {
+      let body = '';
+      req.on('data', (c) => { if (body.length < 4096) body += c; });
+      req.on('end', () => { log.warn('[client] ' + body.slice(0, 4096)); });
+      res.writeHead(204); res.end();
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/sse') {
+      res.writeHead(200, {
+        'Content-Type':  'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection':    'keep-alive',
+        'X-Accel-Buffering': 'no',
+        'Access-Control-Allow-Origin': '*',
+      });
+      // Flush headers now and keep the socket alive. Without a heartbeat,
+      // NAT/routers/proxies silently drop an idle SSE connection and the
+      // overlay then never receives live events (replay-on-connect still works).
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      try { req.socket.setKeepAlive(true, 15000); req.socket.setNoDelay(true); } catch {}
+      res.write(': connected\n\n');
+      const _hb = setInterval(() => {
+        try { res.write(': ping\n\n'); } catch { clearInterval(_hb); }
+      }, Number(process.env.OVERLAY_SSE_HEARTBEAT_MS) || 15000);
+      res.on('close', () => clearInterval(_hb));
+      for (const [id, section] of _sections) {
+        res.write(`data: ${JSON.stringify({ type: 'section', id, data: section.data })}\n\n`);
+      }
+      if (_pollState !== undefined) {
+        res.write(`data: ${JSON.stringify({ type: 'poll', data: _pollState })}\n\n`);
+      }
+      _clients.add(res);
+      req.on('close', () => _clients.delete(res));
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/state') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(Object.fromEntries([..._sections.entries()].map(([id, s]) => [id, s.data]))));
+      return;
+    }
+
+    const m = url.match(/^\/state\/(.+)$/);
+    if (req.method === 'GET' && m) {
+      const s = _sections.get(m[1]);
+      if (!s) { res.writeHead(404); res.end('Section not found'); return; }
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify(s.data));
+      return;
+    }
+
+    // ── External chat/redeem API ─────────────────────────────────────────
+    // Pull-based JSON endpoints for out-of-process consumers (e.g. the
+    // ViewersHateMe Minecraft Fabric mod). See pushExternalChatMessage /
+    // pushExternalRedeem above for the producer side.
+    if (req.method === 'GET' && url === '/api/chat') {
+      const { since, limit } = _parseCursor(req.url);
+      const messages = _drainSince(_externalChatBuffer, since, limit);
+      const lastId   = messages.length ? messages[messages.length - 1].id : since;
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        since,
+        lastId,
+        count: messages.length,
+        messages,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/api/redeems') {
+      const { since, limit } = _parseCursor(req.url);
+      const redeems = _drainSince(_externalRedeemBuffer, since, limit);
+      const lastId  = redeems.length ? redeems[redeems.length - 1].id : since;
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        since,
+        lastId,
+        count: redeems.length,
+        redeems,
+      }));
+      return;
+    }
+
+    if (req.method === 'GET' && url === '/api/state') {
+      res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(JSON.stringify({
+        ok: true,
+        startedAt:        _externalStartedAt,
+        uptimeMs:         Date.now() - _externalStartedAt,
+        lastSeq:          _externalSeq,
+        chatBuffered:     _externalChatBuffer.length,
+        redeemBuffered:   _externalRedeemBuffer.length,
+        chatBufferMax:    EXTERNAL_BUFFER_MAX,
+        redeemBufferMax:  EXTERNAL_BUFFER_MAX,
+      }));
+      return;
+    }
+
+    // ── Prefix-based routes (e.g. /clipcurator/*) ─────────────────────────
+    // Checked before exact routes so /clipcurator catches all sub-paths.
+    for (const { prefix, handler } of _prefixRoutes) {
+      if (url.startsWith(prefix)) {
+        try { handler(req, res); } catch (e) {
+          log.error(`[overlay] Prefix route error (${prefix}):`, e.message);
+          if (!res.headersSent) {
+            res.writeHead(500); res.end('Internal error');
+          }
+        }
+        return;
+      }
+    }
+
+    // Plugin-registered extra routes (exact match)
+    const extraHandler = _extraRoutes.get(url);
+    if (extraHandler) {
+      try { extraHandler(req, res); } catch (e) {
+        log.error('[overlay] Extra route error:', e.message);
+        res.writeHead(500); res.end('Internal error');
+      }
+      return;
+    }
+
+    // ── Static files from src/overlay/public/ ─────────────────────────────
+    // Serves any file under that directory at its relative URL path.
+    // e.g. src/overlay/public/sfx/vine-boom.mp3 → GET /sfx/vine-boom.mp3
+    if (req.method === 'GET' && serveStatic(url, res, req)) return;
+
+    res.writeHead(404);
+    res.end('Not found');
+  });
+
+  server.listen(port, () => {
+    log.info(`[overlay] Listening  → ${port}`);
+    log.info(`[overlay] OBS source → ${port}/overlay`);
+    log.info(`[overlay] Static files served from: ${PUBLIC_DIR}`);
+  });
+  server.on('error', (err) => log.error('[overlay] Server error:', err.message));
+  return server;
+}
+
+function _getSectionMeta(id) {
+  const s = _sections.get(id);
+  if (!s) return null;
+  return { id, title: s.title, icon: s.icon, render: s.render };
+}
+
+function _getSectionData(id) {
+  return _sections.get(id)?.data ?? null;
+}
+
+/**
+ * Build a self-contained standalone HTML page that renders exactly one
+ * registered section (plus its live SSE-driven data).
+ *
+ * Plugins that need a dedicated OBS browser source for their section —
+ * instead of appearing in the main /overlay mosaic — should call this
+ * helper from an addRoute() handler:
+ *
+ *   addRoute('/my-plugin', (req, res) => {
+ *     const html = buildStandaloneSectionPage('my-plugin');
+ *     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+ *     res.end(html);
+ *   });
+ *
+ * @param {string} sectionId  The id passed to registerSection()
+ * @param {{ title?: string }} [opts]  Optional page <title> override
+ * @returns {string}  Complete HTML document
+ */
+function buildStandaloneSectionPage(sectionId, opts = {}) {
+  const s = _sections.get(sectionId);
+  if (!s) {
+    return `<!DOCTYPE html><html><body><pre>Section "${sectionId}" not registered</pre></body></html>`;
+  }
+
+  const pageTitle = opts.title ?? s.title ?? sectionId;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${pageTitle}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
+<style>
+${_SECTION_CSS}
+</style>
+</head>
+<body>
+<div class="overlay-card" id="card-${sectionId}">
+  <div class="section-header">
+    <span class="section-icon">${s.icon ?? ''}</span>
+    <span class="section-title">${s.title ?? sectionId}</span>
+    <span class="section-badge" id="badge-${sectionId}"></span>
+  </div>
+  <div class="section-body" id="body-${sectionId}"></div>
+</div>
+<div class="msg-reconnecting" id="reconn-${sectionId}" style="display:none">⚠ RECONNECTING…</div>
+
+<script>
+(function () {
+  const SECTION_ID  = ${JSON.stringify(sectionId)};
+  const RENDER_SRC  = ${JSON.stringify(s.render)};
+  const INITIAL_DATA = ${JSON.stringify(s.data)};
+
+  let renderFn;
+  try { renderFn = new Function('return (' + RENDER_SRC + ')')(); }
+  catch (e) { console.error('[overlay-standalone] compile error in', SECTION_ID, e); renderFn = function () {}; }
+
+  const card   = document.getElementById('card-' + SECTION_ID);
+  const body   = document.getElementById('body-' + SECTION_ID);
+  const badge  = document.getElementById('badge-' + SECTION_ID);
+  const reconn = document.getElementById('reconn-' + SECTION_ID);
+
+  function esc(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')
+                     .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
+  function invoke(data) {
+    if (!renderFn || !body) return;
+    try { renderFn(data, body, esc, { card, badge }); }
+    catch (e) { console.error('[overlay-standalone] render error in', SECTION_ID, e); }
+  }
+
+  invoke(INITIAL_DATA);
+
+  let es;
+  function connect() {
+    es = new EventSource('/sse');
+    es.onopen    = () => { reconn.style.display = 'none'; };
+    es.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'section' && msg.id === SECTION_ID) invoke(msg.data);
+      } catch {}
+    };
+    es.onerror = () => {
+      reconn.style.display = 'block';
+      es.close();
+      setTimeout(connect, 3000);
+    };
+  }
+  connect();
+})();
+</script>
+</body>
+</html>`;
+}
+
+module.exports = {
+  startOverlayServer,
+  registerSection,
+  updateSection,
+  updatePollOverlay,
+  addRoute,
+  addPrefixRoute,
+  // Public helper — plugins that need a standalone OBS page for their
+  // section should use this instead of reaching into _getSectionMeta/_Data.
+  buildStandaloneSectionPage,
+  // External chat/redeem API — producers (queue.onMessage / queue.onRedeem
+  // wired in index.js) call these to feed the JSON polling endpoints
+  // (/api/chat, /api/redeems, /api/state) that out-of-process clients
+  // (e.g. the ViewersHateMe Minecraft mod) consume.
+  pushExternalChatMessage,
+  pushExternalRedeem,
+  // Legacy private helpers — kept for backward compat, prefer
+  // buildStandaloneSectionPage() for new code.
+  _getSectionMeta,
+  _getSectionData,
+};
