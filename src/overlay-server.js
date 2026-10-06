@@ -74,6 +74,18 @@ function serveStatic(url, res, req) {
 
   const ext      = path.extname(absPath).toLowerCase();
   const mimeType = MIME_TYPES[ext] ?? 'application/octet-stream';
+
+  // Diagnostics: log media/image requests (who asked, status, whether the
+  // client hung up early) so we can tell if OBS even requests them.
+  if (req && /^\.(mp4|webm|mp3|ogg|wav|png|jpe?g|gif|webp|svg)$/.test(ext)) {
+    const t0 = Date.now();
+    const ua = req.headers['user-agent'] || '?';
+    const who = ua.includes('OBS/') ? 'OBS' : ua.slice(0, 40);
+    res.on('close', () => log.info(
+      `[overlay] static ${url} -> ${res.statusCode} ` +
+      `${res.writableFinished ? 'complete' : 'ABORTED-by-client'} ` +
+      `range=${req.headers.range || '-'} ${Date.now() - t0}ms ${who}`));
+  }
   const headers  = {
     'Content-Type':  mimeType,
     'Cache-Control': 'public, max-age=3600',
