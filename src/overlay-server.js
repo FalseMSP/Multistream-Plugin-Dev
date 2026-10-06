@@ -905,7 +905,11 @@ function startOverlayServer(port = 2999) {
         res.write(`data: ${JSON.stringify({ type: 'poll', data: _pollState })}\n\n`);
       }
       _clients.add(res);
-      req.on('close', () => _clients.delete(res));
+      log.info(`[overlay] SSE streams open: ${_clients.size} (browsers allow ~6 connections per host; more than that starves media/image loads)`);
+      req.on('close', () => {
+        _clients.delete(res);
+        log.info(`[overlay] SSE streams open: ${_clients.size}`);
+      });
       return;
     }
 

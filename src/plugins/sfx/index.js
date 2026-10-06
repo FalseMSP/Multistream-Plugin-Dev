@@ -110,9 +110,18 @@ registerSection('sfx', {
         el.__sfxPlaying = true;
         var item = el.__sfxQueue.shift();
 
+        // Optional ?media=http://host:port on the /overlay URL: load sounds (and
+        // send logs) via another host so they don't queue behind the permanent
+        // SSE streams that exhaust the browser's ~6 connections per host.
+        var _mb = '';
+        try {
+          var _m = new URLSearchParams(location.search).get('media') || '';
+          if (/^https?:\/\/[^\/\s]+$/.test(_m)) _mb = _m;
+        } catch (e) {}
+
         var audio = document.createElement('audio');
         audio.style.display = 'none';
-        audio.src = item.url;
+        audio.src = (_mb && item.url && item.url.charAt(0) === '/') ? _mb + item.url : item.url;
         audio.volume = Math.min(1, Math.max(0, item.volume ?? 1));
         el.appendChild(audio);
 
@@ -125,7 +134,7 @@ registerSection('sfx', {
 
         // Report to the bot log: OBS browser sources have no devtools.
         function _report(msg) {
-          try { fetch('/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(function(){}); } catch (e) {}
+          try { fetch(_mb + '/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(function(){}); } catch (e) {}
         }
 
         audio.addEventListener('ended', _onDone);

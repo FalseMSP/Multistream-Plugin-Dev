@@ -343,7 +343,7 @@ function handleGridPull(data) {
     vid.autoplay = true;
     vid.playsInline = true;
     vid.volume = 1;
-    vid.src = item.videoFile;
+    vid.src = mediaUrl(item.videoFile);
     cell.appendChild(vid);
 
     if (!item.isDud && item.iconPath) {
@@ -352,7 +352,7 @@ function handleGridPull(data) {
 
       const icon = document.createElement('img');
       icon.className = 'grid-icon';
-      icon.src = item.iconPath;
+      icon.src = mediaUrl(item.iconPath);
       iconWrapEl.appendChild(icon);
 
       const rarityEl = document.createElement('div');
@@ -418,14 +418,14 @@ function handlePull(data) {
   // Show backdrop + video
   backdrop.classList.add('visible');
   clientLog('gacha pull event rarity=' + data.rarity + ' video=' + data.videoFile);
-  video.src = data.videoFile;
+  video.src = mediaUrl(data.videoFile);
   video.load();
   playLogged(video, 'pull');
   video.classList.add('visible');
 
   // Schedule icon reveal
   if (!data.isDud && data.iconPath) {
-    itemIcon.src = data.iconPath;
+    itemIcon.src = mediaUrl(data.iconPath);
     iconTimer = setTimeout(() => {
       iconWrap.classList.add('visible');
     }, ICON_REVEAL_MS);
@@ -437,8 +437,22 @@ function handlePull(data) {
 
 // ── Client diagnostics → bot log (OBS browser sources have no devtools) ─────
 // Open the page as /gacha?debug=1 to also draw a diagnostics panel on screen.
-const PAGE_VERSION = 'gacha-overlay-2026-10-06-d';
+const PAGE_VERSION = 'gacha-overlay-2026-10-06-e';
 const DEBUG = /[?&]debug\b/.test(location.search);
+// Optional media origin, e.g. /gacha?media=http://1.2.3.4:2999
+// OBS (Chromium) allows only ~6 HTTP/1.1 connections per host, shared by every
+// browser source. Each overlay holds a permanent SSE stream, so many sources
+// starve video/image/log requests to the same host. Loading media (and log
+// POSTs) from a different host gives them their own connection pool.
+const MEDIA_BASE = (function () {
+  try {
+    const m = new URLSearchParams(location.search).get('media') || '';
+    return /^https?:\/\/[^\/\s]+$/.test(m) ? m : '';
+  } catch (_) { return ''; }
+})();
+function mediaUrl(p) {
+  return (MEDIA_BASE && typeof p === 'string' && p.charAt(0) === '/') ? MEDIA_BASE + p : p;
+}
 const _dbgLines = [];
 let _dbgEl = null;
 function dbgRender() {
@@ -452,7 +466,7 @@ function dbgRender() {
   }
   const v = video;
   _dbgEl.textContent = [
-    PAGE_VERSION,
+    PAGE_VERSION + (MEDIA_BASE ? '  media=' + MEDIA_BASE : '  media=(same host)'),
     'video: ready=' + v.readyState + ' net=' + v.networkState + ' paused=' + v.paused +
       ' err=' + (v.error ? v.error.code : 'none'),
     'src: ' + (v.currentSrc ? v.currentSrc.split('/').pop() : '(none)'),
@@ -463,7 +477,7 @@ function clientLog(msg) {
   _dbgLines.push(new Date().toLocaleTimeString() + ' ' + msg.replace(/^gacha /, '').slice(0, 110));
   if (_dbgLines.length > 7) _dbgLines.shift();
   try {
-    fetch('/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(() => {});
+    fetch(MEDIA_BASE + '/__client-log', { method: 'POST', body: msg, keepalive: true }).catch(() => {});
   } catch (_) {}
 }
 function watchMedia(el, label) {
