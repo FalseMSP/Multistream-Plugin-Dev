@@ -443,6 +443,9 @@ function clientLog(msg) {
 }
 function watchMedia(el, label) {
   el.addEventListener('error', () => {
+    // hideAll() clears video.src = '' which makes browsers fire an
+    // "Invalid URI" error. That's expected, not a real load failure.
+    if (!el.getAttribute('src')) return;
     const e = el.error;
     clientLog('gacha ' + label + ' MEDIA ERROR code=' + (e && e.code) +
       ' msg=' + (e && e.message) + ' src=' + el.currentSrc);
