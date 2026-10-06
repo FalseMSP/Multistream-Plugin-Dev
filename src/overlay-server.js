@@ -60,7 +60,7 @@ const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
 };
 
-function serveStatic(url, res) {
+function serveStatic(url, res, req) {
   // Prevent path traversal
   const rel     = path.normalize(url).replace(/^(\.\.[/\\])+/, '');
   const absPath = path.join(PUBLIC_DIR, rel);
@@ -74,11 +74,30 @@ function serveStatic(url, res) {
 
   const ext      = path.extname(absPath).toLowerCase();
   const mimeType = MIME_TYPES[ext] ?? 'application/octet-stream';
-  res.writeHead(200, {
+  const headers  = {
     'Content-Type':  mimeType,
     'Cache-Control': 'public, max-age=3600',
+    'Accept-Ranges': 'bytes',
     'Access-Control-Allow-Origin': '*',
-  });
+  };
+
+  // Range support — OBS's browser source (Chromium/CEF) needs this to play
+  // mp4s whose moov atom is at the end of the file (not "faststart").
+  const range = req && req.headers && req.headers.range;
+  const m = range && /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (m && (m[1] || m[2])) {
+    let start, end;
+    if (m[1] === '') { start = Math.max(0, stat.size - parseInt(m[2], 10)); end = stat.size - 1; }
+    else { start = parseInt(m[1], 10); end = m[2] ? Math.min(parseInt(m[2], 10), stat.size - 1) : stat.size - 1; }
+    if (start >= stat.size || start > end) {
+      res.writeHead(416, { 'Content-Range': `bytes */${stat.size}` }); res.end(); return true;
+    }
+    res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${stat.size}`, 'Content-Length': end - start + 1 });
+    fs.createReadStream(absPath, { start, end }).pipe(res);
+    return true;
+  }
+
+  res.writeHead(200, { ...headers, 'Content-Length': stat.size });
   fs.createReadStream(absPath).pipe(res);
   return true;
 }
@@ -948,7 +967,7 @@ function startOverlayServer(port = 2999) {
     // ── Static files from src/overlay/public/ ─────────────────────────────
     // Serves any file under that directory at its relative URL path.
     // e.g. src/overlay/public/sfx/vine-boom.mp3 → GET /sfx/vine-boom.mp3
-    if (req.method === 'GET' && serveStatic(url, res)) return;
+    if (req.method === 'GET' && serveStatic(url, res, req)) return;
 
     res.writeHead(404);
     res.end('Not found');
