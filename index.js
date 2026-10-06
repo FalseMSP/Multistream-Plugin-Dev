@@ -237,10 +237,13 @@ async function main() {
   //      chatReply.twitch(text)                — broadcast to primary Twitch channel
   //      chatReply.youtube(text)               — broadcast to all live YT sessions
   //      chatReply.youtubeSession(videoId, text) — target one specific YT live stream
+  // Promise-safe wrappers: even if a platform module throws synchronously,
+  // callers always get a rejected Promise (handled by their .catch) instead
+  // of a sync TypeError / unhandled rejection.
   plugins.setChatReply({
-    twitch:         (text) => twitchModule.say(text),
-    youtube:        (text) => ytModule.say(text),
-    youtubeSession: (videoId, text) => ytModule.sayTo(videoId, text),
+    twitch:         (text) => Promise.resolve().then(() => twitchModule.say(text)),
+    youtube:        (text) => Promise.resolve().then(() => ytModule.say(text)),
+    youtubeSession: (videoId, text) => Promise.resolve().then(() => ytModule.sayTo(videoId, text)),
   });
 
   // 10. Register Discord slash commands (idempotent guild deploy)

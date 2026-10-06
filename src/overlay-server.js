@@ -679,7 +679,7 @@ function _buildHtml() {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
 <style>
- ${_SECTION_CSS}
+${_SECTION_CSS}
 </style>
 </head>
 <body>
@@ -1007,7 +1007,7 @@ function buildStandaloneSectionPage(sectionId, opts = {}) {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;900&family=JetBrains+Mono:wght@500;700&display=swap">
 <style>
- ${_SECTION_CSS}
+${_SECTION_CSS}
 </style>
 </head>
 <body>

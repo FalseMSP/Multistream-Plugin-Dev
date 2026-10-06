@@ -662,9 +662,31 @@ async function twitchUnvip(platform, username) {
 
 let _tmiClient = null;
 
+// Throttle for the "IRC not connected" warn — plugins fire this on every
+// reply (timers, commands, streaks), so warn at most once a minute.
+let _lastSayWarn = 0;
+
+/**
+ * Send a message to the primary Twitch channel.
+ *
+ * ALWAYS returns a Promise — every plugin replies via `send(text).catch(...)`,
+ * so a bare `undefined` here becomes "Cannot read properties of undefined
+ * (reading 'catch')" and (for timer-driven callers like discord-reminder) an
+ * unhandled rejection. Returned promise never rejects: send errors are
+ * logged here so callers don't need their own .catch to avoid noise.
+ *
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
 function say(text) {
-  if (!_tmiClient || !CHANNELS.length) return;
-  _tmiClient.say(CHANNELS[0], text).catch(err => log.error('[Twitch] say() error:', err.message));
+  if (!_tmiClient || !CHANNELS.length) {
+    if (Date.now() - _lastSayWarn > 60_000) {
+      _lastSayWarn = Date.now();
+      log.warn('[Twitch] say() — IRC client not connected, dropping message');
+    }
+    return Promise.resolve();
+  }
+  return _tmiClient.say(CHANNELS[0], text).catch(err => log.error('[Twitch] say() error:', err.message));
 }
 
 async function startTwitch(queue) {
