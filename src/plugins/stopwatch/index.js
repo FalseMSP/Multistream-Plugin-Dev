@@ -503,13 +503,22 @@ dashboard.registerWidget('stopwatch', {
       return !!(sel && document.activeElement === sel);
     })();
 
-    // Options only rebuild when the list/selection actually changed — keeps
-    // an open native dropdown from being rebuilt out from under the cursor
-    // by the 2s heartbeat.
+    // Options only rebuild when the list/selection actually changed. When
+    // nothing changed we KEEP the live <select> node: detach it BEFORE the
+    // innerHTML wipe, then re-insert it into the fresh row afterwards.
+    // (Assigning innerHTML destroys the old subtree — grabbing parentNode
+    // AFTER the wipe silently no-oped because the node was already detached,
+    // so the dropdown vanished every other heartbeat: visible ~2s, gone
+    // ~2s, forever. Detach-then-reinsert in the same synchronous render
+    // keeps it continuously visible with its value + listener intact.)
     var listKey = list.map(function (sw) { return sw.id + ':' + sw.name; }).join('|') +
                   '@' + (data.activeId || '');
     var prevSelect = document.getElementById('stopwatch-select');
     var selectChanged = !prevSelect || prevSelect.__listKey !== listKey;
+    var keptSelect = (!selectChanged && prevSelect) ? prevSelect : null;
+    if (keptSelect && keptSelect.parentNode) {
+      keptSelect.parentNode.removeChild(keptSelect);
+    }
 
     var optionsHtml = list.map(function (sw) {
       var sel = sw.id === data.activeId;
@@ -533,7 +542,7 @@ dashboard.registerWidget('stopwatch', {
 
       (list.length
         ? // Select + delete row
-          '<div style="display:flex;gap:6px;margin-bottom:8px">' +
+          '<div id="stopwatch-select-row" style="display:flex;gap:6px;margin-bottom:8px">' +
           (selectChanged
             ? '<select id="stopwatch-select" style="' + SELECT_STYLE + '">' + optionsHtml + '</select>'
             : '') +
@@ -576,21 +585,17 @@ dashboard.registerWidget('stopwatch', {
         '<button id="stopwatch-create-btn" style="' + BTN_PRIMARY + ';flex-shrink:0">Create</button>' +
       '</div>';
 
-    // Restore in-progress inputs + dropdown focus
+    // Restore in-progress inputs + the preserved dropdown
     restoreInput('stopwatch-create-input', capCreate);
     restoreInput('stopwatch-rename-input', capRename);
     restoreInput('stopwatch-set-input', capSet);
+    if (keptSelect) {
+      var selRow = document.getElementById('stopwatch-select-row');
+      if (selRow) selRow.insertBefore(keptSelect, selRow.firstChild);
+    }
     if (selectHadFocus) {
       var newSel = document.getElementById('stopwatch-select');
       if (newSel) { newSel.value = data.activeId; newSel.focus(); }
-    }
-    if (!selectChanged && prevSelect) {
-      // Re-attach the preserved <select> we deliberately didn't rebuild:
-      // swap it into the row so its listKey/state survive.
-      var row = prevSelect.parentNode;
-      if (row && !document.getElementById('stopwatch-select')) {
-        row.insertBefore(prevSelect, row.firstChild);
-      }
     }
     var curSelect = document.getElementById('stopwatch-select');
     if (curSelect) curSelect.__listKey = listKey;
@@ -636,7 +641,11 @@ dashboard.registerWidget('stopwatch', {
     bind('stopwatch-reset-btn', 'reset');
 
     var selEl = document.getElementById('stopwatch-select');
-    if (selEl) {
+    // A preserved <select> survives across renders — wire it exactly once,
+    // or every heartbeat would stack another change listener onto the same
+    // node (one pick → N duplicate POSTs).
+    if (selEl && !selEl.__wired) {
+      selEl.__wired = true;
       selEl.addEventListener('change', function () {
         selEl.disabled = true;
         action('select', { id: selEl.value })
