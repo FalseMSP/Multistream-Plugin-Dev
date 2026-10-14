@@ -12,11 +12,20 @@
  *   - type:poll        → creates a real Twitch channel poll via twitch.createPoll()
  *   - type:prediction  → creates a real Twitch prediction via twitch.createPrediction()
  *
- * YouTube:
- *   - Always chat-based (YouTube API has no live poll/prediction endpoint)
- *   - Posts the question + numbered options to YouTube chat
- *   - Listens for messages containing "1", "2", "3", etc. (first vote per user wins)
- *   - /poll end or duration expiry posts results to both YouTube chat and Discord
+ * YouTube (real poll API integration via masterchat):
+ *   - YouTube's public Data API has no "create poll" endpoint — polls must be
+ *     created manually in YouTube Studio. Once a poll exists, masterchat emits
+ *     three native poll actions straight from the live_chat endpoint:
+ *       showPollPanelAction → poll created (we adopt it as the active YT poll)
+ *       updatePollAction    → vote ratios updated (we sync to overlay / Discord)
+ *       addPollResultAction → poll closed (we post final results)
+ *   - /poll start platform:youtube posts a heads-up message telling the
+ *     broadcaster which question + options to enter in Studio, then subscribes
+ *     to poll events. When the broadcaster creates the poll, the plugin
+ *     automatically adopts it and streams live vote ratios to the overlay.
+ *   - /poll end posts whatever tally we have so far. The broadcaster is still
+ *     responsible for closing the poll in Studio (no public end-poll API);
+ *     when YouTube emits addPollResultAction we also auto-finalise.
  *
  * Required env vars:
  *   DISCORD_CHAT_WEBHOOK_URL  — for result embeds
@@ -24,10 +33,11 @@
  *                              (requires scopes: channel:manage:polls, channel:manage:predictions)
  *
  * Note: This plugin uses the public twitch module APIs (createPoll, endPoll,
- * getPoll, createPrediction, endPrediction, getBroadcasterId) instead of
- * reimplementing Helix token plumbing. The previous version had ~150 lines
- * of duplicate Helix code (token refresh, app token, broadcaster ID resolution)
- * that have all been removed in favour of the shared twitch.js helpers.
+ * getPoll, createPrediction, endPrediction, getBroadcasterId) and the public
+ * youtube module APIs (onPollEvent, getActivePoll) instead of reimplementing
+ * their internals. The previous version had ~150 lines of duplicate Helix code
+ * that have all been removed in favour of the shared twitch.js helpers, and
+ * the YouTube branch no longer relies on chat-based "type 1/2/3" voting.
  */
 
 const { SlashCommandBuilder, EmbedBuilder, WebhookClient, PermissionFlagsBits } = require('discord.js');
@@ -40,7 +50,8 @@ const CHAT_WEBHOOK_URL = process.env.DISCORD_CHAT_WEBHOOK_URL ?? '';
 
 // ── Plugin context (set in init) ───────────────────────────────────────────
 
-let _twitch = null;
+let _twitch  = null;
+let _youtube = null;
 
 // ── Discord webhook (for result embeds) ───────────────────────────────────
 
@@ -65,7 +76,7 @@ function onChatReady(chatReply) {
  *   type:       'poll' | 'prediction',
  *   title:      string,
  *   options:    string[],
- *   platforms:  string[],
+ *   platforms:   string[],
  *   startedAt:  Date,
  *   durationMs: number,
  *   timer:      NodeJS.Timeout | null,
@@ -73,12 +84,15 @@ function onChatReady(chatReply) {
  *   // Twitch
  *   twitchPollId:       string | null,
  *   twitchPredictionId: string | null,
- *
- *   // YouTube chat voting
- *   ytVotes:   { [option_index: string]: number },
- *   ytVoters:  Set<string>,
  *   twitchVotes: { [option_index: string]: number },
  *   pollInterval: NodeJS.Timeout | null,
+ *
+ *   // YouTube poll API integration
+ *   youtubePollId:  string | null,        // masterchat poll id once adopted
+ *   youtubeVideoId: string | null,        // which live stream the poll lives on
+ *   youtubeVotes:   { [option_index: string]: number },  // absolute votes per choice
+ *   youtubeTotal:   number,              // total votes reported by YouTube
+ *   ytPollUnsub:    (() => void) | null, // unsubscribe from youtube.onPollEvent
  * } | null}
  */
 let _active = null;
@@ -144,34 +158,168 @@ async function _fetchTwitchVotes() {
   }
 }
 
-// ── YouTube chat voting helpers ───────────────────────────────────────────
+// ── YouTube poll API integration ───────────────────────────────────────────
+//
+// Masterchat (the YouTube live-chat library used by src/youtube.js) emits
+// three poll-related actions straight from YouTube's internal
+// /youtubei/v1/live_chat/get_live_chat endpoint. The youtube module wraps
+// those into a stable poll-state object and pushes them to subscribers via
+// youtube.onPollEvent(callback). Each callback invocation receives
+//   (videoId, action, pollState)
+// where `action.type` is one of:
+//   showPollPanelAction  — broadcaster just created a poll in YouTube Studio
+//   updatePollAction     — vote ratios updated (fired continuously)
+//   addPollResultAction  — poll closed; final tally + winner highlighted
+//   closePanelAction     — UI-only banner dismissal (we ignore this)
+//
+// The plugin subscribes when /poll start platform:youtube runs and
+// unsubscribes when the poll ends (manually, by duration, or by YouTube).
 
-/** Post the poll question to YouTube chat. */
-async function _postYtPollMessage(title, options, durationSec) {
+/** Map option text → choice index (1:1 against _active.options). */
+function _optionTextToIndex(text) {
+  if (!_active || !text) return -1;
+  const norm = String(text).trim().toLowerCase();
+  // exact match first
+  for (let i = 0; i < _active.options.length; i++) {
+    if (_active.options[i].trim().toLowerCase() === norm) return i;
+  }
+  // prefix match (YT may truncate long option text in the panel render)
+  for (let i = 0; i < _active.options.length; i++) {
+    const opt = _active.options[i].trim().toLowerCase();
+    if (opt.length > 3 && (norm.startsWith(opt) || opt.startsWith(norm))) return i;
+  }
+  // positional fallback — match by order in the choice array
+  return -1;
+}
+
+/**
+ * Map a YouTube pollState's choices onto our option-indexed vote tally.
+ * Returns { votes: { [index]: number }, total: number, matched: boolean }.
+ * If we can't confidently map ANY choice to our options (e.g. the broadcaster
+ * created a poll with completely different text), we fall back to positional
+ * ordering so the overlay still updates — the Discord embed will note the
+ * mismatch.
+ */
+function _mapYtChoicesToOptions(poll) {
+  const votes = Object.fromEntries(_active.options.map((_, i) => [i, 0]));
+  const choices = poll?.choices ?? [];
+
+  // Try text-matching first
+  let matchedCount = 0;
+  const usedIdx = new Set();
+  choices.forEach((c, i) => {
+    const idx = _optionTextToIndex(c.text);
+    if (idx >= 0 && !usedIdx.has(idx)) {
+      votes[idx] = (votes[idx] ?? 0) + (c.voteCount ?? 0);
+      usedIdx.add(idx);
+      matchedCount++;
+    }
+  });
+
+  // If text matching failed for every choice, fall back to positional mapping
+  // so the overlay still shows something useful — broadcaster likely created
+  // the poll with their own wording.
+  if (matchedCount === 0 && choices.length === _active.options.length) {
+    choices.forEach((c, i) => { votes[i] = c.voteCount ?? 0; });
+  }
+
+  return {
+    votes,
+    total:   poll?.totalVotes ?? 0,
+    matched: matchedCount > 0,
+  };
+}
+
+/**
+ * Update _active.youtubeVotes / youtubeTotal / youtubePollId from a fresh
+ * pollState and refresh the overlay. No-op if the plugin state has moved on.
+ */
+function _syncYtPollState(videoId, poll) {
+  if (!_active || _active.youtubeVideoId !== videoId) return;
+  if (poll?.pollId && !_active.youtubePollId) {
+    _active.youtubePollId = poll.pollId;
+    log.info(`[poll] Adopted YouTube poll id=${poll.pollId} q="${poll.question}"`);
+  }
+  if (poll?.pollId && _active.youtubePollId && poll.pollId !== _active.youtubePollId) {
+    // A different poll appeared — ignore it; the broadcaster may have queued
+    // up a second poll. We only track one at a time.
+    return;
+  }
+
+  const mapped = _mapYtChoicesToOptions(poll);
+  _active.youtubeVotes = mapped.votes;
+  _active.youtubeTotal = mapped.total;
+  _active._ytMatched    = mapped.matched;
+  _pushOverlay();
+}
+
+/**
+ * Subscriber callback handed to youtube.onPollEvent(). Runs for every active
+ * YouTube session — we filter to the video we're tracking.
+ *
+ * Adoption rule: if we don't yet know which video the broadcaster will create
+ * the poll on (youtubeVideoId === null), the FIRST showPollPanelAction on ANY
+ * active stream adopts that video. Subsequent events are then filtered to
+ * that videoId, so a poll created on a second concurrent stream is ignored.
+ */
+function _onYtPollEvent(videoId, action, poll) {
+  if (!_active) return;
+
+  // First-ever poll event for this /poll session — adopt the videoId.
+  if (_active.youtubeVideoId === null && action.type === 'showPollPanelAction') {
+    _active.youtubeVideoId = videoId;
+    log.info(`[poll] Adopting YouTube video ${videoId} as the poll stream.`);
+  }
+
+  // Filter to the adopted video — ignore polls from other concurrent streams.
+  if (_active.youtubeVideoId !== videoId) return;
+
+  if (action.type === 'showPollPanelAction') {
+    // A new poll appeared — adopt it (regardless of whether the question
+    // exactly matches what /poll start suggested; the broadcaster may have
+    // paraphrased). Sync vote state immediately.
+    _syncYtPollState(videoId, poll);
+  } else if (action.type === 'updatePollAction') {
+    // Vote ratios updated — sync the live tally to the overlay.
+    _syncYtPollState(videoId, poll);
+  } else if (action.type === 'addPollResultAction') {
+    // Poll closed on YouTube's side — auto-finalise with the final tally.
+    log.info('[poll] YouTube poll closed by broadcaster — auto-finalising.');
+    _syncYtPollState(videoId, poll);
+    _endPoll(null).catch(e => log.error('[poll] Auto-finalise error:', e.message));
+  }
+  // closePanelAction is UI-only — ignored.
+}
+
+/** Post the "please create this poll in YouTube Studio" heads-up message. */
+async function _postYtPollInstructions(title, options, durationSec) {
   const send = _chatReply.youtube;
-  if (!send) { log.warn('[poll] No YouTube chat reply — cannot post poll'); return; }
+  if (!send) { log.warn('[poll] No YouTube chat reply — cannot post instructions'); return; }
 
+  const optionLines = options.map((o, i) => `${i + 1}. ${o}`).join('  •  ');
   const lines = [
-    `📊 ${title}`,
-    ...options.map((o, i) => `${i + 1}️⃣  ${o}`),
-    `Type 1–${options.length} to vote! (${Math.round(durationSec / 60)} min)`,
+    `📊 Poll starting: ${title}`,
+    `Options: ${optionLines}`,
+    `Create this poll in YouTube Studio — I'll track votes automatically. (${Math.round(durationSec / 60)} min)`,
   ];
 
   send(lines.join('  |  ')).catch(e => log.error('[poll] YT post error:', e.message));
 }
 
-async function _postYtResultsMessage(title, votes, options) {
+/** Post the final YouTube poll result message to YouTube chat. */
+async function _postYtResultsMessage(title, votes, options, total) {
   const send = _chatReply.youtube;
   if (!send) return;
-  const total = Object.values(votes).reduce((a, b) => a + b, 0) || 1;
+  const sum = total || Object.values(votes).reduce((a, b) => a + b, 0) || 1;
   const lines = [
     `📊 Results: ${title}`,
     ...options.map((o, i) => {
       const v   = votes[i] ?? 0;
-      const pct = Math.round((v / total) * 100);
+      const pct = Math.round((v / sum) * 100);
       const bar = '█'.repeat(Math.round(pct / 10)) + '░'.repeat(10 - Math.round(pct / 10));
       return `${i + 1}. ${o}  ${bar}  ${v} (${pct}%)`;
     }),
+    `Total YouTube votes: ${sum}`,
   ];
   send(lines.join('  |  ')).catch(e => log.error('[poll] YT results error:', e.message));
 }
@@ -182,9 +330,9 @@ async function _postResultsEmbed(state, winningIndex = null, twitchVotes = {}, c
   const wh = _getWebhook();
   if (!wh) return;
 
-  const votes    = combinedVotes ?? state.ytVotes;
+  const votes    = combinedVotes ?? state.youtubeVotes;
   const total    = Object.values(votes).reduce((a, b) => a + b, 0) || 1;
-  const ytTotal  = Object.values(state.ytVotes).reduce((a, b) => a + b, 0);
+  const ytTotal  = Object.values(state.youtubeVotes).reduce((a, b) => a + b, 0);
   const twTotal  = Object.values(twitchVotes).reduce((a, b) => a + b, 0);
   const isPrediction  = state.type === 'prediction';
   const twitchLabel   = isPrediction ? 'channel points' : 'votes';
@@ -193,7 +341,7 @@ async function _postResultsEmbed(state, winningIndex = null, twitchVotes = {}, c
     const combined  = votes[i] ?? 0;
     const pct       = Math.round((combined / total) * 100);
     const winner    = winningIndex === i ? ' 🏆' : '';
-    const yt        = state.ytVotes[i] ?? 0;
+    const yt        = state.youtubeVotes[i] ?? 0;
     const tw        = twitchVotes[i] ?? 0;
     const breakdown = state.platforms.length > 1
       ? `\nTwitch: ${tw.toLocaleString()} ${twitchLabel}  •  YouTube: ${yt}`
@@ -224,8 +372,12 @@ async function _postResultsEmbed(state, winningIndex = null, twitchVotes = {}, c
 
 function _pushOverlay() {
   if (!_active) return;
+  // Combined = Twitch votes + YouTube poll votes per option index
   const combinedVotes = Object.fromEntries(
-    _active.options.map((_, i) => [i, (_active.ytVotes[i] ?? 0) + (_active.twitchVotes[i] ?? 0)])
+    _active.options.map((_, i) => [
+      i,
+      (_active.twitchVotes[i]  ?? 0) + (_active.youtubeVotes[i] ?? 0),
+    ])
   );
   overlay.updatePollOverlay({
     type:          _active.type,
@@ -249,12 +401,20 @@ async function _startPoll({ title, options, durationSec, type, platforms }) {
     startedAt:          new Date(),
     durationMs:         durationSec * 1000,
     timer:              null,
+
+    // Twitch state
     twitchPollId:       null,
     twitchPredictionId: null,
-    ytVotes:            Object.fromEntries(options.map((_, i) => [i, 0])),
-    ytVoters:           new Set(),
     twitchVotes:        Object.fromEntries(options.map((_, i) => [i, 0])),
     pollInterval:       null,
+
+    // YouTube state (real poll API)
+    youtubePollId:      null,
+    youtubeVideoId:     null,
+    youtubeVotes:       Object.fromEntries(options.map((_, i) => [i, 0])),
+    youtubeTotal:       0,
+    ytPollUnsub:        null,
+    _ytMatched:        true,
   };
   _pushOverlay();
 
@@ -289,9 +449,23 @@ async function _startPoll({ title, options, durationSec, type, platforms }) {
     _active.pollInterval = setInterval(_fetchTwitchVotes, 5000);
   }
 
-  // YouTube
+  // YouTube — subscribe to real poll events and ask the broadcaster to create
+  // the poll in YouTube Studio. The subscription is global (not per-video);
+  // _onYtPollEvent adopts the first showPollPanelAction's videoId and filters
+  // all subsequent events to it, so a poll created on a second concurrent
+  // stream is ignored.
   if (platforms.includes('youtube')) {
-    await _postYtPollMessage(title, options, durationSec);
+    if (!_youtube) {
+      errors.push('YouTube module not available in init context');
+    } else if (typeof _youtube.onPollEvent !== 'function') {
+      errors.push('YouTube module missing onPollEvent — update src/youtube.js');
+    } else {
+      _active.youtubeVideoId = null;          // adopted on first poll event
+      _active.ytPollUnsub    = _youtube.onPollEvent(_onYtPollEvent);
+      log.info('[poll] Subscribed to YouTube poll events — waiting for broadcaster to create poll in Studio.');
+
+      await _postYtPollInstructions(title, options, durationSec);
+    }
   }
 
   // Auto-end timer
@@ -311,8 +485,12 @@ async function _endPoll(winningIndex) {
   const state = _active;
   _active = null;
 
-  if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+  if (state.timer)        { clearTimeout(state.timer); state.timer = null; }
   if (state.pollInterval) { clearInterval(state.pollInterval); state.pollInterval = null; }
+  if (typeof state.ytPollUnsub === 'function') {
+    try { state.ytPollUnsub(); } catch { /* ignore */ }
+    state.ytPollUnsub = null;
+  }
 
   const errors = [];
 
@@ -347,14 +525,31 @@ async function _endPoll(winningIndex) {
     }
   }
 
+  // For YouTube: if a YouTube poll was adopted, do one last poll-state sync
+  // before finalising. The broadcaster is responsible for actually closing
+  // the poll in YouTube Studio — there is no public end-poll endpoint.
+  if (state.platforms.includes('youtube') && state.youtubeVideoId && _youtube?.getActivePoll) {
+    try {
+      const fresh = _youtube.getActivePoll(state.youtubeVideoId);
+      if (fresh && fresh.pollId === state.youtubePollId) {
+        const m = _mapYtChoicesToOptionsForState(state, fresh);
+        state.youtubeVotes = m.votes;
+        state.youtubeTotal = m.total;
+        state._ytMatched   = m.matched;
+      }
+    } catch (e) {
+      log.warn('[poll] Final YouTube poll sync failed:', e.message);
+    }
+  }
+
   // Merge Twitch + YouTube votes
   const combinedVotes = Object.fromEntries(
-    state.options.map((_, i) => [i, (state.ytVotes[i] ?? 0) + (twitchVotes[i] ?? 0)])
+    state.options.map((_, i) => [i, (state.youtubeVotes[i] ?? 0) + (twitchVotes[i] ?? 0)])
   );
 
   // YouTube results (show combined totals in chat)
   if (state.platforms.includes('youtube')) {
-    await _postYtResultsMessage(state.title, combinedVotes, state.options);
+    await _postYtResultsMessage(state.title, combinedVotes, state.options, state.youtubeTotal);
   }
 
   // Discord embed
@@ -376,34 +571,59 @@ async function _endPoll(winningIndex) {
   return { state, errors };
 }
 
-// ── processMessage — YouTube vote counting ────────────────────────────────
+/**
+ * Standalone version of _mapYtChoicesToOptions that takes an explicit state
+ * object instead of reading the module-level _active. Lets _endPoll sync one
+ * last time after _active has been cleared.
+ */
+function _mapYtChoicesToOptionsForState(state, poll) {
+  if (!state || !poll) return { votes: {}, total: 0, matched: false };
+  const votes = Object.fromEntries(state.options.map((_, i) => [i, 0]));
+  const choices = poll?.choices ?? [];
+  const norm = (s) => String(s ?? '').trim().toLowerCase();
 
-async function processMessage(msg) {
-  if (!_active) return { message: msg };
-  if (!_active.platforms.includes('youtube')) return { message: msg };
-  if (msg.platform !== 'youtube') return { message: msg };
+  let matchedCount = 0;
+  const usedIdx = new Set();
+  choices.forEach((c) => {
+    const txt = norm(c.text);
+    let idx = -1;
+    for (let i = 0; i < state.options.length; i++) {
+      if (norm(state.options[i]) === txt) { idx = i; break; }
+    }
+    if (idx < 0) {
+      for (let i = 0; i < state.options.length; i++) {
+        const opt = norm(state.options[i]);
+        if (opt.length > 3 && (txt.startsWith(opt) || opt.startsWith(txt))) { idx = i; break; }
+      }
+    }
+    if (idx >= 0 && !usedIdx.has(idx)) {
+      votes[idx] = (votes[idx] ?? 0) + (c.voteCount ?? 0);
+      usedIdx.add(idx);
+      matchedCount++;
+    }
+  });
 
-  const trimmed = msg.message.trim();
-
-  // Accept bare digits or digit + punctuation: "1", "2.", "3!", " 2 " etc.
-  const match = trimmed.match(/^(\d+)[^\d]?$/);
-  if (!match) return { message: msg };
-
-  const choice = parseInt(match[1], 10) - 1; // 0-indexed
-  if (choice < 0 || choice >= _active.options.length) return { message: msg };
-
-  if (_active.ytVoters.has(msg.username)) {
-    // Already voted — suppress the duplicate silently but don't count it
-    return { message: null };
+  if (matchedCount === 0 && choices.length === state.options.length) {
+    choices.forEach((c, i) => { votes[i] = c.voteCount ?? 0; });
   }
 
-  _active.ytVoters.add(msg.username);
-  _active.ytVotes[choice] = (_active.ytVotes[choice] ?? 0) + 1;
-  log.info(`[poll] YT vote from ${msg.username}: option ${choice + 1}`);
-  _pushOverlay();
+  return {
+    votes,
+    total:   poll?.totalVotes ?? 0,
+    matched: matchedCount > 0,
+  };
+}
 
-  // Suppress vote messages from Discord feed — keeps #stream-chat clean
-  return { message: null };
+// ── processMessage ────────────────────────────────────────────────────────
+//
+// With the YouTube poll API integration, YouTube chat is no longer used as
+// the vote channel — votes are submitted directly through the YouTube poll
+// UI and masterchat reports them via updatePollAction events. So we no
+// longer intercept "1", "2", "3" messages on YouTube. Chat messages pass
+// through unchanged to the main feed.
+
+async function processMessage(msg) {
+  return { message: msg };
 }
 
 // ── Slash commands ─────────────────────────────────────────────────────────
@@ -464,9 +684,15 @@ const commandPoll = new SlashCommandBuilder()
 // ── init ───────────────────────────────────────────────────────────────────
 
 function init(context) {
-  _twitch = context.twitch;
+  _twitch  = context.twitch;
+  _youtube = context.youtube;
   if (!_twitch) {
     log.warn('[poll] twitch module not in init context — Twitch poll/prediction creation disabled');
+  }
+  if (!_youtube) {
+    log.warn('[poll] youtube module not in init context — YouTube poll API integration disabled');
+  } else if (typeof _youtube.onPollEvent !== 'function') {
+    log.warn('[poll] youtube module missing onPollEvent — update src/youtube.js to enable YouTube polls');
   }
 }
 
@@ -483,16 +709,27 @@ async function handleInteraction(interaction) {
     }
     const elapsed  = Math.round((Date.now() - _active.startedAt.getTime()) / 1000);
     const remaining = Math.max(0, Math.round((_active.durationMs - (Date.now() - _active.startedAt.getTime())) / 1000));
-    const total     = Object.values(_active.ytVotes).reduce((a, b) => a + b, 0) || 1;
-    const lines     = _active.options.map((o, i) => {
-      const v = _active.ytVotes[i] ?? 0;
-      return `${i + 1}. **${o}** — ${v} YT votes (${Math.round((v / total) * 100)}%)`;
+    const ytTotal = _active.youtubeTotal ?? Object.values(_active.youtubeVotes).reduce((a, b) => a + b, 0);
+    const twTotal = Object.values(_active.twitchVotes).reduce((a, b) => a + b, 0);
+    const total = Math.max(1, ytTotal + twTotal);
+    const lines = _active.options.map((o, i) => {
+      const yt = _active.youtubeVotes[i] ?? 0;
+      const tw = _active.twitchVotes[i]  ?? 0;
+      const pct = Math.round(((yt + tw) / total) * 100);
+      const ytPart = _active.platforms.includes('youtube') ? `  •  YT: ${yt}` : '';
+      const twPart = _active.platforms.includes('twitch')  ? `  •  TW: ${tw}` : '';
+      return `${i + 1}. **${o}** — ${yt + tw} votes (${pct}%)${ytPart}${twPart}`;
     });
+
+    const ytAdopted = _active.youtubePollId ? `  •  YouTube poll: ${_active.youtubePollId}` : '';
+    const ytWaiting = (_active.platforms.includes('youtube') && !_active.youtubePollId)
+      ? '\n⏳ Waiting for broadcaster to create the poll in YouTube Studio…'
+      : '';
 
     return interaction.editReply(
       `**${_active.type === 'prediction' ? '🔮 Prediction' : '📊 Poll'}**: ${_active.title}\n` +
-      `Platforms: ${_active.platforms.join(', ')}  •  ${elapsed}s elapsed  •  ~${remaining}s remaining\n\n` +
-      lines.join('\n')
+      `Platforms: ${_active.platforms.join(', ')}${ytAdopted}  •  ${elapsed}s elapsed  •  ~${remaining}s remaining\n\n` +
+      lines.join('\n') + ytWaiting
     );
   }
 
@@ -527,10 +764,14 @@ async function handleInteraction(interaction) {
     const optionList = options.map((o, i) => `${i + 1}. ${o}`).join('\n');
     const errBlock   = errors.length ? `\n\n⚠️ Errors:\n${errors.join('\n')}` : '';
 
+    const ytNote = platforms.includes('youtube')
+      ? `\nYouTube: create the poll in YouTube Studio with the title + options above — I'll auto-adopt it.`
+      : '';
+
     return interaction.editReply(
       `✅ **${type === 'prediction' ? 'Prediction' : 'Poll'} started** on ${platforms.join(' + ')}\n` +
       `**${title}**\n${optionList}\n` +
-      `Duration: ${durationSec}s${errBlock}`
+      `Duration: ${durationSec}s${ytNote}${errBlock}`
     );
   }
 
@@ -551,13 +792,20 @@ async function handleInteraction(interaction) {
     if (!result) return interaction.editReply('Poll already ended.');
 
     const { state, errors } = result;
-    const total = Object.values(state.ytVotes).reduce((a, b) => a + b, 0);
+    const ytTotal  = state.youtubeTotal ?? Object.values(state.youtubeVotes).reduce((a, b) => a + b, 0);
+    const twTotal  = Object.values(state.twitchVotes).reduce((a, b) => a + b, 0);
     const errBlock = errors.length ? `\n\n⚠️ Errors:\n${errors.join('\n')}` : '';
     const winner   = winningIndex !== null ? `\nWinner: **${state.options[winningIndex]}**` : '';
 
+    const ytNote = state.platforms.includes('youtube')
+      ? state.youtubePollId
+        ? `\nYouTube poll tracked: ${state.youtubePollId} (${ytTotal} votes).`
+        : `\nYouTube: no poll was adopted before /poll end — broadcaster may not have created one in Studio.`
+      : '';
+
     return interaction.editReply(
       `✅ **${state.type === 'prediction' ? 'Prediction' : 'Poll'} ended**: ${state.title}${winner}\n` +
-      `${total} YouTube votes recorded — results posted to Discord.${errBlock}`
+      `${twTotal} Twitch votes  •  ${ytTotal} YouTube votes recorded — results posted to Discord.${ytNote}${errBlock}`
     );
   }
 

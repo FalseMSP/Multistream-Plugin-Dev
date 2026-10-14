@@ -138,6 +138,170 @@ function _createSession(videoId) {
   };
 }
 
+// ── Live chat poll events (real YouTube poll API via masterchat) ──────────
+//
+// masterchat emits three poll action types straight from YouTube's internal
+// /youtubei/v1/live_chat/get_live_chat endpoint:
+//
+//   showPollPanelAction  → broadcaster just created a poll in Studio
+//   updatePollAction     → vote ratios updated (fired continuously as votes arrive)
+//   addPollResultAction  → poll closed; final tally with winner highlighted
+//   closePanelAction     → poll banner dismissed from chat (UI only, not state)
+//
+// We normalise them into a stable shape, cache the latest poll per videoId,
+// and fan-out to subscribers. Plugins call onPollEvent(cb) / getActivePoll(id).
+
+/** @type {Map<string, Array<(videoId: string, event: object, poll: object|null) => void>>} */
+const _pollEventSubscribers = new Set();
+
+/** @type {Map<string, object>} videoId → most recent poll state */
+const _activePollsByVideoId = new Map();
+
+/**
+ * Subscribe to live chat poll events across all active YouTube sessions.
+ * Callback receives (videoId, event, pollState). Returns an unsubscribe fn.
+ */
+function onPollEvent(callback) {
+  if (typeof callback !== 'function') return () => {};
+  _pollEventSubscribers.add(callback);
+  return () => { _pollEventSubscribers.delete(callback); };
+}
+
+/**
+ * Public snapshot of the most recent poll seen for a given video.
+ * Returns null if no poll has been observed for this video yet.
+ */
+function getActivePoll(videoId) {
+  return _activePollsByVideoId.get(videoId) ?? null;
+}
+
+/**
+ * Best-effort stringify for any of the YTText / YTRun[] / string shapes
+ * masterchat hands us for poll question and choice text. Falls back to ''
+ * if no recognisable field is present.
+ */
+function _pollTextToString(text) {
+  if (text == null) return '';
+  if (typeof text === 'string') return text;
+  if (Array.isArray(text)) return _stringifyRuns(text);
+  if (typeof text === 'object') {
+    if (typeof text.simpleText === 'string') return text.simpleText;
+    if (Array.isArray(text.runs)) return _stringifyRuns(text.runs);
+  }
+  return '';
+}
+
+/**
+ * Extract vote count from a poll choice. masterchat only ships voteRatio
+ * (0–1) on updatePollAction, and an explicit voteCount on addPollResultAction.
+ * We compute absolute votes from ratio × total when count is missing.
+ */
+function _choiceVoteCount(choice, totalVotes) {
+  if (typeof choice?.voteCount === 'number') return choice.voteCount;
+  const ratio = typeof choice?.voteRatio === 'number' ? choice.voteRatio : 0;
+  return Math.round(ratio * (totalVotes || 0));
+}
+
+/**
+ * Normalise any poll action into a stable poll-state object and update the
+ * per-video cache. Then fan-out to subscribers.
+ *
+ * @param {string} videoId
+ * @param {object} action  masterchat action with type in
+ *   {showPollPanelAction, updatePollAction, addPollResultAction, closePanelAction}
+ */
+function _emitPollEvent(videoId, action) {
+  if (!videoId || !action) return;
+
+  if (action.type === 'showPollPanelAction') {
+    const poll = {
+      videoId,
+      pollId:    action.id ?? null,
+      pollType:  action.pollType ?? null,
+      question:  _pollTextToString(action.question),
+      authorName: action.authorName ?? '',
+      startedAt: new Date(),
+      endedAt:   null,
+      status:    'active',
+      totalVotes: 0,
+      choices:   (action.choices ?? []).map(c => ({
+        text:        _pollTextToString(c.text),
+        voteRatio:  typeof c.voteRatio === 'number' ? c.voteRatio : 0,
+        voteCount:  0,
+        votePercentage:
+          typeof c.votePercentage === 'string'
+            ? c.votePercentage
+            : (c.votePercentage?.simpleText ?? ''),
+        winner: false,
+      })),
+    };
+    _activePollsByVideoId.set(videoId, poll);
+    log.info(`[YouTube] Poll started: id=${poll.pollId} q="${poll.question}" (${poll.choices.length} choices)`);
+  } else if (action.type === 'updatePollAction') {
+    const poll = _activePollsByVideoId.get(videoId);
+    if (poll && poll.pollId === action.id) {
+      poll.totalVotes = typeof action.voteCount === 'number' ? action.voteCount : poll.totalVotes;
+      if (action.question) poll.question = _pollTextToString(action.question);
+      (action.choices ?? []).forEach((c, i) => {
+        if (!poll.choices[i]) {
+          poll.choices[i] = { text: _pollTextToString(c.text), voteRatio: 0, voteCount: 0, votePercentage: '', winner: false };
+        }
+        poll.choices[i].text        = _pollTextToString(c.text) || poll.choices[i].text;
+        poll.choices[i].voteRatio   = typeof c.voteRatio === 'number' ? c.voteRatio : poll.choices[i].voteRatio;
+        poll.choices[i].voteCount   = _choiceVoteCount(c, poll.totalVotes);
+        poll.choices[i].votePercentage =
+          typeof c.votePercentage === 'string'
+            ? c.votePercentage
+            : (c.votePercentage?.simpleText ?? poll.choices[i].votePercentage);
+      });
+    }
+  } else if (action.type === 'addPollResultAction') {
+    const poll = _activePollsByVideoId.get(videoId);
+    if (poll && poll.pollId === action.id) {
+      poll.status     = 'closed';
+      poll.endedAt     = new Date();
+      poll.totalVotes  =
+        typeof action.voteCount === 'number'
+          ? action.voteCount
+          : (parseInt(action.total ?? '0', 10) || poll.totalVotes);
+      if (action.question) poll.question = _pollTextToString(action.question);
+      (action.choices ?? []).forEach((c, i) => {
+        if (!poll.choices[i]) {
+          poll.choices[i] = { text: _pollTextToString(c.text), voteRatio: 0, voteCount: 0, votePercentage: '', winner: false };
+        }
+        poll.choices[i].text       = _pollTextToString(c.text) || poll.choices[i].text;
+        poll.choices[i].voteRatio  = typeof c.voteRatio === 'number' ? c.voteRatio : poll.choices[i].voteRatio;
+        poll.choices[i].voteCount  = _choiceVoteCount(c, poll.totalVotes);
+        poll.choices[i].votePercentage =
+          typeof c.votePercentage === 'string' ? c.votePercentage : poll.choices[i].votePercentage;
+      });
+      // Mark the highest-ratio choice as the winner (ties → first)
+      let bestIdx = -1;
+      let bestRatio = -1;
+      poll.choices.forEach((c, i) => {
+        if (c.voteRatio > bestRatio) { bestRatio = c.voteRatio; bestIdx = i; }
+      });
+      if (bestIdx >= 0) poll.choices[bestIdx].winner = true;
+      log.info(`[YouTube] Poll closed: id=${poll.pollId} totalVotes=${poll.totalVotes} winner=${bestIdx}`);
+      // Drop the cache after 30 s so a future poll with the same id (extremely
+      // unlikely on the same video) is not mistaken for a stale entry.
+      setTimeout(() => {
+        const cur = _activePollsByVideoId.get(videoId);
+        if (cur?.pollId === poll.pollId) _activePollsByVideoId.delete(videoId);
+      }, 30_000);
+    }
+  } else if (action.type === 'closePanelAction') {
+    // UI-only dismissal of the poll banner — do not treat as a poll close.
+    // We still forward the event so subscribers can react if they want to.
+  }
+
+  const poll = _activePollsByVideoId.get(videoId) ?? null;
+  for (const cb of _pollEventSubscribers) {
+    try { cb(videoId, action, poll); }
+    catch (err) { log.warn('[YouTube] poll event subscriber error:', err.message); }
+  }
+}
+
 // ── Per-Session Helpers ───────────────────────────────────────────────────
 
 function _cacheParticipant(session, displayName, channelId) {
@@ -291,6 +455,20 @@ async function _runFetchLane(laneId, videoId, session, queue, isFirstLane) {
           for (let i = 0; i < giftCount; i++) {
             queue.pushMessage({ platform: 'youtube', type: 'subscribe', username: displayName ?? null });
           }
+          continue;
+        }
+
+        // ── YouTube live poll events ────────────────────────────────────────
+        // Forwarded straight from masterchat — these are the actions YouTube's
+        // own player uses to render the poll banner, so they carry the real
+        // vote ratios and final tally (no chat-scraping fallback needed).
+        if (
+          action.type === 'showPollPanelAction' ||
+          action.type === 'updatePollAction'    ||
+          action.type === 'addPollResultAction' ||
+          action.type === 'closePanelAction'
+        ) {
+          _emitPollEvent(videoId, action);
           continue;
         }
 
@@ -1064,6 +1242,12 @@ module.exports = {
     vip:     ytVip,
     unvip:   ytUnvip,
   },
+
+  // ── Live chat poll API (real YouTube polls via masterchat) ──────────────
+  // Subscribe to poll lifecycle events (created / vote-update / closed) and
+  // query the most recent poll state per videoId. See _emitPollEvent above.
+  onPollEvent,
+  getActivePoll,
 };
 
 // Register mod action handlers with the dashboard so that timeout/ban buttons
