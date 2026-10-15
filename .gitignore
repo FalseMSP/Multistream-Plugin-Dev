@@ -15,3 +15,4 @@ clipcurator/server.log
 clipcurator/.vercel
 clipcurator/*.tsbuildinfo
 clipcurator/next-env.d.ts
+src/plugins/create-reward/rewards.json

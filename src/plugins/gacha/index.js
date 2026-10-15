@@ -424,7 +424,15 @@ function triggerPull({ user, isPremium = false }) {
 
 // Channel Point reward title(s) that trigger a standard pull.
 // Case-insensitive. Add alternates if you name it differently on YT.
-const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha'];
+//
+// "first" → the FIRST reward (one redeem per stream, see
+// src/plugins/create-reward/rewards.json). Twitch enforces the
+// once-per-stream limit at the reward level (max_per_stream=1), so by
+// the time the redeem reaches us it is genuinely the first and only
+// redeem of the stream. We still fire a STANDARD pull — same odds as
+// any other channel-point pull — so the viewer gets a real chance at
+// the loot table.
+const STANDARD_REDEEM_TITLES = ['gacha pull', 'gacha', 'first'];
 
 // Channel Point reward title(s) that trigger a premium pull.
 const PREMIUM_REDEEM_TITLES  = ['gacha premium pull', 'gacha premium'];
