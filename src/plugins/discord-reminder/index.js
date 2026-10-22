@@ -12,12 +12,23 @@ const DISCORD_URL = 'https://discord.gg/jBSNayWUrX';
 // Messages sent to both platforms
 const COMMON_MESSAGES = [
   `Join the Discord: ${DISCORD_URL}`,
+  `Gacha odds are public! https://docs.google.com/spreadsheets/d/1EG0E9UboCVIvHQ-oV3QAAf7gQqtSp5ikBLoeQHfD3rE/edit?usp=sharing`,
+  `!help will tell you all available commands`,
+  `these messages are pre-generated, i'm running out of things to say`,
+  `Hey there! Do you want to know about Twitch Prime? Oh! You may be asking, "What's Twitch Prime?" Let me tell ya! When you connect your Amazon account to your Twitch account, you can get 1 free sub to ANY streamer on Twitch, every month! Yup, and along with that, get yourself some Twitch loot! With Twitch loot, you can go ahead and get yourself some exclusive Twitch gear and your favorite games! So go ahead! Grab your Amazon account, grab a family or friend's Amazon Prime account, and link it to your Twitch account TODAY!`
+  `If you find these messages helpful/annoying let me know! https://forms.gle/4FLx9uW6nEzy8pWq9`,
 ];
 
 // Messages exclusive to YouTube (doesn't make sense to plug Twitch on Twitch)
 const YOUTUBE_ONLY_MESSAGES = [
   `if you're enjoying, like the stream please :)`,
   `im also on twitch! twitch.tv/redlifemc`,
+  `Liking the stream gives a free budget gacha pull!`,
+  `do !points to see your channel points!`,
+  `you can spend your channel points by using !redeem`,
+  `do !rewards to see all rewards that are purchasable with channel points!`,
+  `if you want to put something in the queue, use !q`,
+  `if you wanna see more content from me, subscribe!`,
 ];
 
 function _randomFrom(arr) {
