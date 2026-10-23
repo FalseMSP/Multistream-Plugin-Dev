@@ -52,8 +52,9 @@ async function _dispatchModerate(username, platform, action, duration) {
 /**
  * HTTP route handler for POST /dashboard/moderate.
  * Expects JSON body: { username, platform, action, duration? }
- * Broadcasts a 'moderate' SSE event (so the dashboard UI can reflect the
- * action immediately) then dispatches to registered handlers.
+ * Broadcasts a 'moderate' SSE event (consumed by the dashboard UI as a
+ * toast + entry in the Mod history tab) then dispatches to registered
+ * handlers.
  */
 async function handleModerate(req, res) {
   const { _readJsonBody } = require('./http-helpers');
@@ -61,7 +62,7 @@ async function handleModerate(req, res) {
   const { username, platform, action, duration } = body;
   if (username && platform && action) {
     log.info(`[dashboard] Moderation: ${action} ${username} on ${platform}${duration ? ' for ' + duration + 's' : ''}`);
-    broadcast({ type: 'moderate', username, platform, action, duration: duration ?? 0 });
+    broadcast({ type: 'moderate', username, platform, action, duration: duration ?? 0, ts: Date.now() });
     _dispatchModerate(username, platform, action, duration ?? 0).catch(err => {
       log.error('[dashboard] _dispatchModerate threw:', err.message);
     });

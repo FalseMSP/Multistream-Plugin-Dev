@@ -28,6 +28,11 @@ module.exports = {
   //   context.youtube:  the src/youtube module — say, sayTo, stopSession,
   //                     triggerVideo, updateVideoInfo, getSubscriberCount,
   //                     getLikeCount, ban, timeout, vip, unvip
+  //   context.streamInfo: the src/stream-info module — live Twitch stream state:
+  //                     isLive(), getActiveGame(), getSnapshot(), getViewerCount(),
+  //                     getCurrentSession(), getLastSession(), getAllSessions(),
+  //                     getSessionStats(), onStreamEvent(fn).
+  //                     See "Reading the active game / live viewer state" below.
   //
   // Note: chatReply is NOT in context — it's set later via onChatReady().
   // Anything that needs to send chat replies must wait for onChatReady.
@@ -223,6 +228,74 @@ module.exports = {
 
 > Use `command` (singular) when your plugin only needs one slash command.  
 > Use `commands` (array) when it needs two or more.
+
+---
+
+## Reading the active game / live viewer state
+
+`init(context)` receives `context.streamInfo` — a shared, always-fresh view of
+the broadcaster's Twitch stream state (polled from Helix `GET /streams` every
+60 s by default, using the existing app token — no new credentials).
+
+### Quick reference
+
+| Call | Returns | Notes |
+|---|---|---|
+| `streamInfo.isLive()` | `boolean` | |
+| `streamInfo.getActiveGame()` | `{ name, id, since } \| null` | The Twitch category currently being played; `null` while offline |
+| `streamInfo.getViewerCount()` | `number` | Live viewer count; `0` while offline |
+| `streamInfo.getSnapshot()` | `{ isLive, gameName, gameId, title, viewers, startedAt, gameSinceAt, fetchedAt }` | Latest poll result |
+| `streamInfo.getCurrentSession()` | session \| null | Open session while live (shape below) |
+| `streamInfo.getLastSession()` | session \| null | Most recent FROZEN session — data freezes when the stream ends |
+| `streamInfo.getAllSessions()` | session[] | Archived frozen sessions, oldest first |
+| `streamInfo.getSessionStats(s)` | `{ peak, peakAt, avg, count, durationMs }` | Summary stats for any session |
+| `streamInfo.onStreamEvent(fn)` | unsubscribe fn | Events: `live`, `offline`, `game-change`, `update` |
+
+Session shape (compact — samples are `[epochSeconds, viewers, gameIndex]`
+triples sharing a `games` string table):
+
+```js
+{
+  startedAt: 1761164400000,   // ms epoch (Twitch started_at)
+  endedAt:   null,            // set when the stream ended → session is frozen
+  gameName: 'Minecraft',      // game at stream start
+  title:    '…',              // latest stream title
+  games:    ['Minecraft', 'Just Chatting'],
+  samples:  [[1761164400, 42, 0], [1761164460, 55, 0], ...],
+  peak:     { v: 420, t: 1761170000000 },
+  rawSampleCount: 480,        // polls captured (before any decimation)
+}
+```
+
+### Example: react to game changes
+
+```js
+function init(context) {
+  const { streamInfo } = context;
+  if (!streamInfo) return; // running under an older index.js — unavailable
+
+  streamInfo.onStreamEvent(ev => {
+    if (ev.type === 'game-change') {
+      // ev.from → ev.to, e.g. swap an OBS scene or update a Discord channel
+      log.info(`Now playing: ${ev.to} (was ${ev.from})`);
+    }
+    if (ev.type === 'offline') {
+      const last = streamInfo.getLastSession();
+      log.info(`Stream ended — peak ${streamInfo.getSessionStats(last).peak} viewers`);
+    }
+  });
+}
+```
+
+The `stream-stats` plugin (live viewcount widget + graph + CSV export) is a
+full working example of everything above — see
+`src/plugins/stream-stats/index.js`.
+
+> **Why polling, not EventSub?** Twitch's EventSub has `stream.online` /
+> `stream.offline` events but **no viewer-count event** — Helix `GET /streams`
+> is the only source of live viewer numbers, so one poll loop covers
+> liveness, game changes, and viewcounts together (~1 req/min, well within
+> the 800 req/min app-token budget).
 
 ---
 

@@ -21,6 +21,7 @@ const { startWebSub }     = require('./src/websub');
 const queue               = require('./src/queue');
 const log                 = require('./src/logger');
 const plugins             = require('./src/plugins/index');
+const streamInfo          = require('./src/stream-info');
 
 const { startOverlayServer } = require('./src/overlay-server');
 const {
@@ -53,12 +54,24 @@ async function main() {
   //     only init pass — no duplicate "first init without queue" anymore,
   //     which previously caused the spurious "context.queue not available"
   //     warnings in gacha / sfx / event-feed / stream-events / pull-fragment.
+  //     context.streamInfo exposes the active game + live viewer state from
+  //     Twitch (see src/stream-info.js) to every plugin that wants it.
   plugins.initPlugins({
     discord,
     queue,
     twitch: twitchModule,
     youtube: ytModule,
+    streamInfo,
   });
+
+  // 2b-2. Start the shared stream-state poller (Twitch Helix GET /streams).
+  //       It feeds context.streamInfo — active game, live/offline state, and
+  //       the per-session viewer time-series that the stream-stats dashboard
+  //       widget renders. Starting it here means plugins receive 'live' /
+  //       'offline' / 'game-change' events from the very beginning of the
+  //       process lifetime. Uses the app token only — works regardless of
+  //       whether IRC chat or EventSub came up.
+  streamInfo.start(twitchModule);
 
   // 2c. Mount dashboard routes on the overlay server, then start the HTTP
   //     server. OBS Browser Source URL: http://127.0.0.1:2999/overlay

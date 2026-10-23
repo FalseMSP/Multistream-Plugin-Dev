@@ -72,7 +72,36 @@ function buildDashboardPage() {
   }
   .topbar-logo { display: flex; align-items: center; gap: 8px; font-weight: 900; font-size: 14px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text); }
   .topbar-logo svg { color: var(--accent); }
-  .topbar-badge { background: var(--accent-lo); border: 1px solid rgba(229, 57, 53, 0.35); color: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 3px; letter-spacing: 0.06em; text-transform: uppercase; }
+  /* Live status chip (topbar) — driven by the stream-info widget data */
+  .live-chip {
+    display: flex; align-items: center; gap: 7px;
+    background: var(--surface2); border: 1px solid var(--border); color: var(--muted);
+    font-family: var(--mono); font-size: 10px; font-weight: 700;
+    padding: 3px 9px; border-radius: 3px; letter-spacing: 0.06em;
+    text-transform: uppercase; transition: all 0.2s; flex-shrink: 0;
+  }
+  .live-chip .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+  .live-chip[data-state="live"] { background: var(--accent-lo); border-color: rgba(229,57,53,0.45); color: var(--accent); }
+  .live-chip[data-state="live"] .live-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(229,57,53,0.2); animation: pulse 2s ease infinite; }
+  .live-chip[data-state="frozen"] { color: #f59e0b; border-color: rgba(245,158,11,0.35); background: rgba(245,158,11,0.08); }
+  .live-chip[data-state="frozen"] .live-dot { background: #f59e0b; }
+  .live-viewers { font-weight: 700; }
+  .topbar-stream { display: none; align-items: center; gap: 8px; min-width: 0; max-width: 38vw; overflow: hidden; }
+  .topbar-stream-game { font-size: 11px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 1; min-width: 0; }
+  .topbar-stream-sep { color: var(--muted); flex-shrink: 0; }
+  .topbar-stream-title { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .topbar-uptime { font-family: var(--mono); font-size: 11px; color: var(--muted); flex-shrink: 0; white-space: nowrap; }
+  /* Small topbar buttons (layout controls) */
+  .topbar-tiny-btn {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: var(--muted); background: none;
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 10px; cursor: pointer; font-family: inherit;
+    transition: color 0.15s, border-color 0.15s, background 0.15s; flex-shrink: 0;
+  }
+  .topbar-tiny-btn:hover { color: var(--text); border-color: var(--muted); }
+  .topbar-tiny-btn.active { color: var(--accent); border-color: rgba(229,57,53,0.35); background: var(--accent-lo); }
+  .layout-controls { display: flex; gap: 6px; }
   .topbar-spacer { flex: 1; }
   .topbar-status { display: flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; box-shadow: 0 0 0 2px rgba(34,197,94,0.25); animation: pulse 2s ease infinite; }
@@ -96,13 +125,15 @@ function buildDashboardPage() {
   .grid-inner { position: relative; width: 100%; min-height: 100%; }
   /* ── Right: chat column ── */
   .chat-column {
-    width: 380px;
+    width: var(--chat-w, 380px);
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
     border-left: 1px solid var(--border);
     background: var(--surface);
     overflow: hidden;
+    position: relative;
+    transition: width 0.15s ease;
   }
   .chat-column-header {
     display: flex; align-items: center; gap: 10px;
@@ -110,6 +141,33 @@ function buildDashboardPage() {
     background: var(--accent-lo); flex-shrink: 0;
   }
   .chat-column-title { font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: var(--accent); }
+  /* Chat column resize handle (left edge) */
+  .chat-resize-handle {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 7px;
+    cursor: col-resize; background: transparent; z-index: 20;
+    transition: background 0.15s; touch-action: none;
+  }
+  .chat-resize-handle:hover, .chat-resize-handle.active { background: rgba(229,57,53,0.3); }
+  /* Chat column collapse button + collapsed rail */
+  .chat-collapse-btn {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    padding: 3px 4px; border-radius: 3px; font-size: 12px; line-height: 1;
+    display: flex; align-items: center; flex-shrink: 0;
+    transition: color 0.15s, background 0.15s, transform 0.2s;
+  }
+  .chat-collapse-btn:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+  .chat-column-icon { display: flex; align-items: center; flex-shrink: 0; }
+  .chat-column.collapsed { width: 42px !important; min-width: 42px; }
+  .chat-column.collapsed .chat-feed,
+  .chat-column.collapsed .chat-column-tabs,
+  .chat-column.collapsed .chat-column-icon { display: none; }
+  .chat-column.collapsed .chat-column-header {
+    flex-direction: column; align-items: center; justify-content: flex-start;
+    padding: 12px 0; gap: 14px; border-bottom: none; flex: 1;
+  }
+  .chat-column.collapsed .chat-column-title {
+    writing-mode: vertical-rl; text-orientation: mixed; letter-spacing: 0.3em;
+  }
   .chat-column-tabs { display: flex; gap: 6px; margin-left: auto; }
   .chat-tab {
     font-size: 10px; font-family: var(--mono); font-weight: 700;
@@ -248,6 +306,28 @@ function buildDashboardPage() {
   .widget-header:active { cursor: grabbing; }
   .widget-card.dragging { opacity: 0.85; box-shadow: 0 12px 40px rgba(0,0,0,0.6); z-index: 50; cursor: grabbing; }
   .widget-card.minimized .widget-body { display: none; }
+  /* ── Auto-flow grid mode (topbar layout toggle) ── */
+  .grid-inner.grid-mode {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+    align-items: start;
+    width: 100% !important;
+    min-height: 100%;
+  }
+  .grid-inner.grid-mode .widget-card {
+    position: static !important;
+    width: auto !important;
+    height: auto !important;
+    left: auto !important;
+    top: auto !important;
+  }
+  .grid-inner.grid-mode .widget-resize-handle { display: none !important; }
+  .grid-inner.grid-mode .widget-body {
+    height: auto !important;
+    max-height: 60vh;
+    overflow: auto !important;
+  }
   .widget-minimize {
     margin-left: 6px; background: none; border: none; color: var(--muted);
     cursor: pointer; padding: 2px 5px; border-radius: 3px; font-size: 14px;
@@ -399,6 +479,48 @@ function buildDashboardPage() {
   .cmd-ac-item:hover, .cmd-ac-item.active { background: var(--accent-lo); color: var(--text); }
   .cmd-ac-name  { color: var(--accent); font-weight: 700; white-space: nowrap; }
   .cmd-ac-desc  { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* ── Moderation history rows (Mod tab) ── */
+  .mod-row { display: flex; align-items: flex-start; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 12px; line-height: 1.45; }
+  .mod-row:last-child { border-bottom: none; }
+  .mod-row-icon { font-size: 14px; flex-shrink: 0; line-height: 1.3; }
+  .mod-row-body { flex: 1; min-width: 0; }
+  .mod-row-user { font-weight: 700; font-size: 12px; }
+  .mod-row-detail { color: var(--muted); font-size: 11px; }
+  .mod-row-ts { font-family: var(--mono); font-size: 10px; color: var(--muted); flex-shrink: 0; align-self: center; }
+  /* ── Toasts ── */
+  .toast-stack { position: fixed; top: 60px; right: 16px; z-index: 2000; display: flex; flex-direction: column; gap: 8px; max-width: 340px; pointer-events: none; }
+  .toast {
+    background: var(--surface2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 6px; padding: 10px 14px; font-size: 12px; color: var(--text);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5); animation: toastIn 0.18s ease;
+  }
+  .toast.ok { border-left-color: #4ade80; }
+  .toast.warn { border-left-color: #f59e0b; }
+  .toast.fade { opacity: 0; transition: opacity 0.35s; }
+  @keyframes toastIn { from { transform: translateX(12px); opacity: 0; } to { transform: none; opacity: 1; } }
+  /* ── Responsive: laptop / small desktop ── */
+  @media (max-width: 1440px) {
+    .topbar-stream { max-width: 30vw; }
+  }
+  /* ── Responsive: tablet — stack chat below the widget grid ── */
+  @media (max-width: 1100px) {
+    .dashboard-layout { flex-direction: column; }
+    .grid { flex: 1 1 auto; min-height: 0; }
+    .chat-column { width: 100% !important; height: var(--chat-h, 42vh); border-left: none; border-top: 1px solid var(--border); flex-shrink: 0; }
+    .chat-resize-handle { display: none; }
+    .chat-column.collapsed { width: 100% !important; height: 40px !important; min-width: 0; }
+    .chat-column.collapsed .chat-column-header { flex-direction: row; padding: 8px 14px; gap: 10px; }
+    .chat-column.collapsed .chat-column-title { writing-mode: horizontal-tb; letter-spacing: 0.12em; }
+  }
+  /* ── Responsive: phone ── */
+  @media (max-width: 760px) {
+    .topbar { flex-wrap: wrap; height: auto; padding: 8px 10px; gap: 8px; row-gap: 6px; }
+    .topbar-stream { display: none !important; }
+    .chat-column { height: 48vh; }
+    .mod-modal { width: min(320px, 92vw); }
+    .grid-inner.grid-mode { grid-template-columns: 1fr; }
+    .toast-stack { left: 12px; right: 12px; max-width: none; top: 96px; }
+  }
 </style>
 </head>
 <body>
@@ -410,8 +532,28 @@ function buildDashboardPage() {
       </svg>
       Dashboard
     </div>
-    <span class="topbar-badge">LIVE</span>
+    <div class="live-chip" id="live-chip" data-state="unknown" title="Stream status (from stream-stats)">
+      <span class="live-dot"></span>
+      <span class="live-label" id="live-label">—</span>
+      <span class="live-viewers" id="live-viewers"></span>
+    </div>
+    <div class="topbar-stream" id="topbar-stream">
+      <span class="topbar-stream-game" id="stream-game"></span>
+      <span class="topbar-stream-sep" id="stream-sep">·</span>
+      <span class="topbar-stream-title" id="stream-title"></span>
+      <span class="topbar-uptime" id="stream-uptime"></span>
+    </div>
     <div class="topbar-spacer"></div>
+    <div class="layout-controls">
+      <button class="topbar-tiny-btn" id="layout-mode-btn" title="Toggle between auto-flow CSS Grid layout and freeform drag layout">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        <span id="layout-mode-label">Grid</span>
+      </button>
+      <button class="topbar-tiny-btn" id="layout-reset-btn" title="Reset widget layout — clears saved positions/sizes and stale entries">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>
+        Reset
+      </button>
+    </div>
     <div class="widgets-menu-wrap" id="widgets-menu-wrap">
       <button class="widgets-menu-btn" id="widgets-menu-btn" title="Minimized widgets">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
@@ -445,11 +587,17 @@ function buildDashboardPage() {
       </main>
     </div>
 
-    <aside class="chat-column">
+    <aside class="chat-column" id="chat-column">
+      <div class="chat-resize-handle" id="chat-resize-handle" title="Drag to resize the chat column"></div>
       <div class="chat-column-header">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)">
-          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-        </svg>
+        <button class="chat-collapse-btn" id="chat-collapse-btn" title="Collapse / expand the chat column">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+        </button>
+        <span class="chat-column-icon" style="color:var(--accent)">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </span>
         <span class="chat-column-title">Live Chat</span>
         <div class="chat-column-tabs">
           <button class="chat-tab active" data-feed="combined">All</button>
@@ -461,6 +609,9 @@ function buildDashboardPage() {
           </button>
           <button class="chat-tab" data-feed="events">
             <span style="color:#fbbd08">⚡</span> Events
+          </button>
+          <button class="chat-tab" data-feed="modlog">
+            <span style="color:#4ade80">🛡</span> Mod
           </button>
         </div>
       </div>
@@ -521,6 +672,9 @@ function buildDashboardPage() {
   </div>
 </div>
 
+<!-- Toast notifications -->
+<div class="toast-stack" id="toast-stack"></div>
+
 <!-- Autocomplete portal (top-level to avoid clipping) -->
 <div class="cmd-autocomplete" id="cmd-autocomplete"></div>
 
@@ -577,7 +731,34 @@ function buildDashboardPage() {
 
   // ── Freeform widget positioning ──────────────────────────────────────────
   const SNAP_GRID = 20; // px grid when shift held
-  const widgetPositions = JSON.parse(localStorage.getItem('dash-positions') || '{}');
+
+  // Prune stale localStorage entries — ids of widgets that are no longer
+  // registered (plugin removed / renamed) accumulate forever otherwise.
+  function _pruneMap(key, knownIds) {
+    let map;
+    try { map = JSON.parse(localStorage.getItem(key) || '{}'); }
+    catch { map = {}; }
+    let changed = false;
+    for (const id of Object.keys(map)) {
+      if (!knownIds.has(id)) { delete map[id]; changed = true; }
+    }
+    if (changed) {
+      try { localStorage.setItem(key, JSON.stringify(map)); } catch {}
+    }
+    return map;
+  }
+  function _pruneArray(key, knownIds) {
+    let arr;
+    try { arr = JSON.parse(localStorage.getItem(key) || '[]'); }
+    catch { arr = []; }
+    const filtered = arr.filter(id => knownIds.has(id));
+    if (filtered.length !== arr.length) {
+      try { localStorage.setItem(key, JSON.stringify(filtered)); } catch {}
+    }
+    return filtered;
+  }
+
+  let widgetPositions = _pruneMap('dash-positions', new Set(WIDGETS.map(w => 'wcard-' + w.id)));
 
   function savePositions() {
     const pos = {};
@@ -611,8 +792,53 @@ function buildDashboardPage() {
     });
   }
 
-  // Apply positions after cards are in DOM
-  applyPositions();
+  // ── Layout mode: auto-flow CSS Grid vs freeform absolute positioning ─────
+  let layoutMode = 'free';
+  try { layoutMode = localStorage.getItem('dash-layout-mode') || 'free'; } catch {}
+  const layoutModeBtn   = document.getElementById('layout-mode-btn');
+  const layoutModeLabel = document.getElementById('layout-mode-label');
+  const layoutResetBtn  = document.getElementById('layout-reset-btn');
+
+  function setLayoutMode(mode) {
+    layoutMode = mode;
+    try { localStorage.setItem('dash-layout-mode', mode); } catch {}
+    gridInner.classList.toggle('grid-mode', mode === 'grid');
+    if (layoutModeLabel) layoutModeLabel.textContent = mode === 'grid' ? 'Grid' : 'Free';
+    if (layoutModeBtn) layoutModeBtn.classList.toggle('active', mode === 'grid');
+    if (mode === 'grid') {
+      // CSS grid drives geometry — drop the expanded-canvas inline dims.
+      gridInner.style.width  = '';
+      gridInner.style.height = '';
+    } else {
+      applyPositions();
+      expandCanvas();
+    }
+  }
+
+  if (layoutModeBtn) {
+    layoutModeBtn.addEventListener('click', () => {
+      setLayoutMode(layoutMode === 'grid' ? 'free' : 'grid');
+    });
+  }
+
+  if (layoutResetBtn) {
+    layoutResetBtn.addEventListener('click', () => {
+      widgetPositions = {};
+      try { localStorage.removeItem('dash-positions'); } catch {}
+      gridInner.querySelectorAll('.widget-card').forEach(card => {
+        card.style.left = ''; card.style.top = '';
+        card.style.width = ''; card.style.height = '';
+        const body = card.querySelector('.widget-body');
+        if (body) { body.style.height = ''; body.style.overflow = ''; }
+      });
+      if (layoutMode === 'free') { applyPositions(); expandCanvas(); }
+      toast('Widget layout reset', 'ok');
+    });
+  }
+
+  // Apply layout after cards are in DOM — grid mode is pure CSS auto-flow,
+  // freeform mode applies saved / auto-computed absolute positions.
+  setLayoutMode(layoutMode);
 
   // Expand canvas to fit all cards
   function expandCanvas() {
@@ -626,11 +852,37 @@ function buildDashboardPage() {
   }
 
   // ── Mouse drag on widget headers ─────────────────────────────────────────
+  // ── Collision resolution (freeform mode) ────────────────────────────
+  // Cards could historically be dropped on top of each other. After a drag,
+  // push the moved card below the bottom edge of whatever it overlaps,
+  // repeating until it is clear (bounded so a pathological layout can't loop).
+  function _cardRect(card) {
+    const l = parseInt(card.style.left) || 0;
+    const t = parseInt(card.style.top)  || 0;
+    return { left: l, top: t, right: l + card.offsetWidth, bottom: t + card.offsetHeight };
+  }
+  function _rectsOverlap(a, b) {
+    return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  }
+  function resolveCollisions(moved) {
+    const others = [...gridInner.querySelectorAll('.widget-card')]
+      .filter(c => c !== moved);
+    let guard = 0;
+    while (guard++ < 60) {
+      const r = _cardRect(moved);
+      const hit = others.find(o => _rectsOverlap(r, _cardRect(o)));
+      if (!hit) break;
+      const hr = _cardRect(hit);
+      moved.style.top = (hr.bottom + 16) + 'px';
+    }
+  }
+
   let wDrag = null;
   grid.addEventListener('mousedown', (e) => {
     const header = e.target.closest('.widget-header');
     if (!header) return;
     if (e.target.closest('.widget-minimize')) return;
+    if (layoutMode === 'grid') return; // dragging disabled in auto-flow mode
     const card = header.closest('.widget-card');
     if (!card) return;
     e.preventDefault();
@@ -659,6 +911,7 @@ function buildDashboardPage() {
     function onUp() {
       card.classList.remove('dragging', 'snap-preview');
       card.style.zIndex = '';
+      if (layoutMode === 'free') resolveCollisions(card);
       expandCanvas();
       savePositions();
       wDrag = null;
@@ -674,6 +927,7 @@ function buildDashboardPage() {
   document.addEventListener('mousedown', (e) => {
     const handle = e.target.closest('.widget-resize-handle');
     if (!handle) return;
+    if (layoutMode === 'grid') return; // resizing disabled in auto-flow mode
     const card = handle.closest('.widget-card');
     if (!card) return;
     e.preventDefault();
@@ -716,7 +970,105 @@ function buildDashboardPage() {
   }
 
   for (const w of WIDGETS) invoke(w.id, initialData[w.id]);
-  expandCanvas();
+  if (layoutMode !== 'grid') expandCanvas();
+
+  // ── Topbar live status — driven by the stream-info widget ──────────────
+  // The old topbar LIVE badge was hardcoded HTML; this replaces it with
+  // real isLive / viewer / game / title / uptime data. Source of truth is
+  // the shared stream-info module (src/stream-info.js), surfaced on the
+  // dashboard as the 'stream-stats' widget (initial snapshot here, live
+  // updates via SSE 'widget' events for id 'stream-stats').
+  // Payload shape: { unavailable?, session: { live, game, title, viewers,
+  //   startedAt, endedAt, peak, avg, durationMs, … } | null }
+  const liveChip       = document.getElementById('live-chip');
+  const liveLabel      = document.getElementById('live-label');
+  const liveViewers    = document.getElementById('live-viewers');
+  const topbarStream   = document.getElementById('topbar-stream');
+  const streamGame     = document.getElementById('stream-game');
+  const streamSep      = document.getElementById('stream-sep');
+  const streamTitleEl  = document.getElementById('stream-title');
+  const streamUptime   = document.getElementById('stream-uptime');
+
+  let streamStatus = null;
+
+  function fmtUptime(ms) {
+    if (!ms || ms < 0) ms = 0;
+    const s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const p = n => String(n).padStart(2, '0');
+    return (h > 0 ? h + 'h ' : '') + p(m) + 'm ' + p(sec) + 's';
+  }
+  function fmtNum(n) {
+    return (n === null || n === undefined) ? '' : Number(n).toLocaleString('en-US');
+  }
+
+  function updateStreamStatus(data) {
+    streamStatus = data || null;
+
+    const session = data && data.session ? data.session : null;
+
+    if (!data) {
+      liveChip.dataset.state = 'unknown';
+      liveChip.title = 'No stream-stats data (plugin not loaded?)';
+      liveLabel.textContent = '—';
+      liveViewers.textContent = '';
+      topbarStream.style.display = 'none';
+      return;
+    }
+
+    if (data.unavailable) {
+      liveChip.dataset.state = 'unknown';
+      liveChip.title = 'stream-info module unavailable';
+      liveLabel.textContent = '—';
+      liveViewers.textContent = '';
+      topbarStream.style.display = 'none';
+      return;
+    }
+
+    if (session && session.live) {
+      liveChip.dataset.state = 'live';
+      liveChip.title = 'Stream is live (Twitch)';
+      liveLabel.textContent = 'LIVE';
+      liveViewers.textContent = session.viewers != null ? fmtNum(session.viewers) + ' watching' : '';
+      topbarStream.style.display = 'flex';
+      streamGame.textContent = session.game || '—';
+      streamSep.style.display = (session.game && session.title) ? '' : 'none';
+      streamTitleEl.textContent = session.title || '';
+      streamTitleEl.title = session.title || '';
+      streamUptime.textContent = fmtUptime(session.startedAt ? Date.now() - session.startedAt : 0);
+      streamUptime.title = 'Uptime';
+    } else if (session && session.endedAt) {
+      // Frozen — the stream ended, dataset preserved (downloadable as CSV).
+      liveChip.dataset.state = 'frozen';
+      liveChip.title = 'Stream ended — data frozen (downloadable as CSV)';
+      liveLabel.textContent = 'ENDED';
+      liveViewers.textContent = session.peak != null ? 'peak ' + fmtNum(session.peak) : '';
+      topbarStream.style.display = 'flex';
+      streamGame.textContent = session.game || 'Last stream';
+      streamSep.style.display = (session.game && session.title) ? '' : 'none';
+      streamTitleEl.textContent = session.title || '';
+      streamTitleEl.title = session.title || '';
+      streamUptime.textContent = fmtUptime(session.durationMs != null
+        ? session.durationMs
+        : (session.endedAt || Date.now()) - (session.startedAt || 0));
+      streamUptime.title = 'Stream duration';
+    } else {
+      // Offline — no live session and nothing frozen to show.
+      liveChip.dataset.state = 'offline';
+      liveChip.title = 'Offline';
+      liveLabel.textContent = 'OFFLINE';
+      liveViewers.textContent = '';
+      topbarStream.style.display = 'none';
+    }
+  }
+
+  // Uptime ticker — single interval, recomputed from the latest snapshot.
+  setInterval(() => {
+    if (!streamStatus || !streamStatus.session || !streamStatus.session.live) return;
+    if (!streamStatus.session.startedAt) return;
+    if (topbarStream.style.display === 'none') return;
+    streamUptime.textContent = fmtUptime(Date.now() - streamStatus.session.startedAt);
+  }, 1000);
 
   // ── Chat column ──────────────────────────────────────────────────────────
 
@@ -746,6 +1098,60 @@ function buildDashboardPage() {
 
   const PLATFORM_COLORS = { youtube: '#FF0000', twitch: '#9146FF' };
 
+  // ── Toasts ──────────────────────────────────────────────────────────────
+  const toastStack = document.getElementById('toast-stack');
+
+  function toast(message, kind) {
+    const t = document.createElement('div');
+    t.className = 'toast ' + (kind || 'info');
+    t.textContent = message;
+    toastStack.appendChild(t);
+    // Cap the stack at 5 visible toasts
+    while (toastStack.children.length > 5) toastStack.removeChild(toastStack.firstChild);
+    setTimeout(() => { t.classList.add('fade'); }, 3800);
+    setTimeout(() => { if (t.parentNode) t.remove(); }, 4200);
+  }
+
+  // ── Moderation action history (Mod tab) ─────────────────────────────
+  const modLog = [];
+  const MAX_MODLOG = 100;
+
+  function buildModRow(a) {
+    const row = document.createElement('div');
+    row.className = 'mod-row';
+    const icon = a.action === 'ban' ? '🚫' : '⏱';
+    const platformColor = PLATFORM_COLORS[a.platform] || 'var(--muted)';
+    const detail = a.action === 'ban'
+      ? 'permanent ban'
+      : 'timeout ' + (a.duration ? a.duration + 's' : '');
+    const ts = new Date(a.ts || Date.now());
+    const p = n => String(n).padStart(2, '0');
+    const tsStr = p(ts.getHours()) + ':' + p(ts.getMinutes()) + ':' + p(ts.getSeconds());
+    row.innerHTML =
+      '<span class="mod-row-icon">' + icon + '</span>' +
+      '<div class="mod-row-body">' +
+        '<span class="mod-row-user" style="color:' + platformColor + '">' + esc(a.username || '?') + '</span>' +
+        '<span class="mod-row-detail"> · ' + detail + ' · ' + esc(a.platform || '?') + '</span>' +
+      '</div>' +
+      '<span class="mod-row-ts">' + tsStr + '</span>';
+    return row;
+  }
+
+  function pushModAction(a) {
+    if (!a || !a.username) return;
+    const entry = { ...a, ts: a.ts || Date.now() };
+    modLog.push(entry);
+    if (modLog.length > MAX_MODLOG) modLog.splice(0, modLog.length - MAX_MODLOG);
+
+    if (chatFilter === 'modlog') {
+      const empty = chatFeed.querySelector('.chat-empty');
+      if (empty) empty.remove();
+      const atBottom = chatFeed.scrollHeight - chatFeed.scrollTop - chatFeed.clientHeight < 60;
+      chatFeed.appendChild(buildModRow(entry));
+      if (atBottom) chatFeed.scrollTop = chatFeed.scrollHeight;
+    }
+  }
+
   chatTabs.forEach(tab => {
     tab.addEventListener('click', () => {
       chatTabs.forEach(t => t.classList.remove('active'));
@@ -754,6 +1160,70 @@ function buildDashboardPage() {
       rerenderChat();
     });
   });
+
+  // ── Chat column resize + collapse ────────────────────────────────────
+  const chatColumn    = document.getElementById('chat-column');
+  const chatResizeH   = document.getElementById('chat-resize-handle');
+  const chatCollapseB = document.getElementById('chat-collapse-btn');
+  const CHAT_W_KEY    = 'dash-chat-width';
+  const CHAT_COLLAPSED_KEY = 'dash-chat-collapsed';
+  const narrowLayout  = () => window.matchMedia('(max-width: 1100px)').matches;
+
+  function chatIsCollapsed() { return chatColumn.classList.contains('collapsed'); }
+
+  function applyChatWidth() {
+    // Stacked (≤1100px) and collapsed layouts own their geometry — the
+    // width var is ignored there thanks to CSS !important overrides.
+    let saved = 380;
+    try { saved = parseInt(localStorage.getItem(CHAT_W_KEY)) || 380; } catch {}
+    const cap = Math.max(280, Math.min(760, Math.floor(window.innerWidth * 0.5)));
+    chatColumn.style.setProperty('--chat-w', Math.max(280, Math.min(saved, cap)) + 'px');
+  }
+  applyChatWidth();
+  window.addEventListener('resize', applyChatWidth);
+
+  if (chatResizeH) {
+    chatResizeH.addEventListener('mousedown', (e) => {
+      if (narrowLayout() || chatIsCollapsed()) return;
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = chatColumn.getBoundingClientRect().width;
+      chatResizeH.classList.add('active');
+      document.body.style.cursor = 'col-resize';
+
+      function onMove(e) {
+        const cap = Math.max(280, Math.min(760, Math.floor(window.innerWidth * 0.5)));
+        const w = Math.max(280, Math.min(cap, startW + (startX - e.clientX)));
+        chatColumn.style.setProperty('--chat-w', w + 'px');
+      }
+      function onUp() {
+        chatResizeH.classList.remove('active');
+        document.body.style.cursor = '';
+        try {
+          localStorage.setItem(CHAT_W_KEY, String(parseInt(chatColumn.getBoundingClientRect().width) || 380));
+        } catch {}
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+      }
+      window.addEventListener('mousemove', onMove);
+      window.addEventListener('mouseup', onUp);
+    });
+  }
+
+  if (chatCollapseB) {
+    // Restore persisted collapsed state
+    let collapsed = false;
+    try { collapsed = localStorage.getItem(CHAT_COLLAPSED_KEY) === '1'; } catch {}
+    chatColumn.classList.toggle('collapsed', collapsed);
+    if (collapsed) chatCollapseB.style.transform = 'rotate(180deg)';
+
+    chatCollapseB.addEventListener('click', () => {
+      const now = chatColumn.classList.toggle('collapsed');
+      try { localStorage.setItem(CHAT_COLLAPSED_KEY, now ? '1' : '0'); } catch {}
+      if (!now) applyChatWidth();
+      chatCollapseB.style.transform = now ? 'rotate(180deg)' : '';
+    });
+  }
 
   function buildChatRow(msg) {
     const row = document.createElement('div');
@@ -888,6 +1358,18 @@ function buildDashboardPage() {
     // Full rebuild — used when switching tabs
     renderedIds.clear();
     chatFeed.innerHTML = '';
+
+    if (chatFilter === 'modlog') {
+      if (!modLog.length) {
+        chatFeed.innerHTML = '<div class="chat-empty">No moderation actions yet</div>';
+        return;
+      }
+      // Newest first
+      const toShow = [...modLog].reverse();
+      for (const a of toShow) chatFeed.appendChild(buildModRow(a));
+      chatFeed.scrollTop = chatFeed.scrollHeight;
+      return;
+    }
 
     if (chatFilter === 'events') {
       if (!streamEvents.length) {
@@ -1091,6 +1573,15 @@ function buildDashboardPage() {
   document.getElementById('mod-ban').addEventListener('click',          () => sendModAction('ban', 0));
   modOverlay.addEventListener('click', (e) => { if (e.target === modOverlay) closeModModal(); });
 
+  // Escape closes the moderation modal. Command autocomplete keeps
+  // priority while it is open (its own keydown handler runs first and this
+  // guard avoids double-handling).
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (acVisible) return;
+    if (modOverlay.classList.contains('open')) closeModModal();
+  });
+
   // ── SSE ──────────────────────────────────────────────────────────────────
 
   const statusDot  = document.getElementById('status-dot');
@@ -1104,9 +1595,16 @@ function buildDashboardPage() {
   }
 
   let es;
+  let hadDisconnect = false;
   function connect() {
     es = new EventSource('/dashboard/sse');
-    es.onopen    = () => setOnline(true);
+    es.onopen = () => {
+      setOnline(true);
+      if (hadDisconnect) {
+        hadDisconnect = false;
+        toast('Reconnected — chat and widgets refreshed', 'ok');
+      }
+    };
     es.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
@@ -1119,20 +1617,40 @@ function buildDashboardPage() {
           pushChatMessages(msg.platform, [msg.entry]);
         } else if (msg.type === 'widget') {
           invoke(msg.id, msg.data);
-          // Chat overlay widgets are still bootstrapped from their full
-          // snapshot (see below, on connect/reload) but no longer drive the
-          // live per-message path — that's handled by 'chat-message' above.
           // Feed events tab from stream-events widget
           if (msg.id === 'stream-events' && msg.data && Array.isArray(msg.data.events)) {
             pushStreamEvents(msg.data.events);
           }
+          // Reconnect backfill: the server flushes the full chat-overlay-*
+          // widget snapshots to every (re)connecting SSE client. Feeding
+          // them through the chat pipeline recovers messages that arrived
+          // while the connection was down — previously they vanished until
+          // a full page reload, because the chat column only bootstrapped
+          // from the page-load initialData. pushChatMessages dedupes by
+          // id, so the initial bootstrap and this flush coexist safely.
+          if (CHAT_SECTION_IDS[msg.id] && msg.data && Array.isArray(msg.data.messages)) {
+            pushChatMessages(CHAT_SECTION_IDS[msg.id], msg.data.messages);
+          }
+          // Topbar live badge / game / title / uptime
+          if (msg.id === 'stream-stats') {
+            updateStreamStatus(msg.data);
+          }
         } else if (msg.type === 'log' && msg.entry) {
           addLogEntry(msg.entry);
+        } else if (msg.type === 'moderate') {
+          // Mod-action feedback: toast + Mod history tab.
+          pushModAction(msg);
+          const what = msg.action === 'ban'
+            ? 'banned'
+            : 'timed out ' + (msg.duration ? '(' + msg.duration + 's)' : '');
+          toast('🛡 ' + msg.username + ' ' + what + ' on ' + msg.platform,
+                msg.action === 'ban' ? 'warn' : 'ok');
         }
       } catch {}
     };
     es.onerror = () => {
       setOnline(false);
+      hadDisconnect = true;
       es.close();
       setTimeout(connect, 3000);
     };
@@ -1147,10 +1665,12 @@ function buildDashboardPage() {
   // Bootstrap stream events from initial data
   const initEvents = initialData['stream-events'];
   if (initEvents && Array.isArray(initEvents.events)) pushStreamEvents(initEvents.events);
+  // Bootstrap topbar live status from initial data
+  updateStreamStatus(initialData['stream-stats'] ?? null);
   // ── Minimize / restore widgets ───────────────────────────────────────────
 
   const minimizedSet = new Set(
-    JSON.parse(localStorage.getItem('dash-minimized') || '[]')
+    _pruneArray('dash-minimized', new Set(WIDGETS.map(w => w.id)))
   );
 
   function saveMinimized() {
@@ -1212,7 +1732,7 @@ function buildDashboardPage() {
         card.style.top  = savedPos.y + 'px';
       }
       delete removedCards[id];
-      expandCanvas();
+      if (layoutMode !== 'grid') expandCanvas();
     }
     updateWidgetsMenu();
   }

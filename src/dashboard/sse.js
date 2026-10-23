@@ -13,11 +13,11 @@
  * Payload types:
  *   { type: 'widget',   id, data }   — widget state update
  *   { type: 'log',      entry }      — log line (level, message, ts)
- *   { type: 'moderate', username, platform, action, duration } — mod event
+ *   { type: 'moderate', username, platform, action, duration, ts } — mod event
  *
- * Note: the 'moderate' SSE event is currently broadcast but ignored by the
- * browser-side handler. It's preserved here for backward compat — a future
- * dashboard revision could surface moderation events as a toast.
+ * Note: the 'moderate' SSE event is consumed by the dashboard client — it
+ * surfaces as a toast and an entry in the Mod history tab (see
+ * views/dashboard-page.js). The 'ts' field is the action timestamp.
  */
 
 const _clients = new Set();

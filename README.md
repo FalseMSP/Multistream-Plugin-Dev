@@ -18,6 +18,7 @@ Mirrors Twitch + YouTube Live chat to Discord with rich embeds, channel point re
 Current inbuilt plugins:
 - Minecraft Link -> hides a regex and moves it to #plugin-chat
 - GD Level Requests -> exactly what it sounds like
+- Stream Stats -> live Twitch viewcount widget (graph over time, freezes when the stream ends, CSV export); exposes the active game + viewer state to every plugin via `context.streamInfo`
 
 ---
 
