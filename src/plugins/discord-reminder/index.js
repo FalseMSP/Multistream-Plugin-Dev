@@ -16,7 +16,9 @@ const COMMON_MESSAGES = [
   `!help will tell you all available commands`,
   `these messages are pre-generated, i'm running out of things to say`,
   `Hey there! Do you want to know about Twitch Prime? Oh! You may be asking, "What's Twitch Prime?" Let me tell ya! When you connect your Amazon account to your Twitch account, you can get 1 free sub to ANY streamer on Twitch, every month! Yup, and along with that, get yourself some Twitch loot! With Twitch loot, you can go ahead and get yourself some exclusive Twitch gear and your favorite games! So go ahead! Grab your Amazon account, grab a family or friend's Amazon Prime account, and link it to your Twitch account TODAY!`
-  `If you find these messages helpful/annoying let me know! https://forms.gle/4FLx9uW6nEzy8pWq9`,
+  `does anyone actually read these?`,
+  `fun fact: redlife doens't actually see these in his dashboard`,
+  `im not sentient trust guys`
 ];
 
 // Messages exclusive to YouTube (doesn't make sense to plug Twitch on Twitch)
