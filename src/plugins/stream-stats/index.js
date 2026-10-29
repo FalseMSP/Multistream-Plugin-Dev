@@ -51,9 +51,20 @@ dashboard.registerWidget('stream-stats', {
 
   // NOTE: this function is serialised via .toString() and eval'd in the
   // browser — it must be fully self-contained (no outer-scope references).
+  //
+  // Render-contract history: WIDGET_AUTHORING.md documents the 4th argument
+  // as { card, badge }, and the overlay mosaic has always passed both — but
+  // the dashboard's invoke() used to pass { badge } only, so touching
+  // card.* crashed the render with a TypeError and left the widget body
+  // blank. The dashboard now passes { card, badge } too; we STILL resolve
+  // the card defensively (host-provided, else el.closest('.widget-card'))
+  // and guard every use — the card state is cosmetic, never worth crashing
+  // the whole widget over.
   render: (function render(data, el, esc, { card, badge }) {
+    var cardEl = card || (typeof el.closest === 'function' ? el.closest('.widget-card') : null);
+
     if (!data || !data.session) {
-      card.dataset.state = 'idle';
+      if (cardEl) cardEl.dataset.state = 'idle';
       badge.textContent = '';
       el.innerHTML = data && data.unavailable
         ? '<p style="color:var(--muted);font-size:12px;font-family:var(--mono)">stream-info module not available — update index.js init context</p>'
@@ -66,7 +77,7 @@ dashboard.registerWidget('stream-stats', {
     var samples = S.samples || [];
     var games   = S.games || [];
 
-    card.dataset.state = live ? 'live' : 'frozen';
+    if (cardEl) cardEl.dataset.state = live ? 'live' : 'frozen';
     badge.textContent  = live ? (S.viewers + ' watching') : 'frozen';
 
     function fmtNum(n) { return Number(n == null ? 0 : n).toLocaleString('en-US'); }

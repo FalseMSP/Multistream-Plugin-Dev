@@ -706,6 +706,7 @@ function buildDashboardPage() {
   const gridInner = document.getElementById('widget-grid');
   const bodies = {};
   const badges = {};
+  const cards  = {};   // outer .widget-card elements — handed to render fns
 
   if (WIDGETS.length > 0) gridInner.innerHTML = '';
 
@@ -725,6 +726,7 @@ function buildDashboardPage() {
       '<div class="widget-body" id="wbody-' + w.id + '"></div>' +
       '<div class="widget-resize-handle" data-widget-resize="' + w.id + '"></div>';
     gridInner.appendChild(card);
+    cards[w.id]  = card;
     bodies[w.id] = card.querySelector('.widget-body');
     badges[w.id] = card.querySelector('.widget-badge');
   }
@@ -965,7 +967,15 @@ function buildDashboardPage() {
   function invoke(id, data) {
     if (!renderers[id] || !bodies[id]) return;
     try {
-      renderers[id](data, bodies[id], esc, { badge: badges[id] });
+      // { card, badge } — the render contract WIDGET_AUTHORING.md documents
+      // (and the overlay mosaic has always honored). card is the outer
+      // .widget-card — use card.dataset.state for visual modes; badge is the
+      // header pill. The dashboard used to pass only { badge }, which made
+      // any render fn that touched card.* throw a TypeError that this
+      // try/catch swallowed — the widget body then stayed permanently blank
+      // (that's exactly how the "Live Viewers" widget went dark). Renderers
+      // that destructure only { badge } simply ignore the extra card key.
+      renderers[id](data, bodies[id], esc, { card: cards[id], badge: badges[id] });
     } catch (e) { console.error('[dashboard] render error in', id, e); }
   }
 
