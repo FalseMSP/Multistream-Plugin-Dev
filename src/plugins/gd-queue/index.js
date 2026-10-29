@@ -22,6 +22,16 @@
  *   /queue remove <user> — remove a specific user's entry
  *   /queue toggle  — enable or disable the queue plugin
  *
+ * Twitch extension (src/plugins/twitch-ext — the generic EBS host):
+ *   This plugin REGISTERS a panel feed at load time, exactly like it
+ *   registers its overlay sections and dashboard widgets:
+ *     twitchExt.registerFeed({ id:'gd-queue', games, snapshot, actions })
+ *   • snapshot() serves the trimmed queue to /ext/state + PubSub panels
+ *   • the 'level-submit' action lands viewer submissions in this same
+ *     queue as !q (identity comes from the signed viewer JWT)
+ *   • _pushNowPlaying() calls twitchExt.publish('gd-queue') on changes
+ *     (rate-limited by the host; no-ops while the feed is inactive)
+ *
  * Dashboard widgets:
  *   gd-queue          — shows the queue list (the next level is highlighted)
  *   gd-level-preview  — fetches & displays metadata for the next level in
@@ -60,6 +70,10 @@ const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('disc
 const log = require('../../logger');
 const { registerSection, updateSection, addRoute, buildStandaloneSectionPage } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
+// Twitch extension host (EBS) — generic infrastructure (JWT auth, PubSub,
+// category gating). THIS plugin registers a feed into it; the host has no
+// knowledge of gd-queue, so the require direction is one-way and clean.
+const twitchExt = require('../twitch-ext');
 
 const OVERLAY_HTML = path.resolve(__dirname, 'overlay.html');
 
@@ -300,6 +314,15 @@ let _npFetchSeq = 0;      // bumps on every pop — stale name fetches are disca
 
 function _pushNowPlaying() {
   updateSection('gd-now-playing', { nowPlaying: _nowPlaying });
+  // Twitch extension panels — the host re-reads our registered feed's
+  // snapshot and publishes it (its own 1 msg/s PubSub rate limit applies,
+  // and it no-ops while the feed's category gate is closed — panels then
+  // show "No active Extension").
+  try {
+    twitchExt.publish('gd-queue');
+  } catch (err) {
+    log.error('[gd-queue] twitch-ext publish failed:', err.message);
+  }
 }
 
 function _setNowPlaying(entry) {
@@ -924,6 +947,138 @@ function _next(played = true) {
   return entry;
 }
 
+/**
+ * Entry point for the Twitch extension backend (src/plugins/twitch-ext).
+ * Applies the same validation and one-entry-per-user semantics as the !q
+ * chat command, but synchronously and returning a structured result for
+ * the panel's POST /ext/submit response instead of a chat reply.
+ *
+ * @param {{ username: string, platform?: string, levelId: string, notes?: string|null }} params
+ * @returns {{ ok: boolean, error?: string, replaced?: boolean, position?: number, queueLength?: number }}
+ */
+function submitLevel({ username, platform, levelId, notes }) {
+  if (!_enabled) return { ok: false, error: 'The level queue is currently closed.' };
+  if (typeof username !== 'string' || !username.trim()) return { ok: false, error: 'Missing username.' };
+  if (typeof levelId !== 'string' || !levelId.trim())   return { ok: false, error: 'Missing level ID.' };
+
+  const cleanName = username.trim().slice(0, 24);
+  const cleanId   = levelId.trim().slice(0, 16);
+  const cleanNotes = (typeof notes === 'string' && notes.trim()) ? notes.trim().slice(0, 80) : null;
+  const replaced  = _add(cleanName, platform || 'twitch', cleanId, cleanNotes);
+  _notify(); // dashboard + overlay + Twitch extension panels
+  const position = _findByUser(cleanName) + 1;
+  log.info(`[gd-queue] Extension submit: ${cleanName} → ${cleanId} (position #${position})`);
+  return { ok: true, replaced, position, queueLength: _queue.length };
+}
+
+// ── Twitch extension feed registration ──────────────────────────────────────
+//
+// Everything below is what the extension panels see, expressed through the
+// generic host's registerFeed() API — the same pattern as registerSection()
+// and dashboard.registerWidget() above. The host (src/plugins/twitch-ext)
+// handles JWT auth, PubSub delivery, rate limits and cooldowns; we only own
+// the data shape and the submit semantics.
+
+/** Items included in a panel snapshot (the host counts the rest). */
+const EXT_MAX_QUEUE_ITEMS = 30;
+
+/** Categories that light the panel up (case-insensitive). */
+const EXT_ACTIVE_GAMES = (process.env.GD_QUEUE_ACTIVE_GAMES || process.env.TWITCH_EXT_ACTIVE_GAMES || 'Geometry Dash')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+/** Strip control characters, trim, cap length (mirrors the host's rules). */
+function _extSanitize(value, maxLen) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, maxLen);
+}
+
+/**
+ * Feed snapshot for the panels — a trimmed, sanitized view of the queue.
+ * Called lazily by the host on every broadcast and /ext/state request.
+ *
+ * @param {{ byteBudget: number|null }} ctx — the host asks us to stay within
+ *   byteBudget JSON bytes when given (Twitch caps PubSub messages at 5 KB);
+ *   tail items are dropped until we fit, while queueLength keeps the TRUE
+ *   total so the panel can show "+N more in queue".
+ */
+function _extSnapshot({ byteBudget } = {}) {
+  const data = {
+    enabled: _enabled !== false,
+    queueLength: _queue.length,
+    queue: _queue.slice(0, EXT_MAX_QUEUE_ITEMS).map((e) => ({
+      levelId:  _extSanitize(e && e.levelId, 16),
+      username: _extSanitize(e && e.username, 24),
+      platform: (e && e.platform) === 'youtube' ? 'youtube' : 'twitch',
+      notes:    (e && typeof e.notes === 'string' && e.notes.trim())
+                  ? _extSanitize(e.notes, 80)
+                  : null,
+    })),
+    nowPlaying: null,
+  };
+
+  const np = _nowPlaying;
+  if (np && np.levelId) {
+    data.nowPlaying = {
+      levelId:  _extSanitize(np.levelId, 16),
+      username: _extSanitize(np.username, 24),
+      name:     (np.info && np.info.name) ? _extSanitize(np.info.name, 48) : null,
+    };
+  }
+
+  if (typeof byteBudget === 'number' && byteBudget > 0) {
+    let json = JSON.stringify(data);
+    while (Buffer.byteLength(json, 'utf8') > byteBudget && data.queue.length > 0) {
+      data.queue.pop(); // queueLength keeps the TRUE total
+      json = JSON.stringify(data);
+    }
+  }
+
+  return data;
+}
+
+/**
+ * 'level-submit' viewer action — the panel form's POST /ext/submit.
+ *
+ * The host has already verified the viewer JWT, matched the channel,
+ * enforced the per-viewer cooldown and checked our category gate. What is
+ * left for us: validate the payload, decide the submitter's name and run
+ * the same submitLevel() the !q chat command uses.
+ *
+ * IDENTITY: `viewer.login` comes from the SIGNED token — anything the
+ * client put in the body (like a `name` field) is ignored. Anonymous
+ * viewers (login '') get a stable "Viewer-XXXX" handle derived from their
+ * opaque id, so they still occupy exactly one slot in the queue.
+ *
+ * Returns { ok, error?, status? } — `status: 4xx` maps to an HTTP error.
+ */
+function _extHandleLevelSubmit(viewer, payload) {
+  const levelId = _extSanitize(payload && payload.levelId, 16);
+  if (!levelId) return { ok: false, error: 'Enter a level ID', status: 400 };
+  if (!/^[0-9a-zA-Z_-]{1,16}$/.test(levelId)) {
+    return { ok: false, error: 'Level ID can only use letters, numbers, - and _', status: 400 };
+  }
+
+  // Optional notes — same slot as "!q <levelId> [notes]" in chat.
+  const notes = _extSanitize(payload && payload.notes, 80) || null;
+
+  const name = viewer.login || ('Viewer-' + viewer.opaqueId.slice(-4).toUpperCase());
+  return submitLevel({ username: name, platform: 'twitch', levelId, notes });
+}
+
+// The registration itself — one call, at module load, right between the
+// dashboard widget registrations above and the command handlers below.
+twitchExt.registerFeed({
+  id:      'gd-queue',
+  title:   'GD Level Queue',
+  games:   EXT_ACTIVE_GAMES,
+  snapshot: _extSnapshot,
+  actions: {
+    'level-submit': _extHandleLevelSubmit,
+  },
+});
+
 // ── processMessage ────────────────────────────────────────────────────────
 
 async function processMessage(msg) {
@@ -1155,4 +1310,7 @@ module.exports = {
   handleInteraction,
   processMessage,
   onChatReady,
+  // Programmatic entry point for the Twitch extension feed registered
+  // above (kept for tests / dashboard integrations)
+  submitLevel,
 };

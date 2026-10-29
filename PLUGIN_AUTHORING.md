@@ -299,6 +299,110 @@ full working example of everything above — see
 
 ---
 
+## Twitch extension feeds (panel + mobile views)
+
+The `twitch-ext` plugin is a **generic Twitch Extension backend (EBS)**: it owns
+everything Twitch-specific — viewer JWT verification, the broadcaster id,
+Extension PubSub delivery, per-viewer cooldowns, the 5 KB / 1 msg-s PubSub caps —
+and knows nothing about any feature. Your plugin registers a **feed** to get its
+state onto extension panels and to receive actions from viewers.
+
+> Requires `TWITCH_EXT_CLIENT_ID` + `TWITCH_EXT_SECRET` in `.env` (see
+> `env-additions.txt` in the twitch-extension deliverable). Without them the
+> host stays dormant and `registerFeed` is a harmless no-op caller.
+
+```js
+const twitchExt = require('../twitch-ext');
+
+const unregister = twitchExt.registerFeed({
+  // Required — unique, [a-zA-Z0-9_-]{1,32}. The wire key the front-end reads.
+  id: 'my-feature',
+
+  // Optional — shown in logs and /ext/health.
+  title: 'My Feature',
+
+  // Optional category gate (case-insensitive Twitch category names).
+  //   ['Geometry Dash']  → feed only active while streaming one of these
+  //   null / [] / omitted → active whenever the channel is live, any game
+  games: ['Geometry Dash'],
+
+  // Required — the panel state. Called lazily on every /ext/state request
+  // and PubSub broadcast, so it always serves fresh data. Keep it cheap and
+  // JSON-safe, and sanitize anything user-generated.
+  //
+  // `byteBudget` (JSON bytes) is set on the PubSub path: trim yourself to
+  // fit (e.g. drop tail list items while keeping the true total count) —
+  // the whole broadcast envelope must stay under Twitch's 5 KB cap.
+  snapshot({ byteBudget }) {
+    return { items: _items.slice(0, 30), total: _items.length };
+  },
+
+  // Optional — viewer actions. Each key is the `type` field of a
+  // POST /ext/submit body; action types must be unique across feeds.
+  actions: {
+    'do-thing': (viewer, payload) => {
+      // viewer = { login, opaqueId, channelId } — TRUSTED identity, decoded
+      //          from the SIGNED viewer JWT by the host. `login` is '' for
+      //          anonymous viewers. NEVER trust payload for who is calling.
+      // payload = the parsed JSON body (also carries .type).
+      //
+      // Return { ok: true, ...extras } → sent to the panel as-is (HTTP 200),
+      // or      { ok: false, error, status?: 4xx } → shown as the error text.
+      return _doThing(viewer.login, payload.thingId);
+    },
+  },
+});
+
+// Whenever your state changes, tell the host — it broadcasts to every open
+// panel (merged + spaced to Twitch's 1 msg/s cap; no-op while inactive).
+function _notify() {
+  twitchExt.publish('my-feature');
+}
+```
+
+`registerFeed()` returns an `unregister()` function (mostly useful in tests).
+Register at module load, exactly where you `registerSection()` /
+`dashboard.registerWidget()` — that's what `gd-queue` does for its level queue.
+
+### What the panels receive
+
+`GET /ext/state` (viewer JWT) and every PubSub broadcast carry the same
+envelope — one entry per registered feed:
+
+```json
+{
+  "active": true,
+  "category": "Geometry Dash",
+  "updatedAt": 1761170000000,
+  "feeds": {
+    "my-feature": { "active": true, "data": { "…whatever snapshot() returned" } }
+  }
+}
+```
+
+A front-end for one specific Twitch extension picks its feed id and renders
+`state.feeds['my-feature'].data`. Each Twitch extension has its own client id
+and front-end (e.g. the GD Level Queue panel in the twitch-extension
+deliverable) — several feeds can share this one EBS host.
+
+### Host-owned guarantees (you don't have to implement these)
+
+| Concern | What the host does |
+|---|---|
+| Identity | Verifies the viewer JWT (HS256, hand-rolled — no new deps), requires the panel's `channel_id` to match the bot's channel, and hands your action a trusted `{ login, opaqueId, channelId }` |
+| Broadcaster id | Resolved dynamically from `context.twitch.getBroadcasterId()`; `.env` pin only as a fallback |
+| Rate limits | PubSub sends merged + spaced ≥ 1.1 s; per-viewer per-action 10 s cooldown; 4 KB body cap |
+| Delivery | Full snapshots (not deltas) — panels self-heal via their periodic `/ext/state` poll |
+| Category gating | Your feed's `games` list decides when panels are "live"; actions are hard-rejected (409) while the gate is closed |
+
+`gd-queue` (`src/plugins/gd-queue/index.js`, "Twitch extension feed
+registration") is the reference implementation: a trimmed, sanitized queue
+snapshot + a `level-submit` action that lands viewer requests in the same
+queue as the `!q` chat command, with anonymous viewers getting a stable
+`Viewer-XXXX` handle.
+
+---
+
 ## Overlay integration
 
 Plugins can push data to the stream overlay via `registerSection` and `updateSection` from `../../overlay-server`.
