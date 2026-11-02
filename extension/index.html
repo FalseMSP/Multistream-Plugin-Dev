@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>GD Level Queue</title>
+<link rel="stylesheet" href="viewer.css">
+<!-- Twitch Extension helper — must load before viewer.js runs -->
+<script src="https://extension-files.twitch.tv/ext/v1/twitch-ext.min.js"></script>
+</head>
+<body>
+<main id="app">
+
+  <!-- ── Active view: level queue (only when the channel streams Geometry Dash) ── -->
+  <section id="view-active" hidden aria-label="Level queue">
+
+    <section class="card now-card" id="now-card" hidden aria-label="Now playing">
+      <div class="card-label">Now Playing</div>
+      <div class="now-name" id="now-name">&mdash;</div>
+      <div class="now-meta">
+        <span class="now-id" id="now-id"></span>
+        <span class="now-by" id="now-by"></span>
+      </div>
+    </section>
+
+    <section class="card queue-card" aria-label="Up next">
+      <div class="queue-head">
+        <div class="card-label">Up Next</div>
+        <span class="queue-count" id="queue-count">0</span>
+      </div>
+      <ol class="queue-strip" id="queue-strip"></ol>
+      <p class="queue-empty" id="queue-empty" hidden>Queue is empty &mdash; be the first to add a level!</p>
+      <p class="queue-more" id="queue-more" hidden></p>
+      <p class="queue-closed" id="queue-closed" hidden>The queue is closed right now.</p>
+    </section>
+
+    <form class="card submit-card" id="submit-form" autocomplete="off">
+      <div class="submit-title">
+        <label class="card-label" for="input-level">Request a level</label>
+        <span class="submit-as" id="submit-as" hidden></span>
+      </div>
+      <div class="submit-row">
+        <input id="input-level" type="text" inputmode="numeric" maxlength="16"
+               placeholder="Level ID" aria-label="Level ID"
+               autocomplete="off" spellcheck="false">
+        <button id="submit-btn" type="submit">Join Queue</button>
+      </div>
+      <div class="submit-row">
+        <input id="input-notes" type="text" maxlength="80"
+               placeholder="Notes (optional) &mdash; shown with your request"
+               aria-label="Notes for your request, optional"
+               autocomplete="off" spellcheck="false">
+      </div>
+      <p class="submit-hint" id="submit-hint">One level at a time &mdash; submitting again replaces yours.</p>
+    </form>
+
+  </section>
+
+  <!-- ── Inactive view: static page (any other category / offline / EBS down) ── -->
+  <section id="view-inactive" aria-label="No active extension">
+    <div class="inactive-box">
+      <svg viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+        <polygon points="11,2 13.5,8.5 20.5,8.5 14.9,12.7 17,19.5 11,15.3 5,19.5 7.1,12.7 1.5,8.5 8.5,8.5"
+                 fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+      <h1>No active Extension</h1>
+      <p id="inactive-detail">This panel comes alive during Geometry Dash streams.</p>
+    </div>
+  </section>
+
+</main>
+<script src="viewer.js"></script>
+</body>
+</html>

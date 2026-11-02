@@ -1,10 +1,10 @@
 /* ───────────────────────────────────────────────────────────────────────────
- * Multirror — GD Level Queue · Twitch Extension front-end (Panel + Mobile)
+ * RedStreamIntegration — Twitch Extension front-end (Panel + Mobile)
  *
  * Color theme mirrored from the Multirror dashboard
  * (src/dashboard/views/dashboard-page.js → :root):
  *   bg #0d0d0f · surfaces #16171a / #1c1d21 · border #2a2b30
- *   accent #e53935 (GD red) · text #e8e8ec · muted #5a5a6a
+ *   accent #e53935 (project red) · text #e8e8ec · muted #5a5a6a
  *   Inter + JetBrains Mono (system fallbacks — no external font loads,
  *   keeping the file Twitch-CSP-clean and GitHub-Pages-friendly).
  * ─────────────────────────────────────────────────────────────────────────── */

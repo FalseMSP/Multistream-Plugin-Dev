@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>GD Level Queue</title>
+<title>RedStreamIntegration</title>
 <link rel="stylesheet" href="viewer.css">
 <!-- Twitch Extension helper — must load before viewer.js runs -->
 <script src="https://extension-files.twitch.tv/ext/v1/twitch-ext.min.js"></script>
@@ -11,7 +11,7 @@
 <body>
 <main id="app">
 
-  <!-- ── Active view: level queue (only when the channel streams Geometry Dash) ── -->
+  <!-- ── Active view: request queue (only when the channel streams a supported game) ── -->
   <section id="view-active" hidden aria-label="Level queue">
 
     <section class="card now-card" id="now-card" hidden aria-label="Now playing">
@@ -64,7 +64,7 @@
                  fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
       </svg>
       <h1>No active Extension</h1>
-      <p id="inactive-detail">This panel comes alive during Geometry Dash streams.</p>
+      <p id="inactive-detail">This panel comes alive during streams.</p>
     </div>
   </section>
 

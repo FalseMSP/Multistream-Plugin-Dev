@@ -382,7 +382,7 @@ envelope — one entry per registered feed:
 
 A front-end for one specific Twitch extension picks its feed id and renders
 `state.feeds['my-feature'].data`. Each Twitch extension has its own client id
-and front-end (e.g. the GD Level Queue panel in the twitch-extension
+and front-end (e.g. the RedStreamIntegration panel in the twitch-extension
 deliverable) — several feeds can share this one EBS host.
 
 ### Host-owned guarantees (you don't have to implement these)

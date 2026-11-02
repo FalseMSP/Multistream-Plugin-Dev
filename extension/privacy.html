@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RedStreamIntegration — Privacy Notice</title>
+<style>
+  /* Palette mirrored from the RedStreamIntegration panel / Multirror dashboard */
+  :root {
+    --bg: #0d0d0f;
+    --surface: #16171a;
+    --surface2: #1c1d21;
+    --border: #2a2b30;
+    --accent: #e53935;
+    --accent-lo: rgba(229, 57, 53, 0.12);
+    --text: #e8e8ec;
+    --muted: #5a5a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 40px 20px 64px;
+  }
+  h1 {
+    font-size: 26px;
+    margin: 0 0 4px;
+  }
+  .sub {
+    color: var(--muted);
+    margin: 0 0 28px;
+    font-size: 14px;
+  }
+  h2 {
+    font-size: 15px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 32px 0 10px;
+  }
+  p { margin: 0 0 12px; }
+  ul { margin: 0 0 12px; padding-left: 22px; }
+  li { margin-bottom: 6px; }
+  .item {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin: 0 0 10px;
+  }
+  .item h3 {
+    margin: 0 0 4px;
+    font-size: 15px;
+    color: var(--text);
+  }
+  .item p { margin: 0; }
+  code {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 14px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 18px 20px;
+    margin: 0 0 14px;
+  }
+  .accent { color: var(--accent); font-weight: 600; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>RedStreamIntegration — Privacy Notice</h1>
+  <p class="sub">Privacy notice for the RedStreamIntegration Twitch Extension on
+    <strong>YOUR-CHANNEL-NAME</strong>'s channel.</p>
+
+  <h2>What this extension is</h2>
+  <div class="card">
+    <p>RedStreamIntegration is a viewer panel that lets viewers submit requests
+    to the streamer's queue — for example a game level to play, with an
+    optional note. Requests submitted through the panel join the same queue as
+    the streamer's chat commands, and the queue (including who submitted each
+    request) is displayed on the channel page while it is active.</p>
+  </div>
+
+  <h2>Data the extension collects</h2>
+
+  <div class="item">
+    <h3>Username</h3>
+    <p>Read automatically from your signed-in Twitch session so your request
+    can be credited to you. You never type it, and it cannot be faked by
+    someone else. It is shown next to your request in the public queue.</p>
+  </div>
+
+  <div class="item">
+    <h3>Viewer ID</h3>
+    <p>An identifier Twitch assigns to you as a viewer of the panel. If you
+    are logged out of Twitch, it is used instead of a username and appears as
+    a stable &ldquo;Viewer-XXXX&rdquo; handle.</p>
+  </div>
+
+  <div class="item">
+    <h3>Any other details submitted through the extension</h3>
+    <p>Whatever you choose to submit with a request — for example a level ID,
+    or an optional note of up to 80 characters. These details are shown with
+    your request in the queue. Submitting them is entirely up to you.</p>
+  </div>
+
+  <h2>What the extension does NOT collect</h2>
+  <ul>
+    <li>No email address, payment info, or account details</li>
+    <li>No advertising or tracking of any kind</li>
+    <li>No analytics or third-party scripts</li>
+    <li>No cookies — nothing is stored in your browser</li>
+    <li>No data about your activity anywhere outside this panel</li>
+  </ul>
+
+  <h2>Where data lives and who can see it</h2>
+  <div class="card">
+    <p>Submitted requests are stored only on the server the streamer runs to
+    operate the queue (their own bot). The queue — your username and the
+    details you submitted — is <span class="accent">visible by design</span>
+    to anyone viewing the channel page while the queue is active, and to the
+    streamer. Your username is also processed by Twitch itself when it signs
+    you in; that part is governed by
+    <a href="https://www.twitch.tv/p/en-us/legal/privacy-policy/">Twitch's own privacy policy</a>.</p>
+  </div>
+
+  <h2>How long data is kept</h2>
+  <div class="card">
+    <p>Data submitted through the extension is embedded in video files, as
+    VODs will last on YouTube and Twitch &mdash; refer to
+    <a href="https://www.twitch.tv/p/en-us/legal/privacy-policy/">Twitch's</a>
+    and <a href="https://policies.google.com/privacy">YouTube's</a> policies
+    for further information.</p>
+  </div>
+
+</main>
+</body>
+</html>

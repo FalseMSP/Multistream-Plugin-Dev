@@ -1,5 +1,5 @@
 /* ───────────────────────────────────────────────────────────────────────────
- * Multirror — GD Level Queue · Twitch Extension front-end (Panel + Mobile)
+ * RedStreamIntegration — Twitch Extension front-end (Panel + Mobile)
  * ───────────────────────────────────────────────────────────────────────────
  *
  * ONE SETTING TO CHANGE:
@@ -9,7 +9,7 @@
  *
  * The EBS is a generic host: /ext/state and every PubSub broadcast carry a
  * FEEDS ENVELOPE — one entry per plugin that registered a panel feed. This
- * front-end is the "GD Level Queue" extension, so it reads its own slice:
+ * front-end is the RedStreamIntegration panel, so it reads its own slice:
  *   state.feeds['gd-queue'].data → { enabled, queueLength, queue, nowPlaying }
  *
  * How it behaves:
@@ -218,7 +218,7 @@ var FEED_ID = 'gd-queue';
       if (inactiveDetail) {
         inactiveDetail.textContent = (snap && snap.category)
           ? 'Now streaming: ' + snap.category + '.'
-          : 'This panel comes alive during Geometry Dash streams.';
+          : 'This panel comes alive during streams.';
       }
       return;
     }
