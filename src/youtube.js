@@ -29,6 +29,8 @@
  */
 
 const log = require('./logger');
+const https = require('https');
+const zlib  = require('zlib');
 
 const YT_API_KEY    = process.env.YT_API_KEY       ?? '';
 const YT_VIDEO_ID   = process.env.YT_VIDEO_ID      ?? '';
@@ -453,7 +455,7 @@ async function _startSession(videoId, queue, retryDelay = 5_000) {
   await _startMasterchatSession(videoId, queue, retryDelay);
 }
 
-// ── Live video detection ──────────────────────────────────────────────────
+// ── Live video detection ────────────────────────────────────────────────
 
 const SCRAPE_UA_POOL = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -463,39 +465,195 @@ const SCRAPE_UA_POOL = [
 let _uaIndex = 0;
 function _nextUA() { return SCRAPE_UA_POOL[(_uaIndex++) % SCRAPE_UA_POOL.length]; }
 
+/**
+ * Budget for response headers, timeout, redirect hops and body size of the
+ * /channel/<id>/live scrape (see _scrapeGetText for why these exist).
+ */
+const SCRAPE_MAX_HEADER_BYTES = 256 * 1024;   // 256 KiB — YouTube's cookie storms
+const SCRAPE_TIMEOUT_MS       = 10_000;
+const SCRAPE_MAX_REDIRECTS    = 3;
+const SCRAPE_MAX_BODY_BYTES   = 3 * 1024 * 1024;
+
+/**
+ * GET one page as text, with a raised header-size budget.
+ *
+ * Why not node-fetch: youtube.com answers unauthenticated scrapes with a
+ * giant pile of Set-Cookie headers (consent + __Secure-* session cookies).
+ * Node's HTTP parser caps the whole response-header block at 16 KiB by
+ * default, so on Node 18–22 node-fetch dies with
+ * "Parse Error: Header overflow" on every single poll — the exact watchdog
+ * spam this helper eliminates. http.request() accepts a per-request
+ * maxHeaderSize override (supported since Node 13.3), which node-fetch does
+ * not expose, so we talk to https.request directly.
+ *
+ * Also adds what node-fetch gave us for free: manual redirect following,
+ * gzip/deflate/brotli decoding, a hard socket timeout, and a body cap so a
+ * runaway response can never pin the watchdog loop or the memory.
+ *
+ * @param {string} urlStr absolute URL to fetch
+ * @param {number} [redirectsLeft] internal — remaining redirect hops
+ * @returns {Promise<string>} decoded body text
+ */
+function _scrapeGetText(urlStr, redirectsLeft = SCRAPE_MAX_REDIRECTS) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let ok    = (value) => { if (!settled) { settled = true; resolve(value); } };
+    let fail  = (err)   => { if (!settled) { settled = true; reject(err);   } };
+
+    let url;
+    try {
+      url = new URL(urlStr);
+    } catch (err) {
+      return fail(new Error(`invalid scrape URL: ${urlStr}`));
+    }
+
+    let req;
+    try {
+      req = https.request(url.toString(), {
+        method:       'GET',
+        maxHeaderSize: SCRAPE_MAX_HEADER_BYTES,
+        headers: {
+          'Accept-Language': 'en-US,en;q=0.5',
+          'User-Agent':     _nextUA(),
+        },
+      });
+    } catch (err) {
+      return fail(err);
+    }
+
+    req.setTimeout(SCRAPE_TIMEOUT_MS, () => {
+      req.destroy(new Error(`scrape timed out after ${SCRAPE_TIMEOUT_MS / 1000}s`));
+    });
+    req.on('error', fail);
+
+    req.on('response', (res) => {
+      // Manual redirect following (node-fetch used to do this for us).
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        let next;
+        try {
+          next = new URL(res.headers.location, url).toString();
+        } catch {
+          return fail(new Error(`scrape got redirect with invalid Location: ${res.headers.location}`));
+        }
+        req.destroy();
+        if (redirectsLeft <= 0) return fail(new Error(`too many redirects (last hop: ${next})`));
+        return ok(_scrapeGetText(next, redirectsLeft - 1));
+      }
+
+      if (res.statusCode !== 200) {
+        req.destroy();
+        return fail(new Error(`scrape got HTTP ${res.statusCode} from ${url.host}`));
+      }
+
+      // Decode the body. We never ask for compression, but honour it if the
+      // server insists anyway.
+      const enc = String(res.headers['content-encoding'] ?? '').toLowerCase();
+      let bodyStream = res;
+      try {
+        if (enc === 'gzip')          bodyStream = res.pipe(zlib.createGunzip());
+        else if (enc === 'deflate') bodyStream = res.pipe(zlib.createInflate());
+        else if (enc === 'br')       bodyStream = res.pipe(zlib.createBrotliDecompress());
+      } catch (err) {
+        req.destroy();
+        return fail(err);
+      }
+
+      const chunks = [];
+      let received = 0;
+      const finish = () => ok(Buffer.concat(chunks).toString('utf8'));
+
+      // Hard deadline on the whole body — a truncated compressed stream can
+      // stall a piped decompressor forever, and a destroyed socket never
+      // re-fires the idle timeout. Whatever happens, we settle.
+      const deadline = setTimeout(
+        () => req.destroy(new Error('scrape body deadline exceeded')),
+        SCRAPE_TIMEOUT_MS + 5_000
+      );
+      ok  = (value) => { clearTimeout(deadline); if (!settled) { settled = true; resolve(value); } };
+      fail = (err)   => { clearTimeout(deadline); if (!settled) { settled = true; reject(err);   } };
+
+      bodyStream.on('data', (chunk) => {
+        received += chunk.length;
+        if (received <= SCRAPE_MAX_BODY_BYTES) chunks.push(chunk);
+        if (received >= SCRAPE_MAX_BODY_BYTES) {
+          // Cap reached — keep what we have, resolve NOW and stop reading.
+          // (Resolving on the stream's own 'close' would race the gzip
+          // flush; doing it here is deterministic.)
+          finish();
+          req.destroy();
+        }
+      });
+      bodyStream.on('end', finish);
+      bodyStream.on('error', fail);
+      if (bodyStream === res) {
+        // Identity encoding: if the server hangs up mid-body we still resolve
+        // with the bytes received so far — the live markers sit early in the
+        // page, so partial data often still detects the stream.
+        res.on('aborted', finish);
+      }
+    });
+
+    req.end();
+  });
+}
+
+/**
+ * Resolve the channel's currently-live video ID by scraping the /live tab.
+ * Throws on scrape failure (so the watchdog can back off and count errors);
+ * returns null when the page loaded fine but the channel simply isn't live.
+ */
 async function _findLiveVideoId() {
   if (YT_VIDEO_ID) return YT_VIDEO_ID;
   if (!YT_CHANNEL_ID) return null;
 
-  try {
-    const fetch = await _getFetch();
-    const res   = await fetch(`https://www.youtube.com/channel/${YT_CHANNEL_ID}/live`, {
-      headers: { 'Accept-Language': 'en-US,en;q=0.5', 'User-Agent': _nextUA() },
-    });
-    const text = await res.text();
-    const m    = text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})"/);
-    if (m && (text.includes('isLiveBroadcast') || text.includes('"style":"LIVE"'))) return m[1];
-  } catch (err) {
-    log.warn('[YouTube] Watchdog scrape failed:', err.message);
-  }
+  const text = await _scrapeGetText(`https://www.youtube.com/channel/${YT_CHANNEL_ID}/live`);
+  const m    = text.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/watch\?v=([a-zA-Z0-9_-]{11})"/);
+  if (m && (text.includes('isLiveBroadcast') || text.includes('"style":"LIVE"'))) return m[1];
   return null;
 }
 
 // ── Polling watchdog ──────────────────────────────────────────────────────
 
+/** Watchdog scrape failure backoff: 2× on the 1st failure, 4× from the 2nd on. */
+function _watchdogBackoffMultiplier(consecutiveFailures) {
+  if (consecutiveFailures <= 0) return 1;
+  return Math.min(4, 2 ** Math.min(2, consecutiveFailures));
+}
+
 async function _watchdog(queue) {
   log.info('[YouTube] Watchdog polling every', POLL_INTERVAL / 1000, 's');
+
+  let consecutiveFailures = 0;
+  let lastWarnAt          = 0;
+  const WARN_THROTTLE_MS  = 10 * 60 * 1000;  // at most one WARN line per 10 min
+
   while (true) {
+    let delay = POLL_INTERVAL;
     try {
       const videoId = await _findLiveVideoId();
+      if (consecutiveFailures > 0) {
+        log.info(`[YouTube] Watchdog scrape recovered after ${consecutiveFailures} failure(s).`);
+        consecutiveFailures = 0;
+      }
       if (videoId && !_activeSessions.has(videoId)) {
         log.info('[YouTube] Live video detected:', videoId);
         _startSession(videoId, queue);
       }
     } catch (err) {
-      log.error('[YouTube] Watchdog error:', err.message);
+      consecutiveFailures++;
+      delay = POLL_INTERVAL * _watchdogBackoffMultiplier(consecutiveFailures);
+      const now = Date.now();
+      if (consecutiveFailures === 1 || now - lastWarnAt >= WARN_THROTTLE_MS) {
+        log.warn(
+          `[YouTube] Watchdog scrape failed (${consecutiveFailures} consecutive): ${err.message} ` +
+          `— retrying in ${Math.round(delay / 1000)}s`
+        );
+        lastWarnAt = now;
+      } else {
+        log.debug(`[YouTube] Watchdog scrape failed (${consecutiveFailures} consecutive): ${err.message}`);
+      }
     }
-    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    await new Promise(r => setTimeout(r, delay));
   }
 }
 
@@ -1006,6 +1164,13 @@ module.exports = {
   startYouTube,
   triggerVideo,
   updateVideoInfo,
+
+  // Test-only hooks (not part of the plugin contract) — let the test suite
+  // drive the watchdog scrape against a stub server without starting sessions.
+  _findLiveVideoId,
+  _scrapeGetText,
+  _watchdogBackoffMultiplier,
+
   stopSubscriberPoller() {
     if (_subPollerTimer) { clearInterval(_subPollerTimer); _subPollerTimer = null; }
     _lastKnownSubCount = null;

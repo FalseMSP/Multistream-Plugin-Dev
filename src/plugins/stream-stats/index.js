@@ -408,6 +408,12 @@ function _gameReplyText() {
     const v = _streamInfo.getViewerCount();
     return `Currently playing: ${g.name}` + (v > 0 ? ` (${v} watching)` : '');
   }
+  // Live but the broadcaster never picked a category (Twitch allows that) —
+  // saying "offline" here would be a lie.
+  if (_streamInfo.isLive()) {
+    const v = _streamInfo.getViewerCount();
+    return 'Stream is live — no game/category is set on the channel.' + (v > 0 ? ` (${v} watching)` : '');
+  }
   const last    = _streamInfo.getLastSession();
   const lastSmp = last?.samples?.[last.samples.length - 1];
   const lastGame = lastSmp ? (last.games?.[lastSmp[2]] ?? null) : null;
@@ -432,7 +438,14 @@ function init(context) {
 
 function onChatReady(chatReply) {
   _chatReply = chatReply ?? { twitch: null, youtube: null, youtubeSession: null };
-  commandsList.registerCommand('!game', 'Show the game currently being played on stream');
+  // dynamic:true — the generic !command responder (add-commands) must NOT
+  // intercept !game with this static description. It used to: add-commands
+  // runs earlier in the plugin pipeline, replied with this very text
+  // ("Show the game currently being played on stream") and suppressed the
+  // message, so this plugin's dynamic reply never ran. Registering as
+  // dynamic keeps !game in the shared !commands list while leaving the
+  // actual response to us.
+  commandsList.registerCommand('!game', 'Show the game currently being played on stream', { dynamic: true });
   log.info('[stream-stats] Chat reply handlers registered.');
 }
 
@@ -440,7 +453,15 @@ async function processMessage(msg) {
   const text = (msg?.message ?? '').trim();
   if (!CMD_GAME.test(text)) return { message: msg };
 
-  const send = _chatReply[msg?.platform];
+  // Reply on the platform the command came from. For YouTube, target the
+  // specific live stream instead of broadcasting to every active session.
+  let send;
+  if (msg.platform === 'youtube' && msg.videoId && _chatReply.youtubeSession) {
+    const videoId = msg.videoId;
+    send = (t) => _chatReply.youtubeSession(videoId, t);
+  } else {
+    send = _chatReply[msg?.platform];
+  }
   if (send) {
     send(_gameReplyText())
       .catch(e => log.error('[stream-stats] !game reply error:', e.message));

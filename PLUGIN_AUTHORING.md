@@ -156,9 +156,35 @@ function onChatReady(chatReply) {
 }
 ```
 
+### Dynamic commands (your plugin owns the reply)
+
+If your plugin **implements the command itself** (a personalised reply, a side effect, anything beyond a canned response), register it with `dynamic: true`. Otherwise the generic responder in `add-commands` — which runs early in the plugin pipeline — answers the trigger with the static description and suppresses the message before your plugin ever sees it:
+
+```js
+commandsList.registerCommand('!game', 'Show the game currently being played on stream', { dynamic: true });
+```
+
+### Platform-restricted commands
+
+Pass `platform: 'twitch'` or `platform: 'youtube'` to keep the generic responder from answering the trigger on the other platform:
+
+```js
+commandsList.registerCommand('!points', 'Check your point balance', { dynamic: true, platform: 'youtube' });
+```
+
+### Regex commands
+
+Mods can also add **regex commands** from Discord (`/command add <pattern> <response> regex: true`, or by wrapping the trigger in slashes: `/command add /level name/ <response>`). These match the raw chat message against the pattern case-insensitively — no `!` prefix required — and reply with the canned response, rate-limited by a per-command cooldown (`REGEX_CMD_COOLDOWN_MS`, default 5 s). Plugins don't usually need to create these programmatically, but the registry supports it:
+
+```js
+commandsList.registerCommand(null, 'We are playing Geometry Dash!', {
+  type: 'regex', pattern: '^what.?s the level',
+});
+```
+
 ### Removing a command
 
-Call `removeCommand` if your plugin disables a command at runtime (e.g. a toggle feature).
+Call `removeCommand` if your plugin disables a command at runtime (e.g. a toggle feature). It accepts `!trigger`, `trigger`, `/pattern/` or the bare pattern.
 
 ```js
 commandsList.removeCommand('!discord');
@@ -168,17 +194,19 @@ commandsList.removeCommand('!discord');
 
 ```js
 const cmds = commandsList.getCommands();
-// → [{ name: '!commands', description: '…' }, { name: '!discord', description: '…' }, …]
-// Always sorted alphabetically.
+// → [{ trigger: 'discord', response: '…', type: 'prefix', platform: null, dynamic: false }, …]
+// Prefix commands first (A–Z), then regex commands (A–Z by pattern).
 ```
 
 ### Full registry API
 
 | Method | Signature | Description |
 |---|---|---|
-| `registerCommand` | `(name: string, description: string) => void` | Add or update a command entry |
-| `removeCommand` | `(name: string) => void` | Remove a command entry by name |
-| `getCommands` | `() => { name, description }[]` | Return all entries, sorted A–Z |
+| `registerCommand` | `(name: string, description: string, opts?: object\|string) => entry\|null` | Add or update a command entry. `opts` object: `{ dynamic, platform, type: 'regex', pattern, addedBy }`; a bare string is treated as `{ platform }`. |
+| `removeCommand` | `(name: string) => boolean` | Remove a command entry (accepts `!trigger` / `/pattern/` / bare pattern) |
+| `getCommands` | `() => { trigger, response, type, pattern?, platform, dynamic }[]` | Return all entries — prefix commands first, each group sorted A–Z |
+| `validateRegexPattern` | `(pattern: string) => { ok, error?, regex? }` | Validate a chat-trigger regex (rejects empty-matching patterns) |
+| `formatTrigger` | `(entry) => string` | Render an entry the way viewers see it: `!trigger` or `/pattern/` |
 
 > **Load order note.** Plugin directories are loaded alphabetically. If your plugin loads before `commands-list`, the `require('../commands-list')` call will still succeed — Node's module cache means it gets the same singleton once `commands-list` eventually loads. However, prefer registering inside `onChatReady` rather than at module-load time to avoid ordering surprises.
 

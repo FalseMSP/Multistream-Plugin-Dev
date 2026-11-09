@@ -109,7 +109,10 @@ function _send(platform, text) {
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  commandsList.registerCommand('!fragments', `Check how many Pull Fragments you have (${FRAGMENTS_NEEDED} = 1 free premium pull)`);
+  // dynamic:true — this plugin answers !fragments itself with a personalised
+  // fragment count; the generic responder must not intercept it with the
+  // static description.
+  commandsList.registerCommand('!fragments', `Check how many Pull Fragments you have (${FRAGMENTS_NEEDED} = 1 free premium pull)`, { dynamic: true });
   log.info('[pull-fragment] Chat ready.');
 }
 

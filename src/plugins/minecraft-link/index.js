@@ -232,7 +232,7 @@ function onChatReady(_chatReply) {
   // Only register keyword commands if the plugin starts enabled
   if (_enabled) {
     for (const kw of _keywords) {
-      commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+      commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`, { dynamic: true });
     }
   }
 }
@@ -348,7 +348,7 @@ async function handleInteraction(interaction) {
   if (sub === 'enable') {
     _enabled = true;
     await syncManagedRedeems(true);
-    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`, { dynamic: true });
     return interaction.editReply('✅ minecraft-link **enabled**. Twitch redeems (Summon Wither, Disable 60s) **enabled**.');
   }
   if (sub === 'disable') {
@@ -371,7 +371,7 @@ async function handleInteraction(interaction) {
     _keywords   = new Set(list);
     _regex      = buildRegex(_keywords);
     _exactRegex = buildExactRegex(_keywords);
-    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+    for (const kw of _keywords) commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`, { dynamic: true });
 
     const display = list.map(k => `\`${k}\``).join(', ');
     return interaction.editReply(`✅ Keywords replaced with: ${display}`);
@@ -386,7 +386,7 @@ async function handleInteraction(interaction) {
     _keywords.add(kw);
     _regex      = buildRegex(_keywords);
     _exactRegex = buildExactRegex(_keywords);
-    commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`);
+    commandsList.registerCommand(`!${kw}`, `Minecraft trigger: spawns ${kw}`, { dynamic: true });
     return interaction.editReply(`✅ Added \`${kw}\`. Current keywords: ${[..._keywords].sort().map(k => `\`${k}\``).join(', ')}`);
   }
 

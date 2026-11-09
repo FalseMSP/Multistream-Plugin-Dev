@@ -827,9 +827,13 @@ function init(context) {
 function onChatReady(chatReply) {
   _chatReply = chatReply;
 
-  commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)', 'youtube');
-  commandsList.registerCommand('!redeem',  'Redeem a reward — !redeem <name> · !rewards to browse', 'youtube');
-  commandsList.registerCommand('!rewards', 'Browse rewards — !rewards overview · !rewards sfx · !rewards <name> for details', 'youtube');
+  // dynamic + platform:'youtube' — this plugin implements these commands
+  // itself (personalised point balances, reward browsing, redeems) and only
+  // on YouTube. The generic responder in add-commands leaves them alone; on
+  // Twitch they simply do not exist (Twitch has native channel points).
+  commandsList.registerCommand('!points',  'Check your YouTube point balance (or !points top for leaderboard)', { dynamic: true, platform: 'youtube' });
+  commandsList.registerCommand('!redeem',  'Redeem a reward — !redeem <name> · !rewards to browse',            { dynamic: true, platform: 'youtube' });
+  commandsList.registerCommand('!rewards', 'Browse rewards — !rewards overview · !rewards sfx · !rewards <name> for details', { dynamic: true, platform: 'youtube' });
 
   log.info('[yt-points] Ready. Chat commands registered.');
 }
