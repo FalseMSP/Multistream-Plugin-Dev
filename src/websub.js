@@ -12,10 +12,14 @@ const express   = require('express');
 const crypto    = require('crypto');
 const { parseStringPromise } = require('xml2js');
 const log       = require('./logger');
+const { createLeaseMachine } = require('./websub-lease-machine');
+const connections = require('./dashboard/connections');
+const { REAL_CLOCK } = require('./fsm');
 
 const PUBLIC_URL    = (process.env.WEBSUB_PUBLIC_URL ?? '').replace(/\/$/, '');
-const YT_SECRET     = process.env.WEBSUB_SECRET           ?? 'change-me-please';
-const TWITCH_SECRET = process.env.TWITCH_EVENTSUB_SECRET  ?? 'change-me-twitch';
+const { resolveSecret } = require('./secret-store');
+const YT_SECRET     = resolveSecret('WEBSUB_SECRET',        'websub',         'change-me-please');
+const TWITCH_SECRET = resolveSecret('TWITCH_EVENTSUB_SECRET', 'eventsub',     'change-me-twitch');
 const CLIENT_ID     = process.env.TWITCH_CLIENT_ID        ?? '';
 const PORT          = parseInt(process.env.WEBSUB_PORT ?? '8081', 10);
 const HUB           = 'https://pubsubhubbub.appspot.com/';
@@ -23,6 +27,7 @@ const LEASE_SECONDS = 86400;
 const YT_CHANNEL_ID = process.env.YT_CHANNEL_ID ?? '';
 
 let _queue = null;
+let ytLease = null; // lease machine for the YouTube WebSub subscription
 
 // ── YouTube WebSub ────────────────────────────────────────────────────────
 
@@ -62,13 +67,9 @@ async function ytSubscribe(channelId) {
   }
 }
 
-async function ytRenewLoop(channelId) {
-  while (true) {
-    await new Promise(r => setTimeout(r, (LEASE_SECONDS - 3600) * 1000));
-    log.info('[WebSub] Renewing YouTube subscription…');
-    await ytSubscribe(channelId).catch(e => log.error('[WebSub] Renew error:', e));
-  }
-}
+// ytRenewLoop was replaced by the lease machine (websub-lease-machine.js):
+// same renewal timing (lease minus 1 h margin), plus failure backoff and
+// state surfacing the old loop lacked.
 
 // ── Twitch EventSub ───────────────────────────────────────────────────────
 
@@ -147,10 +148,28 @@ function buildApp() {
   // other parser can touch it. This is intentionally on the isolated app
   // instance created here, so nothing outside can interfere.
   app.use((req, res, next) => {
+    // Body cap (review W1): this collector runs on a publicly reachable
+    // port BEFORE signature verification — unbounded concatenation was a
+    // memory-exhaustion vector. 256 KB is ~1000x the largest legitimate
+    // WebSub/EventSub notification body (~1-2 KB).
+    const MAX_BODY_BYTES = 256 * 1024;
     const chunks = [];
-    req.on('data',  chunk => chunks.push(chunk));
-    req.on('end',   ()    => { req.body = Buffer.concat(chunks); next(); });
-    req.on('error', err   => { log.error('[WebSub] Body read error:', err.message); res.status(400).end(); });
+    let total = 0;
+    let aborted = false;
+    req.on('data',  chunk => {
+      if (aborted) return;
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        aborted = true;
+        log.warn(`[WebSub] Oversized body (${total} bytes > ${MAX_BODY_BYTES}) on ${req.path} — rejecting.`);
+        res.status(413).end();
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end',   ()    => { if (aborted) return; req.body = Buffer.concat(chunks); next(); });
+    req.on('error', err   => { if (aborted) return; log.error('[WebSub] Body read error:', err.message); res.status(400).end(); });
   });
 
   // ── YouTube WebSub routes ──────────────────────────────────────────────
@@ -261,8 +280,28 @@ async function startWebSub(queue) {
   // challenge handshake is still in-flight (status not yet 'enabled').
 
   if (YT_CHANNEL_ID) {
-    await ytSubscribe(YT_CHANNEL_ID);
-    ytRenewLoop(YT_CHANNEL_ID);
+    // Lease lifecycle via the explicit lease machine (replaces the old
+    // `while (true) { sleep(lease-1h); renew(); }` loop): same renewal
+    // timing, but a failed renewal now retries with exponential backoff
+    // instead of silently dying until the next process restart, and state
+    // changes are surfaced to onState for a future dashboard connections
+    // widget (the "no platform connection status" finding).
+    ytLease = createLeaseMachine({
+      clock: REAL_CLOCK,
+      subscribe: ytSubscribe,
+      onLog: (m) => log.info(m),
+      onState: (state) => {
+        log.info(`[WebSub] YouTube push lease: ${state}`);
+        // Surface the lease lifecycle in the connections widget (review W2):
+        // subscribed = green, renewing/failed = amber/red.
+        const map = { subscribed: ['ok', ''], subscribing: ['degraded', 'Subscribing…'],
+                      renewing: ['degraded', 'Renewing lease…'], failed: ['down', 'Renewal failed — retrying with backoff'],
+                      unsubscribed: ['off', 'Not subscribed'] };
+        const [st, detail] = map[state] || ['off', state];
+        connections.setStatus('websub', st, detail);
+      },
+    });
+    ytLease.start(YT_CHANNEL_ID);
   } else {
     log.info('[WebSub] YT_CHANNEL_ID not set — YouTube WebSub skipped.');
   }
@@ -279,4 +318,4 @@ function getTwitchSecret() {
   return TWITCH_SECRET;
 }
 
-module.exports = { startWebSub, getEventSubCallbackUrl, getTwitchSecret, purgeStaleTwitchSubs };
+module.exports = { startWebSub, getEventSubCallbackUrl, getTwitchSecret, purgeStaleTwitchSubs, getYtLease: () => ytLease };

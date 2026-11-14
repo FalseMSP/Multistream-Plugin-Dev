@@ -1,12 +1,19 @@
 'use strict';
 
 const log = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 const commandsList = require('../commands-list');
 const { registerSection, updateSection, addRoute } = require('../../overlay-server');
+const { createGachaMachine } = require('../gacha-shared/pull-machine');
 const fs   = require('fs');
 const path = require('path');
 
 const GACHA_HTML = path.resolve(__dirname, 'overlay.html');
+
+// Single source of truth for the budget pull price (review W3: help text
+// said 1000, the real pinned Twitch reward is 500). Help text derives from
+// here so !commands never disagrees with the actual price.
+const PULL_COST = 500; // matches the pinned budget Twitch reward
 
 // queue is injected via init(context) — see init() below.
 let _queue = null;
@@ -119,84 +126,60 @@ addRoute('/budgetgacha', (req, res) => {
 
 // ─── State helpers ────────────────────────────────────────────────────────────
 
-let _pullActive = false;
-const _pullQueue = []; // { user, isPremium }
+// The pull choreography runs on the shared state machine
+// (../gacha-shared/pull-machine.js) — the same idle → pulling → result → idle
+// choreography with legacy timings (reveal 8 s, idle 14 s, 1.5 s breath).
+// This variant keeps its OWN animation identity: section id 'budgetgacha',
+// the ONE fixed video (/gachavids/gacha-at-home.mp4), and NO grid mode.
+// The budget overlay page (/budgetgacha) filters on section 'budgetgacha'
+// and only ever handles pulling/result/idle frames — never grid.
+let _machine = null;
 
 function pushState(state, extra = {}) {
   updateSection('budgetgacha', { state, ...extra });
 }
 
-// ─── Internal: play one pull immediately ─────────────────────────────────────
+function _buildMachine() {
+  return createGachaMachine({
+    sectionId: 'budgetgacha',
+    lootTable: LOOT_TABLE,
+    clock: require('../../fsm').REAL_CLOCK,
 
-function _executePull({ user, isPremium }) {
-  _pullActive = true;
+    // ── VARIANT ANIMATION POLICY (what keeps budgetgacha ≠ gacha) ──────────
+    // All pulls use the same video, regardless of rarity or dud.
+    videoFor: () => '/gachavids/gacha-at-home.mp4',
+    dudCount: 0,
+    grid: { enabled: false }, // never any grid frames on this section
 
-  const item = roll(isPremium);
-  const isDud = item.rarity === 'dud';
+    emit: (frame) => {
+      const { state, ...rest } = frame;
+      pushState(state, rest);
+    },
 
-  // All pulls use the same video
-  const videoFile = `/gachavids/gacha-at-home.mp4`;
+    dispatchRedeem: (redeem) => {
+      if (_queue) _queue.pushRedeem(redeem);
+      else log.warn('[budgetgacha] queue not available — synthetic redeem not dispatched');
+    },
 
-  // Icon path (null for duds)
-  const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
+    // No results plumbing in the budget variant (legacy had none — no
+    // gacha-results widget subscription here).
+    results: null,
 
-  log.info(`[budgetgacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
-
-  pushState('pulling', {
-    user,
-    videoFile,
-    iconPath,
-    rarity: item.rarity,
-    label: item.label,
-    isDud,
+    onLog: (m) => log.info(m),
   });
-
-  setTimeout(() => {
-    pushState('result', {
-      result: { rarity: item.rarity, label: item.label, user },
-    });
-
-    // Fire the item's associated redeem as soon as the icon is revealed,
-    // so plugins like sfx pick it up at the right moment.
-    if (!isDud && item.redeem) {
-      log.info(`[budgetgacha] Dispatching redeem "${item.redeem}" for ${user}`);
-      if (_queue) {
-        _queue.pushRedeem({
-          username:  user,
-          title:     item.redeem,
-          cost:      0,
-          input:     null,
-          timestamp: new Date(),
-          _fromGacha: true, // flag so other plugins can tell it's synthetic
-        });
-      } else {
-        log.warn('[budgetgacha] queue not available — synthetic redeem not dispatched');
-      }
-    }
-  }, 8000);
-
-  setTimeout(() => {
-    pushState('idle');
-    _pullActive = false;
-    // Start the next queued pull after a short breath between animations
-    if (_pullQueue.length > 0) {
-      const next = _pullQueue.shift();
-      log.info(`[budgetgacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
-      setTimeout(() => _executePull(next), 1500);
-    }
-  }, 14000);
 }
 
-// ─── Main pull trigger ────────────────────────────────────────────────────────
-// Queues the pull if one is already in progress; plays immediately otherwise.
+// ─── Pull engine: shared state machine ───────────────────────────────────────
+// The legacy _executePull + inline queue-drain code was replaced by
+// ../gacha-shared/pull-machine.js — identical choreography, explicit FSM,
+// asserted against the legacy contract by test/gacha-machine.test.js.
 
 function triggerPull({ user, isPremium = false }) {
-  if (_pullActive) {
-    _pullQueue.push({ user, isPremium });
-    log.info(`[budgetgacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+  if (!_machine) {
+    log.warn('[budgetgacha] triggerPull before init — pull ignored');
     return;
   }
-  _executePull({ user, isPremium });
+  _machine.triggerPull({ user, isPremium });
 }
 
 // ─── Redeem / bits / sub titles ───────────────────────────────────────────────
@@ -217,18 +200,22 @@ let _chatReply = { twitch: null, youtube: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  commandsList.registerCommand('!budgetgacha', 'Spend 1000 channel points to pull from the gacha!');
+  commandsList.registerCommand('!budgetgacha', `Spend ${PULL_COST} channel points to pull from the budget gacha!`);
   log.info('[budgetgacha] ready.');
 }
 
 function _normaliseTitle(raw) {
-  // Strip "[YT]" suffix appended by yt-points when mirroring YouTube redeems
-  return raw.replace(/\s*\[YT\]\s*$/i, '').trim().toLowerCase();
+  // queue.normaliseRedeemTitle centralises the [YT] suffix strip that used to
+  // be re-implemented here and in five other plugins (review W3).
+  return normaliseRedeemTitle(raw);
 }
 
 function init(context) {
   const q = context.queue;
-  _queue = q; // captured for setTimeout-callback access in _executePull
+  _queue = q; // captured for the machine's dispatchRedeem callback
+
+  // Build the pull machine now (it needs the queue for synthetic redeems).
+  if (!_machine) _machine = _buildMachine();
 
   // ── Channel Point redeems ────────────────────────────────────────────────
   if (typeof q?.onRedeem === 'function') {

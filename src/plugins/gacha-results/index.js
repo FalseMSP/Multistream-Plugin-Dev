@@ -87,6 +87,10 @@ function _isAutoRemoveResult(result) {
 
 /** @type {Array<{ id: number, user: string, label: string, rarity: string, isDud: boolean, redeem: string|null, timestamp: string, fulfilled: boolean }>} */
 let _results = [];
+// Id floor for incoming results (review W2): never accept an id that can
+// collide with pre-restart rows — if a producer hands us a small/id-less id,
+// re-stamp it above every persisted id and the wall clock.
+let _idFloor = Date.now();
 
 function _load() {
   try {
@@ -139,6 +143,9 @@ function _onResult(result) {
     return;
   }
 
+  if (typeof result.id !== 'number' || result.id < _idFloor) {
+    result = { ...result, id: _idFloor++ };
+  }
   _results.push({
     id:        result.id,
     user:      result.user,
@@ -153,6 +160,7 @@ function _onResult(result) {
   if (_results.length > MAX_RESULTS) {
     _results = _results.slice(-MAX_RESULTS);
   }
+  _idFloor = Math.max(_idFloor, ..._results.map(r => r.id + 1));
   _save();
   _pushState();
 }

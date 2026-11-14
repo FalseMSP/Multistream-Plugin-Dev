@@ -16,6 +16,7 @@ const {
 } = require('discord.js');
 
 const log = require('./logger');
+const connections = require('./dashboard/connections');
 
 // ── Config ────────────────────────────────────────────────────────────────
 
@@ -273,7 +274,10 @@ async function startDiscordBot() {
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-  client.on('ready', () => log.info(`Discord bot ready as ${client.user.tag}`));
+  client.on('ready', () => {
+    log.info(`Discord bot ready as ${client.user.tag}`);
+    connections.setStatus('discord', 'ok', 'Bot ready as ' + client.user.tag);
+  });
 
   client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;

@@ -68,6 +68,7 @@ const fs   = require('fs');
 const path = require('path');
 const { SlashCommandBuilder, EmbedBuilder, PermissionFlagsBits } = require('discord.js');
 const log = require('../../logger');
+const dashboardAuth = require('../../dashboard/auth');
 const { registerSection, updateSection, addRoute, buildStandaloneSectionPage } = require('../../overlay-server');
 const dashboard = require('../../dashboard');
 // Twitch extension host (EBS) — generic infrastructure (JWT auth, PubSub,
@@ -83,6 +84,60 @@ const OVERLAY_HTML = path.resolve(__dirname, 'overlay.html');
 
 const _queue = [];
 let _enabled = true;
+
+// ── Persistence (review: the queue was memory-only — a mid-stream restart
+// wiped every viewer level request and silently reset to open) ────────────
+// Same load/save twin as stopwatch's stopwatches.json: save on every
+// mutation, load once in init().
+const STATE_FILE = path.join(__dirname, 'queue-state.json');
+
+function _saveState() {
+  try {
+    fs.writeFileSync(STATE_FILE, JSON.stringify({ queue: _queue, enabled: _enabled }, null, 2) + '\n');
+  } catch (e) {
+    log.error('[gd-queue] Failed to save queue state:', e.message);
+  }
+}
+
+function _loadState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    if (Array.isArray(raw.queue)) {
+      for (const e of raw.queue) {
+        if (e && typeof e.username === 'string' && typeof e.levelId === 'string') {
+          _queue.push(e);
+        }
+      }
+    }
+    if (typeof raw.enabled === 'boolean') _enabled = raw.enabled;
+    if (_queue.length > 0) {
+      log.info(`[gd-queue] Restored ${_queue.length} level request(s) from disk (queue ${_enabled ? 'open' : 'closed'}).`);
+    }
+  } catch {
+    // No state file yet (first run) — start empty, as before.
+  }
+}
+
+// ── Route auth (review High: unauthenticated state-mutating API) ───────────
+// POST /api/gd-queue/next and /skip accepted anyone's request. Accept EITHER:
+//   • the dashboard session cookie (same auth as the dashboard itself), or
+//   • the operator token: OVERLAY_TOKEN env, sent as X-Overlay-Token header
+//     or ?token= query param (the standalone OBS page can embed it).
+function _isAuthorised(req) {
+  try {
+    const cookies = dashboardAuth._parseCookies(req.headers.cookie || '');
+    if (dashboardAuth._isValidSession(cookies[dashboardAuth.getCookieName()])) return true;
+  } catch { /* fall through to token check */ }
+  const token = (req.headers['x-overlay-token'] || '').trim()
+    || (new URL(req.url, 'http://x').searchParams.get('token') || '').trim();
+  const expected = (process.env.OVERLAY_TOKEN || '').trim();
+  return Boolean(expected) && token === expected;
+}
+
+function _unauthorised(res) {
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'unauthorised' }));
+}
 
 const CMD_ADD      = /^!(?:q|queue|r|request)\s+(\S+)(?:\s+(.+))?\s*$/i;
 const CMD_LIST     = /^!q\s*$/i;
@@ -857,7 +912,9 @@ addRoute('/api/gd-queue/next', (req, res) => {
     res.writeHead(405, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Method not allowed' }));
   }
+  if (!_isAuthorised(req)) return _unauthorised(res);
   const entry = _next();
+  _saveState(); // queue mutated — persist (review: queue was memory-only)
   _notify();
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(entry ?? null));
@@ -874,7 +931,9 @@ addRoute('/api/gd-queue/skip', (req, res) => {
     res.writeHead(405, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: 'Method not allowed' }));
   }
+  if (!_isAuthorised(req)) return _unauthorised(res);
   const entry = _next(false); // skipped, not played — now-playing overlay stays as-is
+  _saveState(); // queue mutated — persist (review: queue was memory-only)
   if (entry) {
     log.info(`[gd-queue] Skipped level ${entry.levelId} (requested by ${entry.username}) — not copied to clipboard`);
   }
@@ -931,6 +990,7 @@ function _add(username, platform, levelId, notes) {
     log.info(`[gd-queue] Replaced ${username}'s entry ${old} → ${levelId}`);
   }
   _queue.push({ username, platform, levelId, notes: notes || null, addedAt: new Date() });
+  _saveState(); // queue mutated — persist (review: queue was memory-only)
   log.info(`[gd-queue] Added: ${username} → ${levelId}${notes ? ` (notes: ${notes})` : ''} (queue length: ${_queue.length})`);
   return existing !== -1; // true = was a replacement
 }
@@ -1255,6 +1315,7 @@ async function handleInteraction(interaction) {
 
     if (sub === 'toggle') {
       _enabled = !_enabled;
+      _saveState(); // enabled flag mutated — persist
       _notify();
       log.info(`[gd-queue] Queue ${_enabled ? 'enabled' : 'disabled'} by Discord command`);
       return interaction.editReply({ embeds: [
@@ -1285,6 +1346,7 @@ async function handleInteraction(interaction) {
         return interaction.editReply(`⚠️ No entry found for **${user}** in the queue.`);
       }
       const removed = _queue.splice(idx, 1)[0];
+      _saveState(); // queue mutated — persist
       _notify();
       log.info(`[gd-queue] Removed ${removed.username}'s entry (${removed.levelId}) via Discord`);
       return interaction.editReply(`Removed **${removed.username}**'s level \`${removed.levelId}\` from the queue.`);
@@ -1298,6 +1360,7 @@ async function handleInteraction(interaction) {
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
+  _loadState(); // restore persisted queue + enabled flag (review W2)
   log.info('[gd-queue] Chat reply handlers registered.');
   _notify(); // pushes initial state + kicks off preview fetch
 }

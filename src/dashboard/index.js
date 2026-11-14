@@ -61,6 +61,8 @@ const { handleRequest } = require('./routes');
 // We pull it in here so any module that requires './dashboard' triggers
 // the patch exactly once.
 require('./logger-tap');
+const connections = require('./connections');
+connections.ensureRegistered(); // connections widget (review W2) — registers once here
 
 // Warn at module load if the password isn't configured.
 if (!auth.isPasswordConfigured()) {

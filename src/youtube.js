@@ -29,6 +29,7 @@
  */
 
 const log = require('./logger');
+const connections = require('./dashboard/connections');
 const https = require('https');
 const zlib  = require('zlib');
 
@@ -244,6 +245,7 @@ async function _runFetchLane(laneId, videoId, session, queue, isFirstLane) {
         /no longer live/i.test(err.message)
       ) {
         log.info(`[YouTube] Lane ${laneId}: stream ended (${err.message}) — stopping lane`);
+        connections.setStatus('youtube', 'degraded', 'Lane ended: ' + err.message);
         session.stopSignal.stopped = true;
         if (session.likePollerTimer) clearInterval(session.likePollerTimer);
         if (_activeSessions.get(videoId) === session) _activeSessions.delete(videoId);
@@ -375,6 +377,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
     mc = await Masterchat.init(videoId);
   } catch (err) {
     log.error(`[YouTube] Masterchat init failed for ${videoId}: ${err.message}`);
+    connections.setStatus('youtube', 'degraded', 'Masterchat init failed: ' + err.message);
     _activeSessions.delete(videoId);
     const nextDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY);
     log.info(`[YouTube] Retrying in ${nextDelay / 1000}s…`);
@@ -397,6 +400,7 @@ async function _startMasterchat(videoId, queue, retryDelay = 5_000) {
   session.liveChatId = liveChatId;
 
   log.info(`[YouTube] masterchat connected for video=${videoId} liveChatId=${liveChatId}`);
+  connections.setStatus('youtube', 'ok', 'Chat connected: ' + videoId);
   log.info(`[YouTube] Starting dual-lane pipelined chat reader`);
   _startLikePoller(videoId, session, queue);
 

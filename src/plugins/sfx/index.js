@@ -25,6 +25,7 @@
 
 const { registerSection, updateSection } = require('../../overlay-server');
 const log = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 
 // ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -167,7 +168,7 @@ registerSection('sfx', {
  */
 function isSfxTitle(rewardTitle) {
   if (!rewardTitle || typeof rewardTitle !== 'string') return false;
-  var normalised = rewardTitle.replace(/\s*\[YT\]\s*$/i, '').trim();
+  var normalised = normaliseRedeemTitle(rewardTitle); // shared helper (review W3)
   return Object.keys(SFX_MAP).some(
     function(k) { return k.toLowerCase() === normalised.toLowerCase(); }
   );
@@ -195,14 +196,17 @@ function handleRedeem(rewardTitle, opts) {
   opts = opts || {};
   // Strip the "[YT]" suffix that yt-points appends when mirroring YouTube
   // redeems into the pipeline, so the SFX_MAP lookup still matches.
-  var normalised = rewardTitle.replace(/\s*\[YT\]\s*$/i, '').trim();
+  var normalised = normaliseRedeemTitle(rewardTitle); // shared helper (review W3)
   var key = Object.keys(SFX_MAP).find(
     function(k) { return k.toLowerCase() === normalised.toLowerCase(); }
   );
 
   if (!key) {
-    log.debug('[sfx] No sound mapped for reward: "' + normalised + '"' +
-      (normalised !== rewardTitle ? ' (original: "' + rewardTitle + '")' : ''));
+    // warn, not debug (review W2): a renamed Twitch reward silently stops
+    // playing its sound — the streamer needs this in the visible log.
+    log.warn('[sfx] No sound mapped for reward: "' + normalised + '"' +
+      (normalised !== rewardTitle ? ' (original: "' + rewardTitle + '")' : '') +
+      ' — rename it back or add it to SFX_MAP.');
     return false;
   }
 

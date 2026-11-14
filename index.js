@@ -31,8 +31,15 @@ const {
 const dashboard = require('./src/dashboard');
 const chatEmotes = require('./src/chat-emotes');
 
+// unhandledRejection stays log-only: a single bad plugin promise should not
+// restart the whole bot (restart storms). uncaughtException is different —
+// the process state is undefined after one, and chat-mirror.service relies on
+// Restart=on-failure, which never fires if we swallow it (review W1).
 process.on('unhandledRejection', (err) => log.error('Unhandled rejection:', err));
-process.on('uncaughtException',  (err) => log.error('Uncaught exception:',  err));
+process.on('uncaughtException',  (err) => {
+  log.error('Uncaught exception — exiting for systemd restart:', err);
+  process.exit(1);
+});
 
 async function main() {
   log.info('chat-mirror starting…');

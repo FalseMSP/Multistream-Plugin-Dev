@@ -10,6 +10,7 @@
  */
 const tmi = require('tmi.js');
 const log = require('./logger');
+const connections = require('./dashboard/connections');
 const followGuard = require('./follow-guard');
 // ── Config ────────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TWITCH_TOKEN              ?? '';
@@ -263,6 +264,10 @@ async function getUserToken() {
       log.info('[Twitch] User token refreshed and saved.');
     } catch (err) {
       log.error('[Twitch] User token refresh failed:', err.message);
+      // Surface in the connections widget (review W2: a dead user token
+      // bricks reward management until a manual re-auth, and the operator
+      // previously had no visible signal).
+      connections.setStatus('eventsub', 'down', 'User token refresh failed — run twitch_auth.js');
       _userTokenCache = null;
       return null;
     }
@@ -360,6 +365,7 @@ async function subscribeEventSub(broadcasterId, callbackUrl, secret, type, versi
 async function setupEventSub(callbackUrl, secret) {
   if (!callbackUrl) {
     log.warn('[Twitch] No PUBLIC_URL set — EventSub disabled. Redeems only work while live via IRC tags.');
+    connections.setStatus('eventsub', 'off', 'Not configured (no PUBLIC_URL)');
     return;
   }
   if (!CLIENT_ID || !process.env.TWITCH_CLIENT_SECRET) {
@@ -436,7 +442,10 @@ async function setupEventSub(callbackUrl, secret) {
 
   } catch (err) {
     log.warn('[Twitch] EventSub setup failed:', err.message);
+    connections.setStatus('eventsub', 'down', 'Setup failed: ' + err.message);
+    return;
   }
+  connections.setStatus('eventsub', 'ok', 'Subscriptions registered');
 }
 // ── EventSub event handlers (called from your webhook router) ─────────────
 function handleEventSubNotification(type, event, queue) {
@@ -847,13 +856,16 @@ async function startTwitch(queue) {
 
   client.on('reconnect', () => {
     log.info('[Twitch] Reconnecting…');
+    connections.setStatus('twitch-irc', 'degraded', 'Reconnecting…');
   });
 
   client.on('disconnected', (reason) => {
     log.warn('[Twitch] Disconnected:', reason);
+    connections.setStatus('twitch-irc', 'down', 'Disconnected: ' + reason);
     setTimeout(() => client.connect().catch(log.error), 5000);
   });
   await client.connect();
+  connections.setStatus('twitch-irc', 'ok', 'IRC connected');
   log.info('[Twitch] tmi.js client ready');
   _tmiClient = client;
   return client;

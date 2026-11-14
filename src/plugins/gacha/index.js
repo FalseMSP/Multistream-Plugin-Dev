@@ -1,12 +1,19 @@
 'use strict';
 
 const log = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 const commandsList = require('../commands-list');
 const { registerSection, updateSection, addRoute } = require('../../overlay-server');
+const { createGachaMachine } = require('../gacha-shared/pull-machine');
 const fs   = require('fs');
 const path = require('path');
 
 const GACHA_HTML = path.resolve(__dirname, 'overlay.html');
+
+// Single source of truth for the pull price (review W3: the help text said
+// 1000 points while the pinned Twitch reward actually costs 5000, and the
+// commands registry carried a third figure). Help text derives from here.
+const PULL_COST = 5000; // matches the pinned Twitch channel-point reward
 
 // queue is injected via init(context) — see init() below.
 // We keep a module-level reference so setTimeout callbacks (which fire
@@ -112,11 +119,63 @@ registerSection('gacha', {
 
 // ─── State helpers ────────────────────────────────────────────────────────────
 
-let _pullActive = false;
-const _pullQueue = []; // { user, isPremium, count?, users? }
+// The pull choreography runs on the shared, explicitly-modeled state machine
+// (../gacha-shared/pull-machine.js): idle → pulling → result → idle with the
+// legacy timings (reveal 8 s, idle 14 s, 1.5 s breath between queued pulls).
+// This variant keeps its OWN animation identity: section id 'gacha',
+// per-rarity videos, dud1/dud2, and the 25-cell grid mode.
+let _machine = null; // built in init(); module-level for trigger access
+
+// Monotonic id for results so the dashboard widget has stable keys.
+// Seeded from Date.now() (review W2): the gacha-results widget keys rows on
+// these ids and the persisted results array keeps old entries, so a counter
+// restarting at 0 could collide with pre-restart ids in the
+// unfulfilled-rewards view.
+let _resultId = Date.now();
 
 function pushState(state, extra = {}) {
   updateSection('gacha', { state, ...extra });
+}
+
+function _buildMachine() {
+  return createGachaMachine({
+    sectionId: 'gacha',
+    lootTable: LOOT_TABLE,
+    clock: require('../../fsm').REAL_CLOCK,
+
+    // ── VARIANT ANIMATION POLICY (this is what keeps gacha ≠ budgetgacha) ──
+    // Per-rarity video; duds pick dud1/dud2 at random.
+    videoFor: (item, rng) => {
+      if (item.rarity === 'dud') {
+        const dudNum = Math.floor(rng() * DUD_COUNT) + 1; // 1 or 2
+        return `/gachavids/dud${dudNum}.mp4`;
+      }
+      return `/gachavids/${item.rarity}.mp4`;
+    },
+    dudCount: DUD_COUNT,
+    grid: { enabled: true, maxGridSize: MAX_GRID_SIZE },
+
+    // SSE frames go to the 'gacha' section — the overlay at /gacha filters
+    // on exactly this id (unchanged from legacy).
+    emit: (frame) => {
+      const { state, ...rest } = frame;
+      pushState(state, rest);
+    },
+
+    // Synthetic redeems go through the queue exactly as before.
+    dispatchRedeem: (redeem) => {
+      if (_queue) _queue.pushRedeem(redeem);
+      else log.warn('[gacha] queue not available — synthetic redeem not dispatched');
+    },
+
+    // Pull results feed the gacha-results widget via the same listener API.
+    results: {
+      emit: _emitResult,
+      nextId: () => ++_resultId,
+    },
+
+    onLog: (m) => log.info(m),
+  });
 }
 
 // ─── Result listener registry ──────────────────────────────────────────────────
@@ -133,10 +192,6 @@ function _emitResult(result) {
     try { cb(result); } catch (e) { log.error('[gacha] onResult listener threw:', e.message); }
   }
 }
-
-// Monotonic id for results so the dashboard widget has stable keys.
-let _resultId = 0;
-function _nextResultId() { return ++_resultId; }
 
 // ─── Gifted-sub batcher ────────────────────────────────────────────────────────
 // Twitch sends each gifted-sub recipient as a separate `channel.subscribe`
@@ -165,259 +220,30 @@ function _queueGiftedSub(user) {
   }
 }
 
-// ─── Internal: play one pull immediately ─────────────────────────────────────
-
-function _executePull({ user, isPremium }) {
-  _pullActive = true;
-
-  const item = roll(isPremium);
-  const isDud = item.rarity === 'dud';
-
-  // Pick video path — one video per rarity, duds pick dud1 or dud2
-  let videoFile;
-  if (isDud) {
-    const dudNum = Math.floor(Math.random() * DUD_COUNT) + 1; // 1 or 2
-    videoFile = `/gachavids/dud${dudNum}.mp4`;
-  } else {
-    videoFile = `/gachavids/${item.rarity}.mp4`;
-  }
-
-  // Icon path (null for duds)
-  const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
-
-  log.info(`[gacha] ${user} pulled (${isPremium ? 'premium' : 'standard'}): ${item.label} [${item.rarity}] | queue remaining: ${_pullQueue.length}`);
-
-  pushState('pulling', {
-    user,
-    videoFile,
-    iconPath,
-    rarity: item.rarity,
-    label: item.label,
-    isDud,
-  });
-
-  setTimeout(() => {
-    pushState('result', {
-      result: { rarity: item.rarity, label: item.label, user },
-    });
-
-    // Emit the result so plugins like gacha-results can record it.
-    // `redeem` is included so downstream plugins can identify SFX items
-    // (Vine Boom, Metal Pipe, etc.) and auto-remove them from the results
-    // list if desired.
-    _emitResult({
-      id:        _nextResultId(),
-      user:      user,
-      label:     isDud ? '(Dud)' : item.label,
-      rarity:    item.rarity,
-      isDud:     isDud,
-      redeem:    isDud ? null : (item.redeem || null),
-      timestamp: new Date(),
-    });
-
-    // Fire the item's associated redeem as soon as the icon is revealed,
-    // so plugins like sfx pick it up at the right moment.
-    if (!isDud && item.redeem) {
-      log.info(`[gacha] Dispatching redeem "${item.redeem}" for ${user}`);
-      if (_queue) {
-        _queue.pushRedeem({
-          username:  user,
-          title:     item.redeem,
-          cost:      0,
-          input:     null,
-          timestamp: new Date(),
-          _fromGacha: true, // flag so other plugins can tell it's synthetic
-        });
-      } else {
-        log.warn('[gacha] queue not available — synthetic redeem not dispatched');
-      }
-    }
-  }, 8000);
-
-  setTimeout(() => {
-    pushState('idle');
-    _pullActive = false;
-    _startNextQueued();
-  }, 14000);
-}
-
-// ─── Shared queue consumer ───────────────────────────────────────────────────
-// Both _executePull and _executeGridPull end by releasing _pullActive and
-// pulling the next queued item. The next item may itself be a grid pull
-// ({ user, count, isPremium }) or a single pull ({ user, isPremium }).
-// Dispatch to the right executor — otherwise a grid pull queued behind a
-// single pull would be silently demoted to a single pull (the old bug).
-function _startNextQueued() {
-  if (_pullQueue.length === 0) return;
-  const next = _pullQueue.shift();
-  log.info(`[gacha] Starting next queued pull for ${next.user} | ${_pullQueue.length} remaining`);
-  setTimeout(() => {
-    if (next.count && next.count > 1) {
-      _executeGridPull(next);
-    } else {
-      _executePull(next);
-    }
-  }, 1500);
-}
-
-// ─── Grid pull (many pulls revealed simultaneously) ──────────────────────────
-// Used when a single donation is large enough to award multiple pulls at
-// once (e.g. a big bit cheer). Instead of queuing them one after another
-// through _executePull, this rolls everything up front and reveals all
-// items simultaneously in a grid on the overlay.
-
-function _executeGridPull({ user, count, isPremium, users }) {
-  _pullActive = true;
-
-  // `users` is an optional array of usernames, one per pull, so each grid
-  // cell can be attributed to a different recipient (used by the gifted-sub
-  // batcher). If absent, all cells are attributed to the single `user`.
-  const hasPerItemUsers = Array.isArray(users) && users.length >= count;
-
-  const items = [];
-  for (let i = 0; i < count; i++) {
-    const item = roll(isPremium);
-    const isDud = item.rarity === 'dud';
-    let videoFile;
-    if (isDud) {
-      const dudNum = Math.floor(Math.random() * DUD_COUNT) + 1;
-      videoFile = `/gachavids/dud${dudNum}.mp4`;
-    } else {
-      videoFile = `/gachavids/${item.rarity}.mp4`;
-    }
-    const iconPath = isDud ? null : `/gachaicons/${item.icon}/icon.png`;
-    const itemUser = hasPerItemUsers ? users[i] : user;
-    items.push({
-      videoFile, iconPath,
-      rarity: item.rarity, label: item.label, isDud,
-      redeem: item.redeem,
-      user:   itemUser,
-    });
-  }
-
-  // For the header line: if all items share the same user, show that
-  // user; otherwise show "N viewers".
-  const headerUser = hasPerItemUsers
-    ? (items.every(it => it.user === items[0].user) ? items[0].user : `${count} viewers`)
-    : user;
-
-  log.info(`[gacha] ${headerUser} grid pull (${isPremium ? 'premium' : 'standard'}) x${count}: ${items.map(i => i.label).join(', ')}`);
-
-  pushState('grid', { user: headerUser, items });
-
-  setTimeout(() => {
-    // Emit each item as a separate result (after the icon reveal).
-    for (const item of items) {
-      _emitResult({
-        id:        _nextResultId(),
-        user:      item.user,
-        label:     item.isDud ? '(Dud)' : item.label,
-        rarity:    item.rarity,
-        isDud:     item.isDud,
-        redeem:    item.isDud ? null : (item.redeem || null),
-        timestamp: new Date(),
-      });
-    }
-
-    // Fire each item's associated redeem as the icons are revealed, same
-    // as a normal single pull, so plugins like sfx pick them up. Each
-    // redeem is attributed to that item's user (per-recipient for
-    // gifted-sub batches).
-    for (const item of items) {
-      if (item.isDud || !item.redeem) continue;
-      if (_queue) {
-        _queue.pushRedeem({
-          username:  item.user,
-          title:     item.redeem,
-          cost:      0,
-          input:     null,
-          timestamp: new Date(),
-          _fromGacha: true,
-        });
-      }
-    }
-  }, 8000);
-
-  setTimeout(() => {
-    pushState('idle');
-    _pullActive = false;
-    _startNextQueued();
-  }, 14000);
-}
-
-/**
- * Trigger `count` pulls that reveal all at once in a grid, instead of one
- * after another. Falls back to a normal single pull when count <= 1.
- * Queues behind any pull/grid already in progress, same as triggerPull.
- *
- * If `count` exceeds MAX_GRID_SIZE, this AUTOMATICALLY splits into
- * multiple batches of MAX_GRID_SIZE each (last batch may be smaller).
- * Each batch plays as its own ~14s grid reveal, queued back-to-back via
- * _pullQueue. So /pull count:50 = two 25-cell grids, one after another.
- */
-function triggerGridPull({ user, count = 1, isPremium = false, users }) {
-  // If `users` array is provided, it overrides `count` — one pull per
-  // user, each attributed to a different recipient (gifted-sub batcher).
-  if (Array.isArray(users) && users.length > 0) {
-    count = users.length;
-  }
-  if (count <= 1) {
-    // Single pull — but if a specific user was provided via `users[0]`,
-    // use that instead of the bare `user`.
-    const singleUser = Array.isArray(users) && users.length === 1 ? users[0] : user;
-    return triggerPull({ user: singleUser, isPremium });
-  }
-
-  // Split into batches of MAX_GRID_SIZE. For count <= MAX_GRID_SIZE this
-  // is a single batch and behaves exactly like the old code.
-  const batches = [];
-  let remaining = count;
-  while (remaining > 0) {
-    const size = Math.min(MAX_GRID_SIZE, remaining);
-    batches.push(size);
-    remaining -= size;
-  }
-
-  if (batches.length > 1) {
-    log.info(
-      `[gacha] ${user || '(multi-user)'} grid pull x${count} split into ${batches.length} batches ` +
-      `(${batches.join('+')}) — queued back-to-back.`
-    );
-  }
-
-  // Fire the first batch immediately (or queue it if a pull is active),
-  // and queue the rest. _pullQueue dispatches them in order via
-  // _startNextQueued(), which knows to route {count>1} items back through
-  // _executeGridPull.
-  let offset = 0;
-  for (let i = 0; i < batches.length; i++) {
-    const batchCount = batches[i];
-    // Slice the per-item users array for this batch (if present).
-    const batchUsers = Array.isArray(users) ? users.slice(offset, offset + batchCount) : undefined;
-    offset += batchCount;
-
-    if (i === 0 && !_pullActive) {
-      _executeGridPull({ user, count: batchCount, isPremium, users: batchUsers });
-    } else {
-      _pullQueue.push({ user, count: batchCount, isPremium, users: batchUsers });
-      log.info(
-        `[gacha] Grid pull batch ${i + 1}/${batches.length} (${batchCount} pulls) queued for ${user || '(multi-user)'} ` +
-        `| queue depth: ${_pullQueue.length}`
-      );
-    }
-  }
-}
-
-// ─── Main pull trigger ────────────────────────────────────────────────────────
-// Queues the pull if one is already in progress; plays immediately otherwise.
+// ─── Pull engine: shared state machine ───────────────────────────────────────
+// The legacy _executePull/_executeGridPull/_startNextQueued code was replaced
+// by ../gacha-shared/pull-machine.js — the identical choreography (timings,
+// frame shapes, queueing, batching) expressed as an explicit FSM, asserted
+// against the legacy contract by test/gacha-machine.test.js. The variant
+// differences (section id, per-rarity videos, duds, grid mode) are passed
+// in via the machine config above, so gacha and budgetgacha remain fully
+// separate products with different URLs and animations while sharing the
+// engine that was always secretly identical.
 
 function triggerPull({ user, isPremium = false }) {
-  if (_pullActive) {
-    _pullQueue.push({ user, isPremium });
-    log.info(`[gacha] Pull queued for ${user} (${isPremium ? 'premium' : 'standard'}) | queue depth: ${_pullQueue.length}`);
+  if (!_machine) {
+    log.warn('[gacha] triggerPull before init — pull ignored');
     return;
   }
-  _executePull({ user, isPremium });
+  _machine.triggerPull({ user, isPremium });
+}
+
+function triggerGridPull({ user, count = 1, isPremium = false, users }) {
+  if (!_machine) {
+    log.warn('[gacha] triggerGridPull before init — pull ignored');
+    return;
+  }
+  _machine.triggerGridPull({ user, count, isPremium, users });
 }
 
 // ─── Redeem / bits / sub titles ───────────────────────────────────────────────
@@ -446,18 +272,24 @@ let _chatReply = { twitch: null, youtube: null };
 
 function onChatReady(chatReply) {
   _chatReply = chatReply;
-  commandsList.registerCommand('!gacha', 'Spend 1000 channel points to pull from the gacha!');
+  commandsList.registerCommand('!gacha', `Spend ${PULL_COST} channel points to pull from the gacha!`);
   log.info('[gacha] ready.');
 }
 
 function _normaliseTitle(raw) {
-  // Strip "[YT]" suffix appended by yt-points when mirroring YouTube redeems
-  return raw.replace(/\s*\[YT\]\s*$/i, '').trim().toLowerCase();
+  // queue.normaliseRedeemTitle centralises the [YT] suffix strip that used to
+  // be re-implemented here and in five other plugins (review W3).
+  return normaliseRedeemTitle(raw);
 }
 
 function init(context) {
   const q = context.queue;
-  _queue = q; // captured for setTimeout-callback access in _executePull
+  _queue = q; // captured for the machine's dispatchRedeem callback
+
+  // Build the pull machine now (it needs the queue for synthetic redeems
+  // and the result listener registry). Triggers before init are refused
+  // with a warning — same behaviour the legacy code had.
+  if (!_machine) _machine = _buildMachine();
 
   // ── Channel Point redeems ────────────────────────────────────────────────
   if (typeof q?.onRedeem === 'function') {
@@ -568,12 +400,17 @@ function init(context) {
 }
 
 async function processMessage(msg) {
-  // Manual mod trigger: !gacha @user [premium]
-  const manualMatch = false; // msg.text.match(/^!gacha\s+@?(\w+)?\s*(premium)?/i);
-  if (manualMatch) {
-    const user = manualMatch[1] || msg.username;
-    const isPremium = !!manualMatch[2];
-    triggerPull({ user, isPremium });
+  // Manual mod trigger is intentionally disabled — but replying nothing
+  // left mods typing !gacha with zero feedback (review W2). Answer with a
+  // short explanation instead of silence.
+  const manual = msg.text && msg.text.match(/^!gacha(\s|$)/i);
+  if (manual) {
+    if (_chatReply && _chatReply[msg.platform]) {
+      _chatReply[msg.platform](
+        'Manual !gacha pulls are disabled — use the channel-point redeem.',
+        msg.username
+      ).catch(() => {});
+    }
     return { message: null };
   }
   return { message: msg };

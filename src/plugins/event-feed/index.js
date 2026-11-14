@@ -1,6 +1,7 @@
 'use strict';
 
 const log = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 const { registerSection, updateSection, addRoute } = require('../../overlay-server');
 const fs   = require('fs');
 const path = require('path');
@@ -11,7 +12,11 @@ const OVERLAY_HTML = path.resolve(__dirname, 'overlay.html');
 
 const MAX_EVENTS = 20; // keep a rolling window
 const _events = [];    // [{ id, type, label, detail, ts }]
-let   _nextId = 1;
+// Seed from the wall clock (review W2): a restart used to reset this to 1
+// while connected browser sources keep a seen-set of pre-restart ids, so the
+// overlay silently dropped new events until the fresh counter outgrew the
+// old watermark. Date.now() ids never collide across boots.
+let   _nextId = Date.now();
 
 // Event type → display config (emoji + colour)
 const TYPE_CONFIG = {
@@ -96,7 +101,7 @@ function init(context) {
   // Redeems
   if (typeof q?.onRedeem === 'function') {
     q.onRedeem(redeem => {
-      const title = (redeem.title ?? redeem.reward?.title ?? 'Unknown').replace(/\s*\[YT\]\s*$/i, '').trim();
+      const title = normaliseRedeemTitle(redeem.title ?? redeem.reward?.title ?? 'Unknown'); // shared helper (review W3)
       const user  = redeem.username ?? redeem.user ?? 'someone';
       if (redeem._fromGacha) return; // skip synthetic gacha redeems — noise
       _push('redeem', user, title);

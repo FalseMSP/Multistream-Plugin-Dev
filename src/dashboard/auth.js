@@ -60,9 +60,19 @@ function _destroySession(token) {
 }
 
 function _parseCookies(cookieHeader = '') {
-  return Object.fromEntries(
-    cookieHeader.split(';').map(c => c.trim().split('=').map(decodeURIComponent))
-  );
+  // Malformed cookie pairs (a stray % that decodeURIComponent throws on)
+  // used to kill the request handler with a 500 (review W1) — skip bad pairs.
+  const out = {};
+  for (const pair of cookieHeader.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx === -1) continue;
+    const k = pair.slice(0, idx).trim();
+    if (!k) continue;
+    try {
+      out[decodeURIComponent(k)] = decodeURIComponent(pair.slice(idx + 1).trim());
+    } catch { /* skip malformed pair */ }
+  }
+  return out;
 }
 
 function _getSessionToken(req) {

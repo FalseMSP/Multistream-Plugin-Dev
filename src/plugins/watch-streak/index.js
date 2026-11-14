@@ -190,6 +190,16 @@ function onPointsReady(plugin) {
 async function _awardStreakPoints(username, platform, streak) {
   if (!_pointsPlugin) return;
 
+  // YouTube-only awarding (review W3): the points plugin (yt-points) is
+  // YouTube-scoped by design — its passive awarder returns early on
+  // non-YouTube platforms, and Twitch already has native channel points.
+  // Twitch streaks (the majority: the table is keyed twitch:name) used to
+  // silently write a YouTube balance under the Twitch username.
+  if (platform !== 'youtube') {
+    log.info(`[watch-streak] Streak ${streak} for ${platform}/${username} — no points plugin on this platform, skipping award.`);
+    return;
+  }
+
   const points = _streakPoints(streak);
   if (points === 0) return; // streak 1 — no bonus
 

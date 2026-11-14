@@ -20,6 +20,7 @@
  * views/dashboard-page.js). The 'ts' field is the action timestamp.
  */
 
+const log = require('../logger');
 const _clients = new Set();
 
 /**
@@ -28,7 +29,12 @@ const _clients = new Set();
  */
 function broadcast(payload) {
   if (_clients.size === 0) return;
-  const msg = `data: ${JSON.stringify(payload)}\n\n`;
+  // Serialize INSIDE the guard (review W2): a circular widget payload threw
+  // before the per-client try/catch, taking the whole updateWidget call
+  // chain down with it. Skip the event on serialization failure.
+  let msg;
+  try { msg = `data: ${JSON.stringify(payload)}\n\n`; }
+  catch (e) { log.warn('[dashboard:sse] broadcast skipped unserializable payload:', e.message); return; }
   for (const res of _clients) {
     try { res.write(msg); }
     catch { _clients.delete(res); }

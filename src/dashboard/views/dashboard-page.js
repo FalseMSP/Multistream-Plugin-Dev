@@ -496,6 +496,21 @@ function buildDashboardPage() {
   }
   .toast.ok { border-left-color: #4ade80; }
   .toast.warn { border-left-color: #f59e0b; }
+  .toast.error { border-left-color: #f87171; }
+  /* Connections widget (review W2) — one row per platform surface */
+  .connections-list { display: flex; flex-direction: column; gap: 6px; padding: 4px 0; }
+  .connection-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .connection-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .connection-ok { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); }
+  .connection-degraded { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.6); }
+  .connection-down { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.7); }
+  .connection-off { background: #6b7280; }
+  .connection-label { flex: 1; color: var(--fg); }
+  .connection-state { font-size: 11px; padding: 1px 7px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); }
+  .connection-state-ok { color: #4ade80; border-color: rgba(74,222,128,0.4); }
+  .connection-state-degraded { color: #f59e0b; border-color: rgba(245,158,11,0.4); }
+  .connection-state-down { color: #f87171; border-color: rgba(248,113,113,0.5); font-weight: 700; }
+
   .toast.fade { opacity: 0; transition: opacity 0.35s; }
   @keyframes toastIn { from { transform: translateX(12px); opacity: 0; } to { transform: none; opacity: 1; } }
   /* ── Responsive: laptop / small desktop ── */
@@ -1565,13 +1580,34 @@ function buildDashboardPage() {
   async function sendModAction(action, duration) {
     closeModModal();
     try {
-      await fetch('/dashboard/moderate', {
+      const resp = await fetch('/dashboard/moderate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: modTarget.username, platform: modTarget.platform, action, duration }),
       });
+      // Read the real per-platform outcome (review W2): the server now
+      // awaits the dispatch and returns { ok, results: [...] } — show
+      // failures instead of a blanket optimistic success.
+      if (resp.status === 401) {
+        window.location.href = '/dashboard/login?redirect=' + encodeURIComponent('/dashboard');
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data || !data.ok) {
+        const why = (data && data.results && data.results.filter(r => !r.ok).map(r => r.error).join('; '))
+          || (data && data.error) || ('HTTP ' + resp.status);
+        toast('🛡 ' + modTarget.username + ': action FAILED — ' + why, 'error');
+      } else {
+        const failed = (data.results || []).filter(r => !r.ok);
+        if (failed.length) {
+          toast('🛡 ' + modTarget.username + ': partially failed — ' + failed.map(r => r.error).join('; '), 'error');
+        } else {
+          toast('🛡 ' + modTarget.username + ' ' + (action === 'ban' ? 'banned' : 'timed out' + (duration ? ' (' + duration + 's)' : '')) + ' on ' + modTarget.platform, 'ok');
+        }
+      }
     } catch (e) {
       console.warn('[dashboard] moderate request failed:', e);
+      toast('🛡 ' + modTarget.username + ': request failed — ' + e.message, 'error');
     }
   }
 
@@ -1606,9 +1642,21 @@ function buildDashboardPage() {
 
   let es;
   let hadDisconnect = false;
+  let _sseFailures = 0; // rapid consecutive errors with no onopen → expired session
   function connect() {
     es = new EventSource('/dashboard/sse');
+    es.onerror = () => {
+      // EventSource auto-reconnects forever; if the session died the server
+      // now answers 401 and each retry re-requests it. After several rapid
+      // failures with no successful open, assume expiry and go to login.
+      if (!es.readyState /* CONNECTING */ || es.readyState === 2 /* CLOSED */) {
+        if (_sseFailures++ > 3) {
+          window.location.href = '/dashboard/login?redirect=' + encodeURIComponent('/dashboard');
+        }
+      }
+    };
     es.onopen = () => {
+      _sseFailures = 0;
       setOnline(true);
       if (hadDisconnect) {
         hadDisconnect = false;
@@ -1648,13 +1696,20 @@ function buildDashboardPage() {
         } else if (msg.type === 'log' && msg.entry) {
           addLogEntry(msg.entry);
         } else if (msg.type === 'moderate') {
-          // Mod-action feedback: toast + Mod history tab.
+          // Mod-action feedback: toast + Mod history tab. The event now
+          // carries the REAL outcome (ok/results) — legacy fired before
+          // dispatch, so failures were structurally invisible (review W2).
           pushModAction(msg);
           const what = msg.action === 'ban'
             ? 'banned'
             : 'timed out ' + (msg.duration ? '(' + msg.duration + 's)' : '');
-          toast('🛡 ' + msg.username + ' ' + what + ' on ' + msg.platform,
-                msg.action === 'ban' ? 'warn' : 'ok');
+          if (msg.ok === false) {
+            const why = (msg.results || []).filter(r => !r.ok).map(r => r.error).join('; ') || 'unknown error';
+            toast('🛡 ' + msg.username + ' ' + what + ' on ' + msg.platform + ' — FAILED: ' + why, 'error');
+          } else {
+            toast('🛡 ' + msg.username + ' ' + what + ' on ' + msg.platform,
+                  msg.action === 'ban' ? 'warn' : 'ok');
+          }
         }
       } catch {}
     };
@@ -2007,10 +2062,14 @@ function buildDashboardPage() {
   });
 
   function showResult(lines) {
+    // Colour ONLY explicit markers (review W2): legacy treated every plain
+    // result line (queue listings, points output) as a warning because it
+    // did not start with ✅. Plain output is neutral; ❌/⚠️ are errors,
+    // all-✅ is success.
     const hasError = lines.some(l => l.startsWith('❌') || l.startsWith('⚠️'));
-    const allOk    = lines.every(l => l.startsWith('✅'));
-    cmdResult.textContent = lines.join('\\n');
-    cmdResult.className   = 'cmd-result-bar visible ' + (allOk ? 'ok' : hasError ? 'error' : 'warn');
+    const allOk    = lines.length > 0 && lines.every(l => l.startsWith('✅'));
+    cmdResult.textContent = lines.join('\n');
+    cmdResult.className   = 'cmd-result-bar visible ' + (hasError ? 'error' : allOk ? 'ok' : '');
   }
 
   cmdSubmit.addEventListener('click', async () => {
@@ -2048,6 +2107,13 @@ function buildDashboardPage() {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ name: _currentItem.name, options: optionValues }),
       });
+      if (resp.status === 401) {
+        // Session expired (review W2): the server now returns a real 401
+        // for programmatic requests — redirect instead of throwing an
+        // "Unexpected token <" parse error and looping.
+        window.location.href = '/dashboard/login?redirect=' + encodeURIComponent('/dashboard');
+        return;
+      }
       const data = await resp.json();
       showResult(data.results ?? ['⚠️ No response from server']);
     } catch (e) {

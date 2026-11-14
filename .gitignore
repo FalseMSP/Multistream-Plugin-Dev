@@ -16,3 +16,14 @@ clipcurator/.vercel
 clipcurator/*.tsbuildinfo
 clipcurator/next-env.d.ts
 src/plugins/create-reward/rewards.json
+
+# OAuth token files & runtime state (review W1: one `git add -A` away from
+# publishing OAuth refresh tokens)
+.twitch-tokens.json
+.youtube-tokens.json
+client_secret.json
+.yt-points.json
+src/.secrets.json
+
+# gd-queue persisted queue (runtime state)
+src/plugins/gd-queue/queue-state.json

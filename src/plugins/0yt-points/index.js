@@ -103,7 +103,10 @@ const CMD_REDEEM      = /^!redeem\s+(.+)$/i;
 const CMD_REDEEM_BARE = /^!redeem\s*$/i;
 const CMD_REWARDS     = /^!(rewards|shop)(?:\s+(.+))?$/i;
 
-const POINTS_FILE = path.resolve('.yt-points.json');
+// Resolve against THIS file's directory, not the process cwd (review W3):
+// launching the bot from a different directory used to fork the economy
+// into a second empty .yt-points.json before the operator noticed.
+const POINTS_FILE = path.join(__dirname, '.yt-points.json');
 
 /**
  * Window (ms) during which SFX redeem announcements are collected into a

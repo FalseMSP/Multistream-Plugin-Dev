@@ -873,6 +873,15 @@ function startOverlayServer(port = 2999) {
     // devtools) POST media/playback diagnostics here so they show up in the
     // bot's log.
     if (req.method === 'POST' && url === '/__client-log') {
+      // Unauthenticated log injection (review W1): accept diagnostics only
+      // when debugging is explicitly enabled, or the request carries the
+      // operator token (same token the gd-queue OBS page uses).
+      const token = (req.headers['x-overlay-token'] || '').trim();
+      const debug = process.env.OVERLAY_CLIENT_LOG === '1';
+      if (!debug && token !== (process.env.OVERLAY_TOKEN || '')) {
+        res.writeHead(403); res.end();
+        return;
+      }
       let body = '';
       req.on('data', (c) => { if (body.length < 4096) body += c; });
       req.on('end', () => { log.warn('[client] ' + body.slice(0, 4096)); });
@@ -886,7 +895,6 @@ function startOverlayServer(port = 2999) {
         'Cache-Control': 'no-cache, no-transform',
         'Connection':    'keep-alive',
         'X-Accel-Buffering': 'no',
-        'Access-Control-Allow-Origin': '*',
       });
       // Flush headers now and keep the socket alive. Without a heartbeat,
       // NAT/routers/proxies silently drop an idle SSE connection and the
@@ -914,7 +922,7 @@ function startOverlayServer(port = 2999) {
     }
 
     if (req.method === 'GET' && url === '/state') {
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
       res.end(JSON.stringify(Object.fromEntries([..._sections.entries()].map(([id, s]) => [id, s.data]))));
       return;
     }
@@ -923,7 +931,7 @@ function startOverlayServer(port = 2999) {
     if (req.method === 'GET' && m) {
       const s = _sections.get(m[1]);
       if (!s) { res.writeHead(404); res.end('Section not found'); return; }
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache', 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
       res.end(JSON.stringify(s.data));
       return;
     }
@@ -939,7 +947,6 @@ function startOverlayServer(port = 2999) {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': '*',
       });
       res.end(JSON.stringify({
         ok: true,
@@ -958,7 +965,6 @@ function startOverlayServer(port = 2999) {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': '*',
       });
       res.end(JSON.stringify({
         ok: true,
@@ -974,7 +980,6 @@ function startOverlayServer(port = 2999) {
       res.writeHead(200, {
         'Content-Type': 'application/json; charset=utf-8',
         'Cache-Control': 'no-cache',
-        'Access-Control-Allow-Origin': '*',
       });
       res.end(JSON.stringify({
         ok: true,
@@ -1022,7 +1027,12 @@ function startOverlayServer(port = 2999) {
     res.end('Not found');
   });
 
-  server.listen(port, () => {
+  // Bind loopback by default: this server mirrors viewer chat on /sse,
+  // /state and /api/* with no auth, so 0.0.0.0 exposed the full chat feed to
+  // the LAN and to CORS-reading webpages. A reverse proxy (Caddy etc.) or
+  // Docker use can override with OVERLAY_BIND_HOST=0.0.0.0.
+  const bindHost = process.env.OVERLAY_BIND_HOST || '127.0.0.1';
+  server.listen(port, bindHost, () => {
     log.info(`[overlay] Listening  → ${port}`);
     log.info(`[overlay] OBS source → ${port}/overlay`);
     log.info(`[overlay] Static files served from: ${PUBLIC_DIR}`);
@@ -1059,13 +1069,30 @@ function _getSectionData(id) {
  * @param {{ title?: string }} [opts]  Optional page <title> override
  * @returns {string}  Complete HTML document
  */
+// Escape a field for HTML interpolation while keeping emoji intact
+// (review W1: raw icon/title interpolation was stored-XSS-ready if any
+// plugin shipped a malformed string). Also used for titles — the module
+// has no module-scope esc(), so this is the one escaper available to
+// buildStandaloneSectionPage's template.
+function escIcon(v) {
+  return String(v ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function buildStandaloneSectionPage(sectionId, opts = {}) {
   const s = _sections.get(sectionId);
   if (!s) {
     return `<!DOCTYPE html><html><body><pre>Section "${sectionId}" not registered</pre></body></html>`;
   }
 
-  const pageTitle = opts.title ?? s.title ?? sectionId;
+  // Escape BOTH interpolations (review W1: legacy interpolated s.icon and
+  // s.title raw — stored XSS in every standalone overlay page origin).
+  const safeTitle  = escIcon(s.title ?? sectionId);
+  const pageTitle  = escIcon(opts.title ?? s.title ?? sectionId);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1081,8 +1108,8 @@ ${_SECTION_CSS}
 <body>
 <div class="overlay-card" id="card-${sectionId}">
   <div class="section-header">
-    <span class="section-icon">${s.icon ?? ''}</span>
-    <span class="section-title">${s.title ?? sectionId}</span>
+    <span class="section-icon">${escIcon(s.icon)}</span>
+    <span class="section-title">${safeTitle}</span>
     <span class="section-badge" id="badge-${sectionId}"></span>
   </div>
   <div class="section-body" id="body-${sectionId}"></div>

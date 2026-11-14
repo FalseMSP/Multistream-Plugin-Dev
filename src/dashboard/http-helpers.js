@@ -20,7 +20,11 @@ function _readBody(req) {
     req.on('data', chunk => {
       body += chunk;
       if (body.length > MAX_BODY_BYTES) {
+        // Resolve BEFORE destroying: after req.destroy() the 'end' event
+        // never fires, so the readBody promise hung forever and the route
+        // never responded — a request-slot leak (review W2).
         body = '';
+        resolve('');
         req.destroy();
       }
     });

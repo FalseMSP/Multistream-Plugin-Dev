@@ -44,6 +44,25 @@ function loadPlugins() {
     .filter(d => d.isDirectory())
     .map(d => d.name);
 
+  // plugins.json (review W3, minimal version): an OPTIONAL enable/disable
+  // list so plugins can be toggled without editing code and restarting blind.
+  // Shape: { "disabled": ["plugin-id", ...] }. Unknown ids are warned about
+  // so the file can't silently rot. Without the file, all plugins load —
+  // exactly the legacy behaviour.
+  let disabled = new Set();
+  const cfgPath = path.join(dir, 'plugins.json');
+  try {
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      if (Array.isArray(cfg.disabled)) {
+        disabled = new Set(cfg.disabled.map(String));
+        log.info(`[Plugins] plugins.json: ${disabled.size} plugin(s) disabled.`);
+      }
+    }
+  } catch (e) {
+    log.warn('[Plugins] Could not read plugins.json — loading everything:', e.message);
+  }
+
   for (const name of dirs) {
     const file = path.join(dir, name, 'index.js');
     if (!require('fs').existsSync(file)) continue;
@@ -51,12 +70,17 @@ function loadPlugins() {
       const plugin = require(file);
       if (!plugin.id) { log.warn(`[Plugins] Plugin in ${name}/ has no id — skipping`); continue; }
       if (_plugins.find(p => p.id === plugin.id)) continue; // already loaded
+      if (disabled.has(plugin.id)) {
+        log.info(`[Plugins] Skipped disabled plugin: ${plugin.id} (plugins.json)`);
+        continue;
+      }
       _plugins.push(plugin);
       log.info(`[Plugins] Loaded plugin: ${plugin.id}`);
     } catch (err) {
       log.error(`[Plugins] Failed to load plugin ${name}:`, err.message);
     }
   }
+
 }
 
 /**

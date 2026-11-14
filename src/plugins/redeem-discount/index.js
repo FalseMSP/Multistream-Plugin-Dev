@@ -39,6 +39,7 @@
 const fs   = require('fs');
 const path = require('path');
 const log  = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 const { SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 
 const DATA_PATH = path.join(__dirname, 'discount-state.json');
@@ -198,7 +199,7 @@ function init(context) {
       // gacha plugin when a "50 Point Discount" item is revealed).
       if (!redeem._fromGacha) return;
 
-      const title = String(redeem.title ?? '').replace(/\s*\[YT\]\s*$/i, '').trim();
+      const title = normaliseRedeemTitle(redeem.title); // shared helper (review W3)
       if (title.toLowerCase() !== '50 point discount') return;
 
       const user = redeem.user ?? redeem.username ?? 'someone';

@@ -38,6 +38,7 @@
  */
 
 const log          = require('../../logger');
+const { normaliseRedeemTitle } = require('../../queue'); // shared [YT]-strip helper (review W3)
 const premiumRoll  = require('../premium-roll');
 
 // ─── Title matching ──────────────────────────────────────────────────────────
@@ -126,8 +127,9 @@ function onChatReady(chatReply) {
 }
 
 function _normaliseTitle(raw) {
-  return String(raw)
-    .replace(/\s*\[YT\]\s*$/i, '')
+  // [YT] strip via the shared helper; this plugin additionally squashes
+  // punctuation for fuzzy title matching (review W3: single [YT] home).
+  return normaliseRedeemTitle(raw)
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();

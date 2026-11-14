@@ -48,7 +48,10 @@ const state = {
  * @typedef {TextSegment | EmoteSegment}                               Segment
  */
 
-let msgId = 0;
+// Date.now() base (review W2): the overlay client's processedIds seen-set
+// survives a bot restart via SSE replay; restarting the id counter at 0 made
+// post-restart ids collide with pre-restart ones and drop messages.
+let msgId = Date.now();
 
 // buildSegments/parseTwitchEmotesTag now live in ../../chat-emotes so the
 // dashboard chat column can produce identical emote segments — see that
