@@ -715,13 +715,87 @@ function buildDashboardPage() {
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
-  // Icon fields are emoji today, but interpolating them raw turns any
-  // plugin-supplied malformed icon into stored XSS in the dashboard origin
-  // (review W1). escIcon escapes HTML structure, keeps emoji readable.
-  function escIcon(v) {
-    return String(v ?? '')
-      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
-      .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  // Widget icons are either plain text/emoji (render as text) or the small
+  // inline <svg>…</svg> glyphs most widgets register (render as markup).
+  // Blanket-escaping broke every SVG icon into visible '<svg …>' text, so
+  // this is an allowlist instead: a value passes as HTML ONLY if it is one
+  // well-formed <svg> root with whitelisted tags/attributes and no event
+  // handlers, scripts, external refs or entity tricks; everything else —
+  // emoji, malformed markup, payloads — is escaped as inert text.
+  // NOTE: this client code is served through a server-side template
+  // literal: escape sequences written here get eaten or collapsed at
+  // serve time ('\\t' becomes a raw TAB that corrupts the served regex;
+  // the lines.join('\\n') incident class). So this block uses NO regex
+  // literals and NO escape sequences — only plain string operations and
+  // single-character comparisons.
+  const _ICON_TAG_OK = new Set(['svg','g','path','circle','rect','line','polyline','polygon','ellipse','text','title','defs','use']);
+  const _ICON_ATTR_OK = new Set(['xmlns','viewbox','width','height','fill','stroke','stroke-width','stroke-linecap','stroke-linejoin','stroke-dasharray','stroke-dashoffset','stroke-opacity','fill-opacity','opacity','d','cx','cy','r','rx','ry','x','y','x1','y1','x2','y2','points','transform','class','style','aria-hidden','focusable','shape-rendering','paint-order','fill-rule','clip-rule','clip-path','mask','filter','vector-effect','marker-start','marker-end','preserveaspectratio','text-anchor','font-size','font-family','font-weight','lengthadjust','textlength','dx','dy']);
+  const _TAB = String.fromCharCode(9), _LF = String.fromCharCode(10), _CR = String.fromCharCode(13);
+  function _iconBad(s) { return esc(s); }
+  function _isIconWs(c) { return c === ' ' || c === _TAB || c === _LF || c === _CR; }
+  function _hasBadWord(s, words) {
+    const low = s.toLowerCase();
+    for (const w of words) if (low.indexOf(w) !== -1) return true;
+    return false;
+  }
+  function _isAlpha(c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+  function _isAlnumDash(c) { return _isAlpha(c) || (c >= '0' && c <= '9') || c === '-'; }
+  function iconHtml(v) {
+    const s = String(v ?? '').trim();
+    if (s === '') return '';
+    // Structural: must start '<svg' + ws-or-'>' and end '</svg>'.
+    if (!s.startsWith('<svg')) return _iconBad(s);
+    if (s.length > 5 && !_isIconWs(s[4]) && s[4] !== '>') return _iconBad(s);
+    if (!s.endsWith('</svg>')) return _iconBad(s);
+    // No entities (decode tricks), no comments.
+    if (s.indexOf('&') !== -1 || s.indexOf('<!--') !== -1) return _iconBad(s);
+    // Single pass: validate every tag name, attribute and quoted value.
+    let i = 0;
+    const n = s.length;
+    while (i < n) {
+      const lt = s.indexOf('<', i);
+      if (lt === -1) break;
+      let j = lt + 1;
+      if (s[j] === '/') j++;
+      if (!_isAlpha(s[j])) return _iconBad(s);       // stray '<' junk
+      let k = j;
+      while (k < n && _isAlnumDash(s[k])) k++;
+      const tagName = s.slice(j, k).toLowerCase();
+      if (!_ICON_TAG_OK.has(tagName)) return _iconBad(s);
+      // Attributes until '>' or '/>'.
+      let m = k;
+      while (m < n && s[m] !== '>') {
+        while (m < n && _isIconWs(s[m])) m++;
+        if (s[m] === '/' && s[m + 1] === '>') break;
+        if (s[m] === '>') break;
+        let p = m;
+        while (p < n && _isAlnumDash(s[p])) p++;
+        if (p === m) return _iconBad(s);             // junk char inside tag head
+        const attrName = s.slice(m, p).toLowerCase();
+        if (!_ICON_ATTR_OK.has(attrName)) return _iconBad(s);
+        let q = p;
+        while (q < n && _isIconWs(s[q])) q++;
+        if (s[q] === '=') {
+          q++;
+          while (q < n && _isIconWs(s[q])) q++;
+          if (s[q] !== '"') return _iconBad(s);      // unquoted / single-quoted value
+          const close = s.indexOf('"', q + 1);
+          if (close === -1) return _iconBad(s);      // unterminated value
+          const val = s.slice(q + 1, close);
+          if (val.indexOf('<') !== -1 || val.indexOf('>') !== -1) return _iconBad(s);
+          if (attrName === 'style' && _hasBadWord(val, ['url(', '@import', 'expression('])) return _iconBad(s);
+          m = close + 1;
+        } else {
+          m = p;                                     // bare attribute (e.g. focusable)
+        }
+      }
+      const gt = s.indexOf('>', m);
+      if (gt === -1) return _iconBad(s);             // unterminated tag
+      i = gt + 1;
+    }
+    // Belt-and-braces: no event handlers, scripts or external refs anywhere.
+    if (_hasBadWord(s, ['onload=', 'onerror=', 'onclick=', 'onmouseover=', '<script', 'javascript:', 'data:text', 'href=', 'xlink', 'foreignobject', '<iframe', '<image', '<embed', '<animate'])) return _iconBad(s);
+    return s; // well-formed safe SVG → passes through as HTML
   }
 
   // Build widget cards
@@ -739,7 +813,7 @@ function buildDashboardPage() {
     card.id        = 'wcard-' + w.id;
     card.innerHTML =
       '<div class="widget-header">' +
-        '<span class="widget-icon">'  + escIcon(w.icon)    + '</span>' +
+        '<span class="widget-icon">'  + iconHtml(w.icon)   + '</span>' +
         '<span class="widget-title">' + esc(w.title)       + '</span>' +
         '<span class="widget-badge" id="wbadge-' + w.id + '"></span>' +
         '<button class="widget-minimize" data-widget-id="' + w.id + '" title="Minimize widget">' +
@@ -1770,7 +1844,7 @@ function buildDashboardPage() {
         const item = document.createElement('div');
         item.className = 'widgets-dropdown-item';
         item.innerHTML =
-          '<span class="widgets-dropdown-item-icon">' + escIcon(w.icon) + '</span>' +
+          '<span class="widgets-dropdown-item-icon">' + iconHtml(w.icon) + '</span>' +
           '<span class="widgets-dropdown-item-title">' + esc(w.title) + '</span>' +
           '<button class="widgets-dropdown-item-restore" data-restore-id="' + w.id + '">Restore</button>';
         wmList.appendChild(item);

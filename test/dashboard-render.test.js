@@ -185,11 +185,68 @@ test('escape-collision sites keep their backslashes (incident root cause)', () =
     'source lost the double-backslash — a template-literal rewriter collapsed escapes');
 });
 
-test('widget icons are escaped at interpolation (W1 escIcon regression)', () => {
+test('widget icons are sanitized, not blanket-escaped (SVG-as-text regression)', () => {
+  // Incident 2 (Nov 2026): the first XSS fix (escIcon) escaped ALL icon
+  // content, but 14 of 15 real widget icons are <svg> markup — so headers
+  // rendered literal '<svg width="20"…>' text. The replacement is
+  // iconHtml(): strict allowlist parser. These assertions pin it.
   const s = scriptBlocks[0];
-  assert.ok(s.includes('function escIcon'), 'escIcon helper present in client script');
-  assert.ok(s.includes('escIcon(w.icon)'), 'widget card icons go through escIcon');
+  assert.ok(s.includes('function iconHtml'), 'iconHtml helper present in client script');
+  assert.ok(s.includes('iconHtml(w.icon)'), 'widget card icons go through iconHtml');
+  assert.ok(s.includes('iconHtml(w.icon)'), 'dropdown icons go through iconHtml');
   assert.ok(!s.includes("' + w.icon          + '"), 'no raw w.icon interpolation remains');
+  assert.ok(!s.includes('function escIcon'), 'blanket escIcon must not come back');
+  assert.ok(!s.includes('escIcon(w.icon)'), 'no escIcon call sites remain');
+});
+
+test('iconHtml passes safe SVG and escapes everything else', () => {
+  // Reuse the exact iconHtml the client receives: extract + eval it in a vm.
+  const s = scriptBlocks[0];
+  const helper = 'function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}';
+  const block = s.slice(s.indexOf('const _ICON_TAG_OK'), s.indexOf('  // Build widget cards'));
+  const ctx = {}; vm.createContext(ctx);
+  vm.runInContext(helper + '\n' + block, ctx);
+
+  const goodSvg = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v16H4z"/></svg>';
+  assert.strictEqual(ctx.iconHtml(goodSvg), goodSvg, 'safe SVG must pass through byte-identical');
+  assert.strictEqual(ctx.iconHtml('🔗'), '🔗', 'emoji must pass through unchanged');
+
+  const hostile = [
+    '<svg onload="alert(1)"><path d="M0 0"/></svg>',
+    '<svg><foreignObject><iframe src="x"></iframe></foreignObject></svg>',
+    '<svg><script>alert(1)</script></svg>',
+    '<svg width=20></svg>',
+    '<svg><use href="evil.svg"/></svg>',
+    "<svg width='20'></svg>",
+    '<svg></svg> HOOK',
+    '<svg><rect width="1" height="1" onmouseover="x"/></svg>',
+    '<svg style="fill:url(#x)"><path d="M0 0"/></svg>',
+  ];
+  for (const h of hostile) {
+    const out = ctx.iconHtml(h);
+    assert.ok(String(out).includes('&lt;'),
+      `hostile icon must be escaped, got: ${out.slice(0, 60)}`);
+  }
+});
+
+test('every registered widget icon renders as markup, not escaped text', () => {
+  // The 14 real SVG icons (incl. sub-counter's <text COUNT> variant) and the
+  // emoji icon must all pass iconHtml unmodified — otherwise the dashboard
+  // shows '<svg …>' text in headers again.
+  const s = scriptBlocks[0];
+  const helper = 'function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;")}';
+  const block = s.slice(s.indexOf('const _ICON_TAG_OK'), s.indexOf('  // Build widget cards'));
+  const ctx = {}; vm.createContext(ctx);
+  vm.runInContext(helper + '\n' + block, ctx);
+  const reg = require('../src/dashboard/widget-registry');
+  const sorted = reg.getSortedWidgets().sort((a, b) => a.order - b.order);
+  assert.ok(sorted.length >= 15, `expected >=15 widgets, got ${sorted.length}`);
+  for (const w of sorted) {
+    const icon = String(w.icon || '');
+    const out = ctx.iconHtml(icon);
+    assert.strictEqual(out, icon.trim(),
+      `icon of '${w.id}' got blocked by the sanitizer: ${icon.slice(0, 70)}`);
+  }
 });
 
 run();
