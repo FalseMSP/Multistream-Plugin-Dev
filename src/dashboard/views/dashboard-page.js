@@ -715,6 +715,14 @@ function buildDashboardPage() {
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+  // Icon fields are emoji today, but interpolating them raw turns any
+  // plugin-supplied malformed icon into stored XSS in the dashboard origin
+  // (review W1). escIcon escapes HTML structure, keeps emoji readable.
+  function escIcon(v) {
+    return String(v ?? '')
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
 
   // Build widget cards
   const grid      = document.getElementById('widget-grid-wrap');
@@ -731,8 +739,8 @@ function buildDashboardPage() {
     card.id        = 'wcard-' + w.id;
     card.innerHTML =
       '<div class="widget-header">' +
-        '<span class="widget-icon">'  + w.icon          + '</span>' +
-        '<span class="widget-title">' + esc(w.title)    + '</span>' +
+        '<span class="widget-icon">'  + escIcon(w.icon)    + '</span>' +
+        '<span class="widget-title">' + esc(w.title)       + '</span>' +
         '<span class="widget-badge" id="wbadge-' + w.id + '"></span>' +
         '<button class="widget-minimize" data-widget-id="' + w.id + '" title="Minimize widget">' +
           '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg>' +
@@ -1762,7 +1770,7 @@ function buildDashboardPage() {
         const item = document.createElement('div');
         item.className = 'widgets-dropdown-item';
         item.innerHTML =
-          '<span class="widgets-dropdown-item-icon">' + w.icon + '</span>' +
+          '<span class="widgets-dropdown-item-icon">' + escIcon(w.icon) + '</span>' +
           '<span class="widgets-dropdown-item-title">' + esc(w.title) + '</span>' +
           '<button class="widgets-dropdown-item-restore" data-restore-id="' + w.id + '">Restore</button>';
         wmList.appendChild(item);
@@ -2068,7 +2076,7 @@ function buildDashboardPage() {
     // all-✅ is success.
     const hasError = lines.some(l => l.startsWith('❌') || l.startsWith('⚠️'));
     const allOk    = lines.length > 0 && lines.every(l => l.startsWith('✅'));
-    cmdResult.textContent = lines.join('\n');
+    cmdResult.textContent = lines.join('\\n'); // NOTE: escaped — this client code lives inside a server-side template literal
     cmdResult.className   = 'cmd-result-bar visible ' + (hasError ? 'error' : allOk ? 'ok' : '');
   }
 
